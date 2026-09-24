@@ -9,7 +9,7 @@ from models.correlation import Predicate
 
 from flask import Flask, jsonify, render_template, request
 
-from rule_engine import (FIELD_MAPPINGS, TECHNIQUES, RuleValidationError, analyze_rule, detect_siem,
+from rule_engine import (FIELD_MAPPINGS, SIEMS, TECHNIQUES, RuleValidationError, analyze_rule, detect_siem,
                          generate_rules, generate_workbench, supported_siems)
 from storage import RuleStore
 from section_view import section_blocks
@@ -405,7 +405,25 @@ def create_app() -> Flask:
                     query, notes = converted
                     fidelity = "exact"
                 else:
-                    query, fidelity, notes = compile_model(model, siem)
+                    try:
+                        query, fidelity, notes = compile_model(model, siem)
+                    except RuleValidationError as refusal:
+                        # Same per-target contract as compile_request: a target that refuses
+                        # its own settings must not 500 the whole Sigma compile.
+                        outputs.append({"siem": siem, "name": SIEMS.get(siem, {}).get("name", siem),
+                                        "language": SIEMS.get(siem, {}).get("language", ""),
+                                        "query": "", "rule": "", "fidelity": "unsupported",
+                                        "refused": True, "refusal_kind": "target_constraint",
+                                        "refusal_reason": str(refusal),
+                                        "review_note": "This target's own limits reject the requested settings. Adjust them or drop this target; the other targets are unaffected.",
+                                        "notes": [str(refusal)], "capability_notes": [str(refusal)],
+                                        "checks": [str(refusal)], "warnings": [],
+                                        "validation": "failed", "section_blocks": [],
+                                        "field_mapping": {"canonical_field": "Sigma rule fields, built-in renderer",
+                                                          "native_field": "not emitted",
+                                                          "mapping_confidence": "unverified",
+                                                          "mapping_source": "sigma-built-in"}})
+                        continue
                     if not pysigma_status()["installed"]:
                         notes = [*notes, "pySigma is not installed: built-in renderer used. Install pysigma plus a backend package for authoritative Sigma conversion."]
                 checks = target_check(siem, query)

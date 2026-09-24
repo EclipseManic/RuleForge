@@ -254,6 +254,194 @@ p | join kind=inner DeviceNetworkEvents on DeviceId"""
             self.assertTrue(by_siem[other]["rule"].strip(),
                             msg=f"{other} must still produce a rule")
 
+    def test_wazuh_timeframe_attribute_keeps_exact_seconds(self):
+        """Wazuh's timeframe counts SECONDS, so a 30s window must stay 30.
+
+        The renderer went through a minutes helper, which can only express whole minutes
+        and rounds up: 30s became 60 and 61s became 120. The UI advertises 30s, so this
+        silently changed the count window the analyst asked for. QRadar's `LAST n MINUTES`
+        genuinely needs whole minutes and keeps the rounding helper.
+        """
+        from rule_engine import _timeframe_seconds
+        self.assertEqual(_timeframe_seconds("30s"), 30)
+        self.assertEqual(_timeframe_seconds("61s"), 61)
+        self.assertEqual(_timeframe_seconds("5m"), 300)
+        self.assertEqual(_timeframe_seconds("2h"), 7200)
+        self.assertEqual(_timeframe_seconds("1d"), 86400)
+        for window, expected in (("30s", 30), ("61s", 61), ("5m", 300), ("1h", 3600)):
+            rule = generate_rules(example(threshold=5, use_threshold=True, timeframe=window,
+                                          siems=["wazuh"]))[0]
+            self.assertIn(f'timeframe="{expected}"', rule["rule"],
+                          msg=f"window {window} must reach Wazuh unaltered")
+        self.assertIn("LAST 1 MINUTES",
+                      generate_rules(example(threshold=5, use_threshold=True, timeframe="30s",
+                                             siems=["qradar"]))[0]["rule"],
+                      msg="QRadar can only say whole minutes, so 30s rounds up to 1")
+
+    def test_wazuh_is_not_refused_for_a_window_it_never_emits(self):
+        """No count means no frequency and no timeframe attribute at all.
+
+        The bound was checked unconditionally, so a 999d window with thresholding turned
+        off refused Wazuh for a value the generated rule never contained - costing the
+        analyst the target for a limit their output does not hit.
+        """
+        from rule_engine import _wazuh_attribute_problems
+        self.assertEqual(_wazuh_attribute_problems(None, "999d"), [],
+                         msg="no threshold means neither attribute is emitted")
+        self.assertEqual(_wazuh_attribute_problems(1, "999d"), [],
+                         msg="threshold 1 emits no frequency, so no timeframe either")
+        rules = generate_rules(example(threshold=1, use_threshold=False, timeframe="999d",
+                                      siems=["wazuh", "splunk"]))
+        by_siem = {r["siem"]: r for r in rules}
+        self.assertFalse(by_siem["wazuh"].get("refused"),
+                         msg="an unemitted attribute must not refuse the target")
+        self.assertNotIn("timeframe=", by_siem["wazuh"]["rule"])
+        # The cap still applies once a count is on, which is the only time it can bite.
+        self.assertTrue(_wazuh_attribute_problems(5, "999d"))
+
+    def test_an_advanced_wazuh_request_is_refused_per_target_not_raised(self):
+        """A correlation request reaches render_wazuh through compile_model, not RENDERERS.
+
+        The per-target refusal only wrapped the flat path, so an out-of-range count on a
+        sequence request escaped as an unhandled exception and cost the analyst every other
+        selected target too.
+        """
+        from compiler.pipeline import compile_request
+        from rule_engine import parse_request
+        request = parse_request(example(
+            threshold=10000, use_threshold=True, siems=["sentinel", "wazuh"],
+            correlation={"aggregations": [{"function": "dc", "field": "destination.ip", "alias": "d"}]}))
+        out = compile_request(request, "wazuh")
+        self.assertTrue(out.get("refused"))
+        self.assertEqual(out["rule"], "", msg="a refused advanced target emits no rule body")
+        self.assertIn("9999", out["refusal_reason"])
+        self.assertEqual(out["refusal_kind"], "target_constraint")
+        other = compile_request(request, "sentinel")
+        self.assertFalse(other.get("refused"))
+        self.assertTrue(other["rule"].strip())
+
+    def test_a_refusal_is_not_reported_as_a_strict_mode_refusal(self):
+        """Two different things refuse a target and the UI must not conflate them.
+
+        Strict mode refuses lossy conversions and is switched off in the form. A vendor
+        range violation cannot be switched off, so telling the analyst to disable strict
+        mode for it sends them to fix the wrong control.
+        """
+        rules = generate_rules(example(threshold=10000, use_threshold=True,
+                                      siems=["wazuh", "elastic"], strict=True))
+        by_siem = {r["siem"]: r for r in rules}
+        self.assertEqual(by_siem["wazuh"]["refusal_kind"], "target_constraint")
+        strict = generate_rules(example(threshold=5, use_threshold=True, siems=["splunk"],
+                                       strict=True,
+                                       correlation={"sequences": [{"join_by": "host.name", "maxspan": "5m",
+                                                                  "stages": [{"event": "a", "condition": ""},
+                                                                             {"event": "b", "condition": ""}]}]}))
+        refused = [r for r in strict if r.get("refused")]
+        self.assertTrue(refused, msg="strict mode must still refuse a lossy target")
+        self.assertEqual(refused[0]["refusal_kind"], "strict_fidelity")
+
+    def test_source_preservation_does_not_revive_a_refused_target(self):
+        """Preservation overwrote `rule` on an item still marked refused/validation failed.
+
+        A consumer reading that bundle got a non-empty Wazuh rule from a target that had
+        just been refused, with fidelity upgraded to exact. The refusal is the truth.
+        """
+        payload = example(threshold=10000, use_threshold=True, siems=["wazuh", "splunk"],
+                          source_rule="<rule id=\"100100\" frequency=\"10000\"/>",
+                          source_siem="wazuh", preserve_source_rule=True)
+        result = generate_workbench(payload)
+        by_siem = {r["siem"]: r for r in result["rules"]}
+        wazuh = by_siem["wazuh"]
+        self.assertTrue(wazuh.get("refused"))
+        self.assertEqual(wazuh["rule"], "",
+                         msg="a refused target must not be handed a rule body")
+        self.assertEqual(wazuh["validation"], "failed")
+        self.assertNotEqual(wazuh.get("fidelity"), "exact",
+                            msg="a refused target cannot be an exact preservation")
+        self.assertIn("not", wazuh["review_note"])
+        self.assertTrue(by_siem["splunk"]["rule"].strip())
+
+    def test_preservation_contract_reports_reality_not_intent(self):
+        """The bundle-level contract described the REQUEST, not what the bundle contains.
+
+        With a real imported source, preservation that was skipped because the target
+        refused still produced `mode: preserve_source, equivalent: true` and
+        `compile_allowed: true` - a false passing contract next to a target that emitted
+        nothing. The contract, the gate and the allowed flag now all read from whether
+        preservation actually happened.
+        """
+        analysis = analyze_rule('<group><rule id="100210" frequency="5" timeframe="60"><same_srcip /></rule></group>', "wazuh")
+        payload = example(threshold=10000, use_threshold=True, siems=["wazuh"],
+                          technique="custom",
+                          conditions=[{"field": "CommandLine", "operator": "contains", "value": "-enc"}],
+                          source_rule=analysis["raw_rule"], source_siem="wazuh",
+                          source_analysis=analysis, preserve_source_rule=True)
+        result = generate_workbench(payload)
+        self.assertEqual(result["compile_contract"]["source"]["mode"], "preserve_source_not_applied")
+        self.assertFalse(result["compile_contract"]["source"]["equivalent"])
+        self.assertFalse(result["compile_allowed"],
+                         msg="nothing in this bundle is the source artifact")
+        skipped = [g for g in result["quality_gates"] if g["title"] == "Source preservation skipped"]
+        self.assertEqual(len(skipped), 1, msg="skipping preservation must say so once")
+        self.assertIn("wazuh", skipped[0]["detail"])
+        self.assertEqual(result["rules"][0]["rule"], "")
+
+    def test_a_preserved_source_is_the_only_artifact_reported(self):
+        """Only `rule` was replaced with the source, so `query`, checks and validation
+        still described the generated draft it had just been overwritten with. A consumer
+        could read a source rule next to a passing verdict on different text."""
+        source_text = '<group><rule id="100210" frequency="5" timeframe="60"><same_srcip /></rule></group>'
+        analysis = analyze_rule(source_text, "wazuh")
+        payload = example(threshold=5, use_threshold=True, siems=["wazuh"], technique="custom",
+                          conditions=[{"field": "CommandLine", "operator": "contains", "value": "-enc"}],
+                          source_rule=source_text, source_siem="wazuh",
+                          source_analysis=analysis, preserve_source_rule=True)
+        rule = generate_workbench(payload)["rules"][0]
+        self.assertEqual(rule["rule"], source_text)
+        self.assertEqual(rule["query"], source_text,
+                         msg="query must not keep describing the overwritten draft")
+        self.assertEqual(rule["validation"], "unverified",
+                         msg="this tool did not validate text it passed through")
+        self.assertTrue(any("did not re-validate" in c for c in rule["checks"]))
+        self.assertEqual(rule["warnings"], [])
+
+    def test_wazuh_import_round_trips_seconds_exactly(self):
+        """Wazuh stores its timeframe in seconds; importing one rounded it to whole minutes.
+
+        61s came back as 1m and 90s as 2m, so recompiling an imported rule silently changed
+        its count window. A valid 99999s also had to survive the window grammar, which only
+        accepted three digits.
+        """
+        from rule_engine import _duration_from_seconds
+        self.assertEqual(_duration_from_seconds(30), "30s")
+        self.assertEqual(_duration_from_seconds(61), "61s")
+        self.assertEqual(_duration_from_seconds(90), "90s")
+        self.assertEqual(_duration_from_seconds(300), "5m")
+        self.assertEqual(_duration_from_seconds(3600), "1h")
+        self.assertEqual(_duration_from_seconds(99999), "99999s")
+        for seconds, expected in ((30, "30s"), (61, "61s"), (90, "90s"), (600, "10m"), (99999, "99999s")):
+            raw = f'<group><rule id="100210" frequency="5" timeframe="{seconds}"><same_srcip /></rule></group>'
+            analysis = analyze_rule(raw, "wazuh")
+            self.assertEqual(analysis["timeframe"], expected,
+                             msg=f"importing timeframe={seconds} must not change it")
+            out = generate_rules(example(threshold=5, use_threshold=True, siems=["wazuh"],
+                                        timeframe=analysis["timeframe"]))[0]
+            self.assertIn(f'timeframe="{seconds}"', out["rule"],
+                          msg=f"{expected} must reach Wazuh as {seconds} seconds")
+
+    def test_elastic_threshold_window_keeps_exact_seconds(self):
+        """Elastic's threshold_window is a seconds duration derived from a minutes helper,
+        so a 30s request became 60s - the same silent widening as the Wazuh bug."""
+        from compiler.sigma_compiler import _window_seconds
+        self.assertEqual(_window_seconds("30s"), 30)
+        self.assertEqual(_window_seconds("61s"), 61)
+        self.assertEqual(_window_seconds("5m"), 300)
+        self.assertEqual(_window_seconds("2h"), 7200)
+        rendered = generate_rules(example(threshold=5, use_threshold=True, timeframe="30s",
+                                          siems=["elastic"],
+                                          correlation={"aggregations": [{"function": "dc", "field": "destination.ip", "alias": "d"}]}))[0]["rule"]
+        self.assertIn('threshold_window: "30s"', rendered)
+
     def test_generated_header_does_not_claim_a_schedule(self):
         """`Schedule: every 5m` was wrong: nothing schedules these rules.
 

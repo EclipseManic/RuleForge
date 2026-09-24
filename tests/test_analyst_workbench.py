@@ -842,6 +842,25 @@ class AuditFixTests(unittest.TestCase):
         for output in body["outputs"]:
             self.assertTrue(output["rule"])
 
+    def test_sigma_compile_refuses_one_target_instead_of_failing_the_request(self):
+        """The Sigma route called the Wazuh renderer outside any refusal guard.
+
+        A Sigma compile for several targets with a count above Wazuh's 9999 maximum raised
+        out of the handler, so the analyst got an error page and lost the targets that
+        would have compiled. One target's own limit must cost that target only.
+        """
+        payload = {**self.base, "siems": ["wazuh", "sigma"], "sigma": SIGMA_SAMPLE,
+                   "threshold": 10000, "use_threshold": True, "timeframe": "5m"}
+        rv = self.client.post("/api/compile", json=payload)
+        self.assertEqual(rv.status_code, 200,
+                         msg="one target refusing must not turn into a failed request")
+        outputs = {o["siem"]: o for o in rv.get_json()["outputs"]}
+        self.assertTrue(outputs["wazuh"].get("refused"))
+        self.assertEqual(outputs["wazuh"]["rule"], "")
+        self.assertEqual(outputs["wazuh"]["refusal_kind"], "target_constraint")
+        self.assertTrue(outputs["sigma"]["rule"],
+                        msg="the other selected target must still produce its rule")
+
     def test_pysigma_status_is_honest(self):
         from compiler.sigma_compiler import compile_sigma_with_pysigma, pysigma_status
         status = pysigma_status()

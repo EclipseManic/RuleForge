@@ -411,7 +411,7 @@ def _elastic_threshold_rule(expr: str, group: str, window: str, source: str, thr
     threshold comparator and a window in seconds. Emitted as the Kibana detections
     API rule body so it can be pasted straight into the API or the rule editor.
     """
-    seconds = _window_minutes(window) * 60
+    seconds = _window_seconds(window)
     # A wildcard source must not become a concrete index name. Naming an index the
     # analyst does not ingest produces a rule that deploys and never fires, so an
     # unresolved source stays an explicit placeholder instead of a plausible guess.
@@ -455,13 +455,28 @@ def _yaral_span(window: str) -> str:
 
 def _window_minutes(window: str) -> int:
     import re as _re
-    match = _re.fullmatch(r"(\d{1,3})([smhd])", str(window or "5m").lower())
+    match = _re.fullmatch(r"(\d{1,5})([smhd])", str(window or "5m").lower())
     if not match or int(match.group(1)) < 1:
         return 5
     amount, unit = int(match.group(1)), match.group(2)
     if unit == "s":
         return max(1, -(-amount // 60))  # ceiling to whole minutes for QRadar LAST
     return amount * {"m": 1, "h": 60, "d": 1440}[unit]
+
+
+def _window_seconds(window: str) -> int:
+    """Exact seconds, for targets whose window attribute counts in seconds.
+
+    Elastic's `threshold_window` is a seconds duration. Deriving it from the minutes
+    helper doubled a 30s request to 60s, so the count window the analyst asked for was
+    not the one the rule used.
+    """
+    import re as _re
+    match = _re.fullmatch(r"(\d{1,5})([smhd])", str(window or "5m").lower())
+    if not match or int(match.group(1)) < 1:
+        return 300
+    amount, unit = int(match.group(1)), match.group(2)
+    return amount * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
 
 
 # --- Native correlation rendering (Gap 1) -------------------------------------

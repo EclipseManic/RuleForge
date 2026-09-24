@@ -204,6 +204,7 @@ def compile_request(request: Any, siem: str) -> dict[str, Any]:
         return {
             "siem": siem, "name": SIEMS[siem]["name"], "language": SIEMS[siem]["language"],
             "rule": "", "query": "", "refused": True,
+            "refusal_kind": "strict_fidelity",
             "refusal_reason": f"Strict mode: {', '.join(blocked) or 'this rule'} has no faithful "
                               f"{SIEMS[siem]['name']} equivalent. " + " ".join(reasons[:3]),
             "review_note": "Strict mode refuses lossy conversions. Disable strict mode to get a labelled partial draft.",
@@ -214,38 +215,41 @@ def compile_request(request: Any, siem: str) -> dict[str, Any]:
                        f"{', '.join(blocked) or 'the requested family'}."],
             "warnings": [], "validation": "failed", "section_blocks": [],
         }
-    if _has_advanced(request):
-        # F4: multi-event renders come from the canonical model so dialects with native
-        # sequence support emit real correlations; fidelity is the worse of both layers.
-        # The model MUST be built from the translated request, not the original: building
-        # it from `request` emitted canonical fields (process.name) while field_mapping
-        # reported the native one (TargetProcessName), so the API claimed a translation
-        # the rule did not contain - a rule that deploys and never matches.
-        from compiler.sigma_compiler import compile_model
-        model = _request_to_model(native_request)
-        query, cm_fidelity, cm_notes = compile_model(model, siem)
-        if _RANK[cm_fidelity] > _RANK[capability["fidelity"]]:
-            capability["fidelity"] = cm_fidelity
-        capability["notes"] = [*capability["notes"], *[n for n in cm_notes if n not in capability["notes"]]]
-    else:
-        # A target may refuse on its own constraints (Wazuh's frequency/timeframe ranges).
-        # Refuse THIS target, exactly as strict mode does, so selecting six targets and
-        # getting one Wazuh-specific 400 would cost the analyst the other five rules too.
-        try:
+    # Any renderer may refuse on its own constraints (Wazuh's frequency/timeframe ranges),
+    # and an advanced request reaches render_wazuh through compile_model rather than
+    # RENDERERS. Both paths must refuse THIS target, exactly as strict mode does, so
+    # selecting six targets and getting one Wazuh-specific 400 would not cost the analyst
+    # the other five rules too.
+    try:
+        if _has_advanced(request):
+            # F4: multi-event renders come from the canonical model so dialects with native
+            # sequence support emit real correlations; fidelity is the worse of both layers.
+            # The model MUST be built from the translated request, not the original: building
+            # it from `request` emitted canonical fields (process.name) while field_mapping
+            # reported the native one (TargetProcessName), so the API claimed a translation
+            # the rule did not contain - a rule that deploys and never matches.
+            from compiler.sigma_compiler import compile_model
+            model = _request_to_model(native_request)
+            query, cm_fidelity, cm_notes = compile_model(model, siem)
+            if _RANK[cm_fidelity] > _RANK[capability["fidelity"]]:
+                capability["fidelity"] = cm_fidelity
+            capability["notes"] = [*capability["notes"], *[n for n in cm_notes if n not in capability["notes"]]]
+        else:
             query = RENDERERS[siem](native_request)
-        except RuleValidationError as error:
-            return {
-                "siem": siem, "name": SIEMS[siem]["name"], "language": SIEMS[siem]["language"],
-                "rule": "", "query": "", "refused": True,
-                "refusal_reason": str(error),
-                "review_note": "This target's own limits reject the requested settings. "
-                               "Adjust them or drop this target; the other targets are unaffected.",
-                "technique_label": TECHNIQUES[request.technique]["label"],
-                "field_mapping": mapping, "fidelity": "unsupported",
-                "capability": capability["per_family"], "capability_notes": capability["notes"],
-                "checks": [str(error)], "warnings": [], "validation": "failed",
-                "section_blocks": [],
-            }
+    except RuleValidationError as error:
+        return {
+            "siem": siem, "name": SIEMS[siem]["name"], "language": SIEMS[siem]["language"],
+            "rule": "", "query": "", "refused": True,
+            "refusal_kind": "target_constraint",
+            "refusal_reason": str(error),
+            "review_note": "This target's own limits reject the requested settings. "
+                           "Adjust them or drop this target; the other targets are unaffected.",
+            "technique_label": TECHNIQUES[request.technique]["label"],
+            "field_mapping": mapping, "fidelity": "unsupported",
+            "capability": capability["per_family"], "capability_notes": capability["notes"],
+            "checks": [str(error)], "warnings": [], "validation": "failed",
+            "section_blocks": [],
+        }
     if siem == "wazuh" and request.condition_logic == "any" and len(request.conditions) > 1:
         capability["fidelity"] = "partial"
         capability["notes"] = [*capability["notes"], "boolean: OR branches render as ANDed <field> elements — split into separate rules."]

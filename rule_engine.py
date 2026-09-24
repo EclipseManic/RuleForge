@@ -275,11 +275,24 @@ def _rule_text(value: Any) -> str:
 
 def _timeframe(value: Any) -> str:
     text = _plain(value, "Time window", 10).lower()
-    if not re.fullmatch(r"\d{1,3}[smhd]", text):
+    if not re.fullmatch(r"\d{1,5}[smhd]", text):
         raise RuleValidationError("Time window must look like 30s, 5m, 1h, or 1d.")
     if int(text[:-1]) < 1:
         raise RuleValidationError("Time window must be at least 1s, 1m, 1h, or 1d.")
     return text
+
+
+def _duration_from_seconds(seconds: int) -> str:
+    """Canonical window text for an exact second count, coarsest exact unit first.
+
+    Wazuh stores its timeframe in seconds, so importing one has to round-trip the value
+    rather than approximate it: 61s must not come back as 1m, and a valid 99999s must not
+    be rejected as too long for the window grammar.
+    """
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds % size == 0 and seconds // size >= 1:
+            return f"{seconds // size}{unit}"
+    return f"{max(1, seconds)}s"
 
 
 def _strict_flag(value: Any) -> bool:
@@ -424,19 +437,36 @@ def _wazuh_attribute_problems(threshold: int | None, timeframe: str) -> list[str
     once is just a rule with no frequency). `timeframe` is in SECONDS and is capped at
     99999. Neither is enforced by the generic parser, so without this a request can
     return HTTP 200 carrying attribute values Wazuh will reject or silently misread.
+
+    Both attributes are only emitted when a count is actually turned on, so with no
+    count neither is checked: refusing a Wazuh rule for a window its output does not
+    contain would cost the analyst the target for no reason.
     """
     problems: list[str] = []
-    if threshold is not None and threshold > 1:
-        if threshold > WAZUH_MAX_FREQUENCY:
-            problems.append(
-                f"Wazuh frequency allows at most {WAZUH_MAX_FREQUENCY} matches; "
-                f"threshold {threshold} is out of range")
-    seconds = _minutes(timeframe) * 60
+    if threshold is None or threshold <= 1:
+        return problems
+    if threshold > WAZUH_MAX_FREQUENCY:
+        problems.append(
+            f"Wazuh frequency allows at most {WAZUH_MAX_FREQUENCY} matches; "
+            f"threshold {threshold} is out of range")
+    seconds = _timeframe_seconds(timeframe)
     if seconds > WAZUH_MAX_TIMEFRAME_SECONDS:
         problems.append(
             f"Wazuh timeframe allows at most {WAZUH_MAX_TIMEFRAME_SECONDS} seconds; "
             f"{timeframe} is {seconds}s")
     return problems
+
+
+def _timeframe_seconds(timeframe: str) -> int:
+    """Exact seconds for a window, for targets whose attribute counts in seconds.
+
+    Wazuh's `timeframe` is a seconds count, so 30s must stay 30. `_minutes` exists for
+    QRadar's `LAST n MINUTES`, which can only express whole minutes and so rounds up -
+    using it for Wazuh silently doubled a 30s window to 60 and turned a count window
+    into a different count window.
+    """
+    quantity, unit = int(timeframe[:-1]), timeframe[-1]
+    return quantity * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
 
 
 def _minutes(timeframe: str) -> int:
@@ -829,7 +859,7 @@ def render_wazuh(request: RuleRequest) -> str:
     if problems:
         raise RuleValidationError(" ".join(problems))
     if request.threshold and request.threshold > 1:
-        frequency = f' frequency="{request.threshold}" timeframe="{_minutes(request.timeframe) * 60}"'
+        frequency = f' frequency="{request.threshold}" timeframe="{_timeframe_seconds(request.timeframe)}"'
         static_group_fields = {
             "user": "<same_user />", "user.name": "<same_user />",
             "srcip": "<same_srcip />", "source.ip": "<same_srcip />",
@@ -871,35 +901,78 @@ def generate_workbench(payload: dict[str, Any]) -> dict[str, Any]:
     source_document = None
     if payload.get("source_analysis"):
         source_document = DetectionDocument.from_analysis(payload["source_analysis"])
-    if payload.get("preserve_source_rule") is True and payload.get("source_rule") and isinstance(payload.get("source_siem"), str) and payload.get("source_siem") in SIEMS:
+    preserve_wanted = payload.get("preserve_source_rule") is True and bool(payload.get("source_rule"))
+    preservation_possible = (preserve_wanted
+                             and isinstance(payload.get("source_siem"), str)
+                             and payload.get("source_siem") in SIEMS)
+    preservation_applied = False
+    if preservation_possible:
         for rule in rules:
-            if rule["siem"] == payload["source_siem"]:
-                rule["rule"] = str(payload["source_rule"])
-                rule["fidelity"] = "exact"
-                rule["equivalent_recompile"] = True
-                rule["review_note"] = "Original source rule preserved exactly. Generated alternatives for other SIEMs are normalized drafts."
+            if rule["siem"] != payload["source_siem"]:
+                continue
+            if rule.get("refused"):
+                # Preserving over a refusal would hand a consumer a non-empty Wazuh rule on
+                # an item still marked refused/validation failed. The refusal is the truth.
+                rule["review_note"] = (
+                    "This target refused the requested settings, so the source rule was not "
+                    "restored onto it. Fix the settings, or deploy the source rule as-is from "
+                    "where it came from.")
+                continue
+            source_text = str(payload["source_rule"])
+            # `query` must not keep describing the generated draft. Every downstream check,
+            # warning and validation verdict below was computed against the draft, so they
+            # cannot be carried over to text this tool did not produce.
+            rule["rule"] = source_text
+            rule["query"] = source_text
+            rule["fidelity"] = "exact"
+            rule["equivalent_recompile"] = True
+            rule["preserved_source"] = True
+            rule["checks"] = ["Original source preserved verbatim. This tool did not re-validate this text, so the checks and warnings for the generated draft do not apply to it."]
+            rule["warnings"] = []
+            rule["validation"] = "unverified"
+            rule["review_note"] = "Original source rule preserved exactly. Generated alternatives for other SIEMs are normalized drafts."
+            preservation_applied = True
     elif payload.get("source_rule"):
         for rule in rules:
+            if rule.get("refused"):
+                continue
             rule["fidelity"] = "partial"
             rule["equivalent_recompile"] = False
             rule["review_note"] = "The imported rule was edited. This is a normalized draft; compare it with the original before using it."
     gates = quality_gates(request, [rule["field_mapping"] for rule in rules])
-    if payload.get("preserve_source_rule") is True and payload.get("source_rule") and payload.get("source_siem") not in request.siems:
-        gates.append({"level": "warn", "title": "Source preservation skipped",
-                      "detail": f"Preservation was requested for {payload.get('source_siem')} but it is not among the selected targets; no output preserves the original source."})
+    if preserve_wanted and not preservation_applied:
+        target = payload.get("source_siem")
+        refused_source = any(r["siem"] == target and r.get("refused") for r in rules)
+        if refused_source:
+            detail = (f"{target} refused the requested settings, so the original rule was not preserved onto it; "
+                      "nothing in this bundle is the source artifact.")
+        elif not (isinstance(target, str) and target in SIEMS):
+            detail = (f"Preservation was requested for {target!r}, which is not a SIEM this tool targets; "
+                      "no output preserves the original source.")
+        else:
+            detail = (f"Preservation was requested for {target} but it is not among the selected targets; "
+                      "no output preserves the original source.")
+        gates.append({"level": "warn", "title": "Source preservation skipped", "detail": detail})
+    decision = (source_document.compile_decision(
+        preserve_source=payload.get("preserve_source_rule") is True,
+        target_siem=payload.get("source_siem", ""),
+    ) if source_document else {"mode": "generated", "fidelity": "native", "equivalent": True})
+    if preserve_wanted and not preservation_applied and decision.get("mode") == "preserve_source":
+        # The contract describes the request's intent. Reality wins: if the source target
+        # never got an artifact, nothing here is the preserved source and claiming exact
+        # preservation would be the same false claim as a 200 on an invalid Wazuh rule.
+        decision = {"mode": "preserve_source_not_applied", "fidelity": "unsupported",
+                    "equivalent": False,
+                    "reason": [f"No output for {payload.get('source_siem')} exists to carry the original rule, so the original was not preserved."]}
     return {
         "rules": rules,
         "quality_gates": gates,
-        "compile_contract": {
-            "source": source_document.compile_decision(
-                preserve_source=payload.get("preserve_source_rule") is True,
-                target_siem=payload.get("source_siem", ""),
-            ) if source_document else {"mode": "generated", "fidelity": "native", "equivalent": True},
-        },
+        "compile_contract": {"source": decision},
         "compile_allowed": not (
-            source_document
-            and not payload.get("preserve_source_rule")
-            and not source_document.equivalent_recompile
+            (source_document
+             and not payload.get("preserve_source_rule")
+             and not source_document.equivalent_recompile)
+            or (preserve_wanted and not preservation_applied)
         ),
     }
 
@@ -1221,7 +1294,7 @@ def analyze_rule(rule_text: Any, siem: Any) -> dict[str, Any]:
                 if "frequency" in native_metadata:
                     threshold = int(native_metadata["frequency"])
                 if "timeframe" in native_metadata:
-                    timeframe = f"{max(1, round(int(native_metadata['timeframe']) / 60))}m"
+                    timeframe = _duration_from_seconds(int(native_metadata["timeframe"]))
                 group_map = {"same_srcip": "source.ip", "same_dstip": "destination.ip", "same_user": "user.name"}
                 group_by = next((group_map[tag] for tag in native_metadata["same_fields"] if tag in group_map), "user.name")
                 native_sections["rule"] = ET.tostring(rule_node, encoding="unicode")

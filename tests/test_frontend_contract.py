@@ -383,6 +383,24 @@ class FrontendContractTests(unittest.TestCase):
         self.assertNotIn("open", panel.group(0)[:panel.group(0).index(">")],
                          msg="the optional panel must start collapsed")
 
+    def test_a_target_range_refusal_is_not_blamed_on_strict_mode(self):
+        """Two different controls refuse a target, and only one of them is strict mode.
+
+        The UI hardcoded 'Strict mode refused this target' and told the analyst to disable
+        strict mode. A vendor range violation cannot be disabled, so that advice sends the
+        analyst to the wrong control and hides the real fix (lower the count, shorten the
+        window). The backend test covers refusal_kind; this pins the rendering.
+        """
+        self.assertIn("refusal_kind", self.source,
+                      msg="the banner must be able to tell the two refusals apart")
+        self.assertIn("target_constraint", self.source)
+        self.assertIn("strict_fidelity", self.source)
+        # Exactly one unconditional 'Strict mode refused' heading would be the old bug.
+        self.assertNotRegex(self.source, r"<b>Strict mode refused this target:</b>",
+                            msg="the strict-mode wording must not be hardcoded for every refusal")
+        self.assertIn("refusedHeading", self.source)
+        self.assertIn("refusedAdvice", self.source)
+
     def test_window_is_not_described_as_a_schedule(self):
         """There is no scheduler in this tool.
 

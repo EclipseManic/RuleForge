@@ -240,8 +240,14 @@ function renderRules(rules, gates) { const output = document.querySelector('#res
         ? [`<span class="unmapped-chip" title="${escapeHtml('No built-in mapping exists for this field, so its name is passed through unchanged instead of being translated to a vendor column. It may not exist in your SIEM.')}">unmapped field: ${escapeHtml(mapping.native_field || 'field')}</span>`]
         : [])
     ].join('');
+    const refusedHeading = item.refusal_kind === 'target_constraint'
+      ? 'This target refused these settings:'
+      : (item.refusal_kind === 'strict_fidelity' ? 'Strict mode refused this target:' : 'This target was refused:');
+    const refusedAdvice = item.refusal_kind === 'target_constraint'
+      ? 'The target vendor rejects this combination of settings. Lower the count, shorten the window, or drop the target; the other targets are unaffected.'
+      : (item.refusal_kind === 'strict_fidelity' ? 'Strict mode refuses lossy conversions; disable it for a labelled partial draft.' : '');
     const banner = item.refused
-      ? `<div class="fidelity-banner unsupported" role="alert"><b>Strict mode refused this target:</b> ${escapeHtml(item.refusal_reason || 'no faithful equivalent')}</div>`
+      ? `<div class="fidelity-banner unsupported" role="alert"><b>${refusedHeading}</b> ${escapeHtml(item.refusal_reason || 'no faithful equivalent')}</div>`
       : ((item.fidelity === 'partial' || item.fidelity === 'unsupported')
         ? `<div class="fidelity-banner ${escapeHtml(item.fidelity)}" role="note"><b>${escapeHtml(item.fidelity)} output:</b> ${escapeHtml((item.capability_notes || [])[0] || (item.fidelity === 'unsupported' ? 'Not expressible in this dialect - see preserved source.' : 'Single-event projection - verify it matches all stages.'))}</div>`
         : '');
@@ -249,7 +255,7 @@ function renderRules(rules, gates) { const output = document.querySelector('#res
       ? `<div class="capability-notes">${(item.capability_notes || []).map(n => `<p><b>Capability:</b> ${escapeHtml(n)}</p>`).join('')}${(item.warnings || []).map(w => `<p><b>Warning:</b> ${escapeHtml(w)}</p>`).join('')}${(item.checks || []).map(c => `<p><b>Check:</b> ${escapeHtml(c)}</p>`).join('')}</div>`
       : '';
     const body = item.refused
-      ? `<p class="review-note"><b>No query emitted.</b> ${escapeHtml(item.review_note || '')} Strict mode refuses lossy conversions; disable it for a labelled partial draft.</p>`
+      ? `<p class="review-note"><b>No query emitted.</b> ${escapeHtml(item.review_note || '')} ${escapeHtml(refusedAdvice)}</p>`
       : `<div class="rule-primary">
            <div class="rule-primary-head">
              <span class="rule-primary-label">Complete rule &mdash; this is what you deploy</span>
