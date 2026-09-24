@@ -118,13 +118,27 @@ document.querySelector('#analyze-rule').addEventListener('click', async () => {
     if (!body || !Array.isArray(body.conditions) || !body.payload_defaults || typeof body.payload_defaults !== 'object' || !Array.isArray(body.suggestions)) throw new Error('Unexpected analysis response.');
     const defaults = body.payload_defaults;
     conditionList.replaceChildren();
-    body.conditions.forEach(condition => addCondition(conditionList, condition));
-    if (!body.conditions.length) addCondition(conditionList, body.payload_defaults);
+    /* The select is the form's operator vocabulary. An analyser that answers with a token
+       the select does not contain (Sigma says `endswith`, the form says `ends_with`)
+       silently blanks the row, and a blank operator 400s the explainer and the canonical
+       compile. Keep the normalization here as well as in the API so drift can never blank. */
+    const OPERATOR_ALIAS = {endswith: 'ends_with', startswith: 'starts_with'};
+    const addAnalyzed = target => (target.conditions || []).forEach(condition =>
+      addCondition(target.list, Object.assign({}, condition, {
+        operator: OPERATOR_ALIAS[condition.operator] || condition.operator || 'contains',
+      })));
+    addAnalyzed({list: conditionList, conditions: body.conditions});
+    if (!body.conditions.length) addCondition(conditionList, Object.assign({}, defaults, {
+      operator: OPERATOR_ALIAS[defaults.operator] || defaults.operator || 'contains',
+    }));
     document.querySelector('#condition-logic').value = 'all';
     technique.value = 'custom';
     document.querySelector('[name="title"]').value = `Imported ${body.detected_siem} rule`;
     document.querySelector('#f-description').value = `Imported ${body.detected_siem} rule for analyst review and tuning.`;
-    document.querySelectorAll('[name="siems"]').forEach(box => { box.checked = box.value === body.siem; });
+    /* A Sigma paste is vendor-neutral, so narrowing the targets to "Sigma" would answer the
+       question nobody asked. Only a vendor source pins the list to that vendor; otherwise the
+       analyst's own selection stands. */
+    if (body.siem && body.siem !== 'sigma') document.querySelectorAll('[name="siems"]').forEach(box => { box.checked = box.value === body.siem; });
     document.querySelector('#toggle-targets').textContent = 'Select all';
     thresholdToggle.checked = body.payload_defaults.use_threshold;
     document.querySelector('[name="data_source"]').value = body.payload_defaults.data_source;
@@ -132,7 +146,7 @@ document.querySelector('#analyze-rule').addEventListener('click', async () => {
     syncThresholdControls();
     document.querySelector('[name="threshold"]').value = defaults.threshold;
     document.querySelector('[name="timeframe"]').value = defaults.timeframe;
-    importedSource = {rule, siem: body.siem};
+    importedSource = {rule, siem: body.siem, sigma: body.siem === 'sigma' ? rule : null};
     importedSourceDirty = false;
     importedAnalysis = body;
     importedCompileBlocked = false;
@@ -191,7 +205,18 @@ const errorBox = document.querySelector('#form-error');
    filled it with text that the analyst never saw, because nothing cleared `hidden`. */
 function showError(message) { errorBox.textContent = message; errorBox.hidden = false; errorBox.setAttribute('role', 'alert'); }
 function clearError() { errorBox.textContent = ''; errorBox.hidden = true; }
-form.addEventListener('input', () => { if (importedSource) importedSourceDirty = true; });
+/* "Dirty" must mean the RULE changed, not that the analyst touched anything. Choosing
+   targets, toggling strict mode or the threshold switch does not alter the rule, and the
+   imported source still describes it - so marking the import dirty on those silently
+   downgraded a Sigma paste to the form projection the moment anyone picked a target, which
+   is the first thing every analyst does. */
+const NON_RULE_INPUTS = new Set(['siems', 'strict', 'use-threshold']);
+form.addEventListener('input', event => {
+  if (!importedSource) return;
+  const el = event.target;
+  if (el && (NON_RULE_INPUTS.has(el.name) || NON_RULE_INPUTS.has(el.id))) return;
+  importedSourceDirty = true;
+});
 form.addEventListener('submit', async event => {
     event.preventDefault(); clearError(); const submit = form.querySelector('button[type=submit]');
   if (importedCompileBlocked) { showError('This advanced rule contains native correlation logic. Edit and re-analyze the source rule instead of compiling the flattened condition view.'); return; }
@@ -203,7 +228,7 @@ form.addEventListener('submit', async event => {
   const thresholdState = readThreshold();
   if (thresholdState.error) { showError(thresholdState.error); return; }
   const thresholdValue = thresholdState.value;
-  const data = Object.fromEntries(new FormData(form).entries()); data.threshold = thresholdValue; data.use_threshold = thresholdToggle.checked; data.strict = document.querySelector('#strict').checked; data.siems = [...document.querySelectorAll('[name="siems"]:checked')].map(node => node.value); data.conditions = [...conditionList.querySelectorAll('.condition-row')].map(row => ({field: row.querySelector('[data-condition-field]').value, operator: row.querySelector('[data-condition-operator]').value, value: row.querySelector('[data-condition-value]').value})); if (!data.conditions.length || !data.conditions[0].field) { showError('Add at least one detection condition with a field name.'); return; } if (!patternDefaults[data.technique]) { showError('Choose a behavior pattern from the list.'); return; } data.exclude_conditions = [...exclusionList.querySelectorAll('.condition-row')].map(row => ({field: row.querySelector('[data-condition-field]').value, operator: row.querySelector('[data-condition-operator]').value, value: row.querySelector('[data-condition-value]').value})); data.correlation = currentCorrelation(); data.correlation_model = {streams: [...document.querySelectorAll('[data-model-stream-name]')].map((node, index) => ({name: node.value, source: document.querySelectorAll('[data-model-stream-source]')[index]?.value || ''})), joins: [...document.querySelectorAll('[data-model-join-on]')].map((node, index) => ({kind: document.querySelectorAll('[data-model-join-kind]')[index]?.value || 'inner', right: document.querySelectorAll('[data-model-join-right]')[index]?.value || '', on: node.value})), time_constraints: [...document.querySelectorAll('[data-model-time]')].map(node => node.value)}; data.field = data.conditions[0].field; data.operator = data.conditions[0].operator; data.value = data.conditions[0].value; if (importedSource) { data.source_rule = importedSource.rule; data.source_siem = importedSource.siem; data.source_analysis = importedAnalysis; data.preserve_source_rule = !importedSourceDirty; }
+  const data = Object.fromEntries(new FormData(form).entries()); data.threshold = thresholdValue; data.use_threshold = thresholdToggle.checked; data.strict = document.querySelector('#strict').checked; data.siems = [...document.querySelectorAll('[name="siems"]:checked')].map(node => node.value); data.conditions = [...conditionList.querySelectorAll('.condition-row')].map(row => ({field: row.querySelector('[data-condition-field]').value, operator: row.querySelector('[data-condition-operator]').value, value: row.querySelector('[data-condition-value]').value})); if (!data.conditions.length || !data.conditions[0].field) { showError('Add at least one detection condition with a field name.'); return; } if (!patternDefaults[data.technique]) { showError('Choose a behavior pattern from the list.'); return; } data.exclude_conditions = [...exclusionList.querySelectorAll('.condition-row')].map(row => ({field: row.querySelector('[data-condition-field]').value, operator: row.querySelector('[data-condition-operator]').value, value: row.querySelector('[data-condition-value]').value})); data.correlation = currentCorrelation(); data.correlation_model = {streams: [...document.querySelectorAll('[data-model-stream-name]')].map((node, index) => ({name: node.value, source: document.querySelectorAll('[data-model-stream-source]')[index]?.value || ''})), joins: [...document.querySelectorAll('[data-model-join-on]')].map((node, index) => ({kind: document.querySelectorAll('[data-model-join-kind]')[index]?.value || 'inner', right: document.querySelectorAll('[data-model-join-right]')[index]?.value || '', on: node.value})), time_constraints: [...document.querySelectorAll('[data-model-time]')].map(node => node.value)}; data.field = data.conditions[0].field; data.operator = data.conditions[0].operator; data.value = data.conditions[0].value; if (importedSource) { data.source_rule = importedSource.rule; data.source_siem = importedSource.siem; data.source_analysis = importedAnalysis; data.preserve_source_rule = !importedSourceDirty; /* A pasted Sigma rule keeps its own text so the compile can go through the vendor-authored backend. Once the analyst edits the form, the form is the source of truth and the Sigma text would misrepresent it. */ if (importedSource.sigma && !importedSourceDirty) { data.sigma = importedSource.sigma; } }
   if (!form.reportValidity()) return;
   submit.disabled = true; submit.innerHTML = '<span>Compiling templates…</span><span class="spinner"></span>';
   try { const response = await fetch('/api/generate', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)}); const body = await response.json(); if (!response.ok) throw new Error(body.error || 'Unable to generate templates.'); currentPayload = data; compiledRules = body.rules; currentQualityGates = body.quality_gates || []; currentCompileContract = body.compile_contract || null; renderRules(compiledRules, currentQualityGates); loadHistory();
@@ -221,6 +246,13 @@ function renderRules(rules, gates) { const output = document.querySelector('#res
     const fidelity = item.fidelity ? `<span class="fidelity-badge ${escapeHtml(item.fidelity)}">${escapeHtml(item.fidelity)}</span>` : '';
     const validation = item.validation ? `<span class="validation-tag" title="How strongly this output was validated">validated: ${escapeHtml(item.validation)}</span>` : '';
     const chips = [
+      // Which converter produced this. A Sigma paste can be handled by the vendor-authored
+      // backend or by the built-in draft renderer, and the backend already labels them
+      // `sigma-pysigma` vs `sigma-built-in` - but the UI showed neither, so an authoritative
+      // conversion and a hand-rolled draft looked identical in the result list.
+      ...(mapping.mapping_source
+        ? [`<span class="unmapped-chip" title="${escapeHtml(mapping.mapping_source === 'sigma-pysigma' ? 'Converted by the vendor-authored pySigma backend. The syntax is authoritative; the field names are whatever that backend emitted.' : 'Produced by this tool\'s built-in renderer, not a vendor backend. Treat it as a draft, not an equivalent rule.')}">source: ${escapeHtml(mapping.mapping_source)}</span>`]
+        : []),
       ...(mapping.unmapped_fields || []).map(f => `<span class="unmapped-chip">unmapped: ${escapeHtml(f)}</span>`),
       // Inferred mappings (targets with no published schema) are applied, not left
       // unmapped, so without an explicit chip they would read as verified.

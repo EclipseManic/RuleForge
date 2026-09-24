@@ -289,6 +289,14 @@ class FrontendContractTests(unittest.TestCase):
         self.assertRegex(self.source, r"outputCount\.textContent\s*=",
                          msg="the compiled target count must be written back to the panel")
 
+    def test_the_result_card_names_which_converter_produced_it(self):
+        """The backend labelled Sigma output `sigma-pysigma` vs `sigma-built-in` and the
+        UI showed neither, so a vendor-authored conversion and a built-in draft were
+        indistinguishable in the result list."""
+        self.assertIn("mapping.mapping_source", self.source,
+                      msg="the card must render the converter that produced this output")
+        self.assertIn("source: ${escapeHtml(mapping.mapping_source)}", self.source)
+
     def test_every_id_and_navigation_target_actually_exists(self):
         """Nav is wired by string, so a rename leaves the page serving 200 and doing nothing.
 

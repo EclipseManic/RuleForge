@@ -941,6 +941,128 @@ class AuditFixTests(unittest.TestCase):
         self.assertLess(max(by_target.values()), body["field_count"],
                         msg="the count must be reported against the taxonomy it is drawn from")
 
+    def test_analyze_speaks_the_forms_operator_vocabulary(self):
+        """Sigma says `endswith`; the form's operator select holds `ends_with`.
+
+        The raw modifier was written straight into the select, which matched nothing, so the
+        row went out with an empty operator. /api/explain and /api/compile both answered 400
+        and the UI swallowed both - the explainer vanished and lastCompiledModel was never
+        set, which quietly breaks fixtures and diff later. The endpoint must answer in the
+        one vocabulary its consumer can actually select.
+        """
+        sigma = ("title: Ops\nlogsource:\n  product: windows\ndetection:\n  sel:\n"
+                 "    Image|endswith: a.exe\n    CommandLine|startswith: -e\n"
+                 "    Other|contains: x\n  condition: sel\n")
+        body = self.client.post("/api/analyze", json={"siem": "sigma", "rule": sigma}).get_json()
+        operators = {c["field"]: c["operator"] for c in body["conditions"]}
+        self.assertEqual(operators, {"Image": "ends_with", "CommandLine": "starts_with",
+                                     "Other": "contains"})
+        # Every operator the endpoint returns must be selectable, or the row goes blank.
+        selectable = {"contains", "equals", "starts_with", "ends_with", "regex", "in_list",
+                      "wildcard", "windash", "base64", "exists", "cidr"}
+        for entry in [*body["conditions"], *body.get("exclusions", [])]:
+            self.assertIn(entry["operator"], selectable,
+                          msg=f"{entry['field']} carries {entry['operator']!r}, which no option matches")
+        self.assertIn(body["payload_defaults"]["operator"], selectable)
+        # And the round trip the UI relies on must not 400.
+        payload = {"conditions": [{"field": f, "operator": o, "value": "v"} for f, o in operators.items()],
+                   "exclude_conditions": [], "threshold": 1, "timeframe": "5m", "group_by": "user.name",
+                   "title": "t", "description": "d", "severity": "high", "technique": "custom",
+                   "data_source": "*", "siems": ["splunk"], "condition_logic": "all",
+                   "use_threshold": False, "strict": False, "correlation": {}}
+        for path in ("/api/compile", "/api/explain"):
+            self.assertEqual(self.client.post(path, json=payload).status_code, 200, path)
+
+    def test_a_vendor_neutral_import_does_not_narrow_the_target_list(self):
+        """Importing Sigma left only "Sigma" checked, so a vendor-neutral paste answered a
+        question nobody asked instead of producing SPL/KQL/EQL."""
+        sigma = ("title: Ops\nlogsource:\n  product: windows\ndetection:\n  sel:\n"
+                 "    Image|endswith: a.exe\n  condition: sel\n")
+        body = self.client.post("/api/analyze", json={"siem": "sigma", "rule": sigma}).get_json()
+        self.assertEqual(body["siem"], "sigma")
+        source = APP_JS.read_text(encoding="utf-8")
+        self.assertIn("body.siem !== 'sigma'", source,
+                      msg="only a vendor source may pin the target list to itself")
+        self.assertIn("OPERATOR_ALIAS", source,
+                      msg="the select write must normalize even if the API drifts")
+
+    def test_a_pasted_sigma_rule_reaches_the_authoritative_backend(self):
+        """The UI could paste real Sigma YAML and never reach the vendor-authored backend.
+
+        The form compiles through /api/generate, which took only form conditions, so a
+        Sigma paste was rebuilt from Sigma field names with `mapping_confidence: unmapped`
+        while /api/compile's pySigma path sat unused. For the same rule, five targets now
+        come back as vendor-converted, and the targets with no backend are labelled
+        built-in rather than dressed up as authoritative.
+        """
+        sigma = ("title: Encoded PowerShell\nid: 9f1a2b3c-1111-2222-3333-444455556666\n"
+                 "status: test\ndescription: Detects encoded PowerShell\n"
+                 "logsource:\n  product: windows\n  category: process_creation\n"
+                 "detection:\n  selection:\n    Image|endswith: '\\powershell.exe'\n"
+                 "    CommandLine|contains: -enc\n  condition: selection\nlevel: high\n")
+        base = {"title": "Encoded PowerShell", "description": "d", "severity": "high",
+                "technique": "custom", "timeframe": "5m", "group_by": "user.name",
+                "data_source": "*", "threshold": 1, "use_threshold": False}
+        without = self.client.post("/api/generate", json={
+            **base, "siems": ["splunk"],
+            "conditions": [{"field": "Image", "operator": "ends_with", "value": "\\powershell.exe"}],
+        }).get_json()["rules"][0]
+        self.assertEqual(without["field_mapping"]["mapping_confidence"], "unmapped",
+                         msg="baseline: the form path cannot translate a Sigma field name")
+
+        rv = self.client.post("/api/generate", json={
+            **base, "siems": ["splunk", "sentinel", "elastic", "falcon", "qradar", "wazuh"],
+            "sigma": sigma})
+        self.assertEqual(rv.status_code, 200)
+        body = rv.get_json()
+        by_siem = {r["siem"]: r for r in body["rules"]}
+        sources = {s: r["field_mapping"]["mapping_source"] for s, r in by_siem.items()}
+        self.assertTrue(any(v == "sigma-pysigma" for v in sources.values()),
+                        f"no target used the authoritative backend: {sources}")
+        if any(v == "sigma-pysigma" for v in sources.values()):
+            for siem, source in sources.items():
+                if source != "sigma-pysigma":
+                    continue
+                rule = by_siem[siem]
+                self.assertEqual(rule["fidelity"], "exact", siem)
+                self.assertEqual(rule["field_mapping"]["mapping_confidence"], "unverified", siem)
+                self.assertTrue(any("Sigma" in n for n in rule["capability_notes"]), siem)
+        for siem, source in sources.items():
+            if source == "sigma-built-in":
+                self.assertNotEqual(by_siem[siem]["field_mapping"]["mapping_confidence"], "documented",
+                                    msg=f"{siem} must not claim a verified mapping it did not make")
+        # The Sigma field-provenance disclosure must reach every target, not just the first.
+        for siem, rule in by_siem.items():
+            self.assertTrue(rule["capability_notes"], f"{siem} emitted no note at all")
+        # Placeholder-scope caveats are carried in target_warnings, not target_check; the
+        # Sigma path used to drop them, hiding "unscoped index=* - replace before enabling".
+        self.assertTrue(any("index=*" in w or "index" in w.lower()
+                            for w in by_siem.get("splunk", {}).get("warnings", [])),
+                        msg="the unscoped index warning must survive the Sigma path")
+
+    def test_choosing_targets_does_not_discard_the_imported_sigma(self):
+        """The first thing anyone does after an import is pick targets.
+
+        The form's input handler marked the import dirty on ANY change, so ticking a target
+        silently downgraded a Sigma paste to the form projection - the unverified-field
+        draft - with no visible reason, and picking a target is not an edit to the rule.
+        """
+        source = APP_JS.read_text(encoding="utf-8")
+        self.assertIn("NON_RULE_INPUTS", source)
+        for name in ("siems", "strict", "use-threshold"):
+            self.assertIn(f"'{name}'", source,
+                          msg=f"{name} does not alter the rule, so it must not dirty the import")
+
+    def test_the_ui_sends_the_sigma_text_it_already_holds(self):
+        """The backend path is useless if the form never sends the Sigma it imported."""
+        source = APP_JS.read_text(encoding="utf-8")
+        self.assertIn("sigma: body.siem === 'sigma' ? rule : null", source,
+                      msg="an analysed Sigma import must retain its own text")
+        self.assertIn("data.sigma = importedSource.sigma", source,
+                      msg="the compile must send it")
+        self.assertIn("!importedSourceDirty", source,
+                      msg="once the analyst edits the form, the Sigma text no longer describes it")
+
     def test_the_mapping_stat_does_not_claim_verification(self):
         """Wazuh and QRadar publish no field schema, so no mapping count may be called
         'verified' - that word is what made an inferred convention look like a column."""

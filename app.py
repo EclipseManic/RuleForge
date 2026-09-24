@@ -9,8 +9,8 @@ from models.correlation import Predicate
 
 from flask import Flask, jsonify, render_template, request
 
-from rule_engine import (FIELD_MAPPINGS, SIEMS, TECHNIQUES, RuleValidationError, analyze_rule, detect_siem,
-                         generate_rules, generate_workbench, supported_siems)
+from rule_engine import (FIELD_MAPPINGS, OPERATOR_ALIASES, SIEMS, TECHNIQUES, RuleValidationError, analyze_rule,
+                         detect_siem, generate_rules, generate_workbench, supported_siems)
 from storage import RuleStore
 from section_view import section_blocks
 from compiler.validators import faithfulness, sigma_check, target_check
@@ -324,9 +324,15 @@ def create_app() -> Flask:
         payload = request.get_json(silent=True)
         if not isinstance(payload, dict):
             return jsonify({"error": "Send a JSON request body."}), 400
+        # A pasted Sigma rule is converted by the vendor-authored backend when one exists,
+        # because rebuilding it from the form's Sigma field names produced a draft with no
+        # mapping at all. The UI can only reach this through /api/generate, so the Sigma
+        # path has to live here too or it is unreachable in practice.
+        use_sigma = bool(str(payload.get("sigma", "")).strip()) and payload.get("sigma_authoritative", True) is not False
         try:
-            workbench = generate_workbench(payload)
-        except RuleValidationError as error:
+            workbench = (_sigma_workbench(payload, [s for s in payload.get("siems", []) if isinstance(s, str)])
+                         if use_sigma else generate_workbench(payload))
+        except (RuleValidationError, ValueError, RecursionError) as error:
             return jsonify({"error": str(error)}), 400
         generated_at = datetime.now(timezone.utc).isoformat()
         for rule in workbench["rules"]:
@@ -359,6 +365,17 @@ def create_app() -> Flask:
             result = analyze_rule(payload.get("rule"), payload.get("siem", "auto"))
         except RuleValidationError as error:
             return jsonify({"error": str(error)}), 400
+        # One vocabulary out of this endpoint. Sigma modifiers arrive as `endswith` /
+        # `startswith`, but the form's operator <select> holds `ends_with` /
+        # `starts_with`, so writing the raw modifier into it selected NOTHING: the row
+        # went out with an empty operator, /api/explain and /api/compile both answered 400,
+        # and the UI swallowed both. Normalize here so no consumer has to know the alias table.
+        for entry in [*(result.get("conditions") or []), *(result.get("exclusions") or [])]:
+            if isinstance(entry, dict) and isinstance(entry.get("operator"), str):
+                entry["operator"] = OPERATOR_ALIASES.get(entry["operator"], entry["operator"])
+        defaults = result.get("payload_defaults")
+        if isinstance(defaults, dict) and isinstance(defaults.get("operator"), str):
+            defaults["operator"] = OPERATOR_ALIASES.get(defaults["operator"], defaults["operator"])
         # Analyst upgrade: full-model explainer attached (additive, legacy keys kept)
         try:
             model = _analysis_to_model(result)
@@ -431,6 +448,7 @@ def create_app() -> Flask:
             return jsonify({"error": str(error)}), 400
         outputs = []
         from compiler.pipeline import compile_request
+        from compiler.validators import target_warnings
         for siem in targets:
             if payload.get("sigma"):
                 from compiler.validators import validation_level
@@ -499,6 +517,7 @@ def create_app() -> Flask:
                     }
                 outputs.append({"siem": siem, "query": query, "rule": query, "fidelity": fidelity,
                                 "notes": notes, "checks": checks,
+                                "warnings": target_warnings(siem, query),
                                 "validation": validation_level(siem, checks, py_sigma),
                                 "capability_notes": notes,
                                 "field_mapping": mapping,
@@ -749,6 +768,94 @@ def _iter_predicates(node: Any) -> list[Any]:
         elif hasattr(current, "children"):
             stack.extend(list(current.children))
     return found
+
+
+def _sigma_workbench(payload: dict[str, Any], targets: list[str]) -> dict[str, Any]:
+    """Workbench-shaped results for a pasted Sigma rule.
+
+    An analyst could paste real Sigma YAML, get a draft assembled from Sigma field names
+    with no mapping, and never reach the vendor-authored backend that was already wired
+    into /api/compile. This reuses that path and reshapes it into the `rules` contract the
+    UI already renders, so the form and the API agree on which conversion is authoritative.
+    """
+    from compiler.sigma_compiler import compile_model, compile_sigma_with_pysigma, pysigma_status
+    from compiler.validators import target_warnings, validation_level
+
+    sigma_yaml = str(payload.get("sigma", ""))
+    model, _ = _payload_to_model({**payload, **_request_from_sigma(sigma_yaml)})
+    rules: list[dict[str, Any]] = []
+    authoritative = 0
+    for siem in targets:
+        meta = SIEMS.get(siem, {"name": siem, "language": ""})
+        converted = compile_sigma_with_pysigma(sigma_yaml, siem)
+        if converted is not None:
+            query, notes = converted
+            fidelity = "exact"
+            authoritative += 1
+            seen = _sigma_native_fields(query)
+            notes = [*notes, _SIGMA_FIELD_NOTE.format(
+                fields=(f" Field names seen: {', '.join(seen)}." if seen else ""))]
+            mapping = {"canonical_field": "Sigma rule fields, passed through",
+                       "native_field": ", ".join(seen) or "not enumerated",
+                       "mapping_confidence": "unverified", "mapping_source": "sigma-pysigma"}
+        else:
+            try:
+                query, fidelity, notes = compile_model(model, siem)
+            except RuleValidationError as refusal:
+                rules.append({"siem": siem, "name": meta.get("name", siem),
+                              "language": meta.get("language", ""), "rule": "", "query": "",
+                              "fidelity": "unsupported", "refused": True,
+                              "refusal_kind": "target_constraint",
+                              "refusal_reason": str(refusal),
+                              "review_note": "This target's own limits reject the requested settings. "
+                                             "Adjust them or drop this target; the other targets are unaffected.",
+                              "capability_notes": [str(refusal)], "checks": [str(refusal)],
+                              "warnings": [], "validation": "failed", "section_blocks": [],
+                              "field_mapping": {"canonical_field": "Sigma rule fields, built-in renderer",
+                                                "native_field": "not emitted",
+                                                "mapping_confidence": "unverified",
+                                                "mapping_source": "sigma-built-in"}})
+                continue
+            if not pysigma_status()["installed"]:
+                notes = [*notes, "pySigma is not installed: built-in renderer used. Install pysigma "
+                                 "plus a backend package for authoritative Sigma conversion."]
+            mapping = {"canonical_field": "Sigma rule fields, built-in renderer",
+                       "native_field": "see output", "mapping_confidence": "unverified",
+                       "mapping_source": "sigma-built-in"}
+        # Both halves: target_warnings is where the placeholder-scope caveats live (an
+        # unscoped index=*, the Sentinel table placeholder). Dropping it hid exactly the
+        # warnings that say the output is not deployable as written.
+        checks = target_check(siem, query)
+        warnings = target_warnings(siem, query)
+        rules.append({
+            "siem": siem, "name": meta.get("name", siem), "language": meta.get("language", ""),
+            "rule": query, "query": query, "fidelity": fidelity,
+            "review_note": (f"Converted from your Sigma rule by the vendor-authored "
+                            f"{meta.get('name', siem)} backend. Field names are whatever that "
+                            "backend emitted - map them to your data model before enabling."),
+            "capability_notes": notes, "checks": checks, "warnings": warnings,
+            "validation": validation_level(siem, checks, converted is not None),
+            "field_mapping": mapping, "section_blocks": [],
+        })
+    gates: list[dict[str, Any]] = []
+    if authoritative and authoritative < len(targets):
+        gates.append({"level": "warn", "title": "Partial authoritative conversion",
+                      "detail": f"{authoritative} of {len(targets)} targets were converted by a "
+                                "vendor-authored backend; the rest used the built-in renderer, "
+                                "which is a draft, not an equivalent rule."})
+    elif not authoritative:
+        gates.append({"level": "warn", "title": "No vendor backend for these targets",
+                      "detail": "None of the selected targets has a pySigma backend here, so the "
+                                "built-in renderer produced these. Treat them as drafts."})
+    return {
+        "rules": rules,
+        "quality_gates": gates,
+        "compile_contract": {"source": {
+            "mode": "sigma_native" if authoritative else "sigma_built_in",
+            "fidelity": "exact" if authoritative and authoritative == len(targets) else "partial",
+            "equivalent": authoritative == len(targets)}},
+        "compile_allowed": bool(rules),
+    }
 
 
 def _request_from_sigma(sigma_yaml: str) -> dict[str, Any]:
