@@ -318,6 +318,20 @@ class FrontendContractTests(unittest.TestCase):
         self.assertEqual(duplicates, [],
                          msg=f"duplicate ids break querySelector and label targeting: {duplicates}")
 
+    def test_no_surface_calls_a_mapping_count_verified(self):
+        """Wazuh and QRadar publish no field schema.
+
+        A count of hand-maintained mappings cannot be 'verified translations', and calling
+        it that is how an inferred convention reads like a documented column. The stat must
+        also carry a denominator, because a bare number against 2638 ECS fields is not a
+        coverage figure.
+        """
+        self.assertNotIn("verified field translations", self.html.lower())
+        self.assertIn("field mappings per target", self.html,
+                      msg="the count must say what it is a count of")
+        self.assertNotRegex(self.html, r"verified\s+field\s+translations")
+        self.assertIn("inferred conventions", self.html.lower())
+
     def test_four_top_level_tabs_and_no_side_rail(self):
         """The shell is Home / Workbench / ATT&CK / History.
 

@@ -1,4 +1,5 @@
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -924,6 +925,35 @@ class AuditFixTests(unittest.TestCase):
                       msg="a cell that failed its own structural check must be counted, not hidden")
         self.assertIn("coverage-caution", source,
                       msg="a target needing review must say so on its own card")
+
+    def test_field_mapping_count_is_per_target_not_one_table_wearing_a_global_label(self):
+        """`mapped_field_count` was len(FIELD_MAPPINGS['sigma']) labelled "verified field
+        translations" - one target's table presented as a global coverage figure, and equal
+        by coincidence to elastic's count. Each target has its own table and they differ."""
+        from rule_engine import FIELD_MAPPINGS, INFERRED_TARGETS
+        body = self.client.get("/api/techniques").get_json()
+        by_target = body["field_mappings_by_target"]
+        self.assertEqual(by_target, {k: len(v) for k, v in sorted(FIELD_MAPPINGS.items())})
+        self.assertGreater(len(set(by_target.values())), 1,
+                           msg="if every target had the same count this defect would be invisible")
+        self.assertEqual(sorted(body["inferred_field_targets"]), sorted(INFERRED_TARGETS),
+                         msg="the inferred targets must come from the invariant, not a copy")
+        self.assertLess(max(by_target.values()), body["field_count"],
+                        msg="the count must be reported against the taxonomy it is drawn from")
+
+    def test_the_mapping_stat_does_not_claim_verification(self):
+        """Wazuh and QRadar publish no field schema, so no mapping count may be called
+        'verified' - that word is what made an inferred convention look like a column."""
+        source = APP_JS.read_text(encoding="utf-8")
+        self.assertIn("field mappings per target", source)
+        self.assertIn("inferred_field_targets", source,
+                      msg="the stat must name which targets are inferred")
+        # Only user-visible strings count: the source may discuss the old label in a comment
+        # explaining why it was wrong, and that is not a claim.
+        shown = re.sub(r"/\*.*?\*/", "", source, flags=re.DOTALL)
+        shown = re.sub(r"(?m)^\s*//.*$|(?<=[^:])//[^\n]*$", "", shown)
+        self.assertNotRegex(shown, r"verified\s+field\s+translations",
+                            msg="no rendered string may call a mapping count verified")
 
     def test_pysigma_backends_produce_native_queries(self):
         from compiler.sigma_compiler import compile_sigma_with_pysigma, pysigma_status

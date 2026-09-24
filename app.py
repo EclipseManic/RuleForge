@@ -129,10 +129,18 @@ def create_app() -> Flask:
 
     @app.get("/api/techniques")
     def techniques() -> Any:
-        from rule_engine import mapping_provenance
-        return jsonify({"techniques": technique_catalog(), "fields": field_taxonomy(),
-                        "field_count": len(field_taxonomy()),
-                        "mapped_field_count": len(FIELD_MAPPINGS.get("sigma", {})),
+        from rule_engine import INFERRED_TARGETS, mapping_provenance
+        taxonomy = field_taxonomy()
+        # `mapped_field_count` used to be the length of ONE target's table (sigma) while the
+        # UI labelled it "verified field translations", which reads as a global coverage
+        # figure and happens to equal elastic's count. Each target has its own table and
+        # they differ, so the count is published per target alongside the denominator.
+        by_target = {siem: len(table) for siem, table in sorted(FIELD_MAPPINGS.items())}
+        return jsonify({"techniques": technique_catalog(), "fields": taxonomy,
+                        "field_count": len(taxonomy),
+                        "mapped_field_count": by_target.get("sigma", 0),
+                        "field_mappings_by_target": by_target,
+                        "inferred_field_targets": sorted(INFERRED_TARGETS),
                         "provenance": mapping_provenance()})
 
     @app.get("/api/mappings/overrides")

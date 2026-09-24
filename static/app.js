@@ -626,12 +626,28 @@ async function loadHeaderStats() {
     if (!response.ok) return;
     const techniques = document.querySelector('#stat-techniques');
     if (techniques) techniques.textContent = String((body.techniques || []).length || '—');
-    const mapped = document.querySelector('#stat-mapped');
-    if (mapped) mapped.textContent = String(body.mapped_field_count || '—');
     const homeTechniques = document.querySelector('#home-techniques');
     if (homeTechniques) homeTechniques.textContent = String((body.techniques || []).length || '—');
-    const homeMapped = document.querySelector('#home-mapped');
-    if (homeMapped) homeMapped.textContent = String(body.mapped_field_count || '—');
+    /* Each target has its own mapping table and they differ (20 to 55 entries), so a single
+       "54 verified field translations" was one target's table wearing a global label. The
+       range is the honest summary, and the tooltip names the denominator and the targets
+       whose names are inferred conventions rather than documented columns. */
+    const byTarget = body.field_mappings_by_target || {};
+    const counts = Object.values(byTarget).filter(n => typeof n === 'number');
+    const label = counts.length ? `${Math.min(...counts)}–${Math.max(...counts)}` : '—';
+    const inferred = (body.inferred_field_targets || []).join(', ') || 'none';
+    const title = counts.length
+      ? `Canonical fields mapped per target, out of ${body.field_count} in the ECS taxonomy. `
+        + `Per target: ${Object.entries(byTarget).map(([k, v]) => `${k} ${v}`).join(', ')}. `
+        + `Inferred conventions, not documented columns: ${inferred}.`
+      : 'Field mapping counts unavailable.';
+    for (const node of [document.querySelector('#stat-mapped'), document.querySelector('#home-mapped')]) {
+      if (!node) continue;
+      node.textContent = label;
+      node.closest('.stat')?.setAttribute('title', title);
+      const caption = node.parentElement?.querySelector('span');
+      if (caption) caption.textContent = 'field mappings per target';
+    }
   } catch { /* the header is supplementary; the workbench works without it */ }
 }
 loadHeaderStats();
