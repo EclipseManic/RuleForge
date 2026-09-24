@@ -235,7 +235,19 @@ function renderRules(rules, gates) { const output = document.querySelector('#res
       : '';
     const body = item.refused
       ? `<p class="review-note"><b>No query emitted.</b> ${escapeHtml(item.review_note || '')} Strict mode refuses lossy conversions; disable it for a labelled partial draft.</p>`
-      : `${((item.section_blocks || []).length ? (item.section_blocks || []).map((block, bi) => `<details class="section-block" open><summary>${escapeHtml(String(block.title || '').replace(/^./, c => c.toUpperCase()))}<button type="button" class="section-copy" data-rule="${index}" data-block="${bi}" aria-label="Copy ${escapeHtml(block.title)} section">⧉</button></summary><pre><code>${escapeHtml(block.code)}</code></pre></details>`).join('') : `<pre><code>${escapeHtml(item.rule)}</code></pre>`)}${notes}<p class="rule-mapping"><strong>Field map</strong> ${escapeHtml(mapping.canonical_field || 'custom')} → ${escapeHtml(mapping.native_field || 'review required')}</p><p class="review-note"><b>Review:</b> ${escapeHtml(item.review_note)}</p>`;
+      : `<div class="rule-primary">
+           <div class="rule-primary-head">
+             <span class="rule-primary-label">Complete rule &mdash; this is what you deploy</span>
+           </div>
+           <pre><code>${escapeHtml(item.rule)}</code></pre>
+         </div>
+         ${(item.section_blocks || []).length
+           ? `<details class="section-inspector">
+                <summary>Inspect rule sections</summary>
+                <p class="hint">A breakdown for review only. Copy the box above to deploy.</p>
+                ${(item.section_blocks || []).map((block, bi) => `<details class="section-block"><summary>${escapeHtml(String(block.title || '').replace(/^./, c => c.toUpperCase()))}<button type="button" class="section-copy" data-rule="${index}" data-block="${bi}" aria-label="Copy ${escapeHtml(block.title)} section">⧉</button></summary><pre><code>${escapeHtml(block.code)}</code></pre></details>`).join('')}
+              </details>`
+           : ''}${notes}<p class="rule-mapping"><strong>Field map</strong> ${escapeHtml(mapping.canonical_field || 'custom')} → ${escapeHtml(mapping.native_field || 'review required')}</p><p class="review-note"><b>Review:</b> ${escapeHtml(item.review_note)}</p>`;
     const actions = item.refused
       ? ''
       : `<div class="result-actions"><button class="copy-btn" data-index="${index}">Copy</button><button class="download-btn" data-index="${index}" aria-label="Download ${escapeHtml(item.language)} rule">↓</button></div>`;

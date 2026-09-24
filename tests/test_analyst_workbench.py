@@ -979,6 +979,41 @@ class AuditFixTests(unittest.TestCase):
         self.assertIn("boolean branching", nested["unsupported_features"])
         self.assertTrue(any("nested grouping" in f for f in nested["unsupported_features"]))
 
+    def test_sigma_pysigma_path_discloses_unverified_field_names(self):
+        """The Sigma path must not look verified when it was not checked.
+
+        pySigma emits Sigma field names (Image, CommandLine) verbatim. The built-in path
+        emits mapped vendor columns and shows a mapping chip. This path previously carried
+        no field_mapping at all, so the same logical rule looked checked on one entry path
+        and unchecked on the other, and the analyst was told nothing.
+        """
+        from app import _sigma_native_fields
+        from compiler.sigma_compiler import pysigma_status
+        self.assertEqual(_sigma_native_fields('index=* CommandLine="*-enc*"'), ["CommandLine"])
+        self.assertEqual(_sigma_native_fields('| Image=/powershell/i'), ["Image"])
+        # A dotted ECS path is a field even under an EQL event-category head.
+        self.assertEqual(_sigma_native_fields('process where process.name == "x"'),
+                         ["process.name"])
+        # Quoted values are values, not fields.
+        self.assertEqual(_sigma_native_fields('#repo=*\n| TargetFilename="a.exe"'),
+                         ["TargetFilename"])
+        # Boilerplate must not become a field list, or the disclosure is noise.
+        self.assertEqual(_sigma_native_fields("index=logs-* | stats count by user"), [])
+
+        if not pysigma_status()["installed"]:
+            self.skipTest("pySigma not installed")
+        body = self.client.post("/api/compile", json={
+            "title": "t", "siems": ["splunk"],
+            "sigma": "title: t\nlogsource:\n  product: windows\n  category: process_creation\n"
+                     "detection:\n  selection:\n    CommandLine|contains: -enc\n"
+                     "  condition: selection\n"}).get_json()
+        out = body["outputs"][0]
+        self.assertIn("field_mapping", out, msg="Sigma output must carry a field_mapping")
+        self.assertEqual(out["field_mapping"]["mapping_confidence"], "unverified")
+        self.assertTrue(
+            any("not columns verified" in n for n in out["notes"]),
+            msg="the unverified-field caveat must be stated, not implied")
+
     def test_pysigma_boundary_is_documented(self):
         status = self.client.get("/api/siems").get_json()["pysigma"]
         self.assertIn("no_backend", status)

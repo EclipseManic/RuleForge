@@ -18,10 +18,13 @@
   --line:          #1f3628;
   --line-strong:   #33553f66;
 
-  /* text */
-  --text:          #e4f2e9;
-  --text-2:        #9fbcaa;
-  --text-3:        #6a8875;
+  /* Text tiers. Contrast measured against the dark surfaces below; see the
+     contrast() helper in tests/test_frontend_contract.py, which fails the build if a
+     tier drops under its target. --text-3 is used for hints, table headers and small
+     labels, so it has to clear AA (4.5:1) at minimum and AAA (7:1) for comfort. */
+  --text:          #e8f5ec;
+  --text-2:        #c8dfd1;
+  --text-3:        #aac7b5;
 
   /* semantic */
   --ok:            #22c55e;
@@ -58,8 +61,8 @@
   --line:          #d3e3d8;
   --line-strong:   #b2cbb9;
   --text:          #0d180f;
-  --text-2:        #425447;
-  --text-3:        #6d8275;
+  --text-2:        #35483b;
+  --text-3:        #516658;
   --ok:            #127c3a;
   --ok-bg:         #127c3a14;
   --warn:          #825800;
@@ -564,6 +567,27 @@ tbody tr:hover { background: var(--surface-2); }
 .rule-mapping, .review-note { margin-top: 10px; font-size: 0.78rem; color: var(--text-2); }
 .rule-mapping strong { color: var(--text-3); font-weight: 600; margin-right: 6px; }
 .section-block summary { display: flex; align-items: center; gap: 8px; cursor: pointer; padding: 7px 0; font: 600 0.75rem/1.4 var(--sans); color: var(--text-2); }
+
+/* The complete rule is the artifact. It is framed as the primary object so nobody
+   assembles a rule from the section breakdown by hand. */
+.rule-primary { border: 1px solid var(--accent); border-radius: var(--r); overflow: hidden; }
+.rule-primary-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; background: var(--accent-bg); border-bottom: 1px solid var(--accent);
+}
+.rule-primary-label {
+  font: 600 0.7rem/1.2 var(--mono); text-transform: uppercase; letter-spacing: 0.07em;
+  color: var(--text);
+}
+.rule-primary pre { margin: 0; border: 0; border-radius: 0; }
+.section-inspector {
+  margin-top: 12px; border: 1px solid var(--line); border-radius: var(--r);
+  background: var(--surface-2); padding: 0 12px 12px;
+}
+.section-inspector > summary {
+  padding: 10px 0; cursor: pointer; font: 600 0.78rem/1.4 var(--sans); color: var(--text-2);
+}
+.section-inspector > summary::marker { color: var(--text-3); }
 
 .explainer-grid { display: flex; flex-direction: column; gap: 6px; }
 .explainer-card { padding: 9px 11px; border-radius: var(--r); background: var(--surface-2); border: 1px solid var(--line); font-size: 0.77rem; }

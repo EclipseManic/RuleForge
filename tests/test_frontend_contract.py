@@ -74,6 +74,33 @@ def _emitted_class_tokens(source: str) -> set[str]:
     return tokens
 
 
+def _srgb(channel: int) -> float:
+    c = channel / 255.0
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def _luminance(hex_colour: str) -> float:
+    h = hex_colour.strip().lstrip("#")
+    if len(h) == 3:
+        h = "".join(ch * 2 for ch in h)
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return 0.2126 * _srgb(r) + 0.7152 * _srgb(g) + 0.0722 * _srgb(b)
+
+
+def _contrast(fg: str, bg: str) -> float:
+    """WCAG 2.1 relative-contrast ratio. No dependency, so it always runs."""
+    a, b = _luminance(fg), _luminance(bg)
+    lighter, darker = max(a, b), min(a, b)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def _tokens(styles: str, scope: str = ":root") -> dict[str, str]:
+    block = re.search(re.escape(scope) + r"\s*\{(.*?)\n\}", styles, re.DOTALL)
+    if not block:
+        raise AssertionError(f"could not find {scope} in styles.css")
+    return dict(re.findall(r"(--[\w-]+)\s*:\s*(#[0-9a-fA-F]{3,6})", block.group(1)))
+
+
 class FrontendContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -303,6 +330,50 @@ class FrontendContractTests(unittest.TestCase):
         for name in ("homeLoading",):
             self.assertLess(self.source.index(f"let {name}"), init,
                             msg=f"'{name}' is used during init but declared after it")
+
+    def test_complete_rule_is_the_primary_output_not_the_sections(self):
+        """The rule was only ever shown as per-section boxes, so copying meant stitching
+        fragments together by hand. The assembled text could differ from the real
+        artifact. The API has always returned the complete `rule`; this pins that it is
+        what the UI leads with, and that the section view is demoted to an inspector.
+        """
+        self.assertIn("rule-primary", self.source,
+                      msg="the complete rule must be rendered as the primary box")
+        self.assertIn("${escapeHtml(item.rule)}", self.source,
+                      msg="the primary box must show item.rule verbatim")
+        self.assertIn("Inspect rule sections", self.source,
+                      msg="sections stay available, demoted to an inspector")
+        self.assertIn("this is what you deploy", self.source,
+                      msg="label the primary box so it is obvious which text to copy")
+        # The old behaviour: section blocks open by default, i.e. the breakdown led.
+        self.assertNotRegex(self.source, r'class="section-block" open',
+                            msg="sections must not be expanded by default; they are secondary")
+
+    def test_text_contrast_meets_its_target_in_both_themes(self):
+        """Faded text was the single most-repeated usability complaint.
+
+        --text-3 measured 3.60-5.11:1 on the dark surfaces, which fails WCAG AA (4.5:1)
+        for normal text. This asserts a real ratio, not a colour string, so a later
+        "tidy the palette" commit cannot silently regress legibility again.
+        """
+        styles = (ROOT / "static" / "styles.css").read_text(encoding="utf-8")
+        # Tiers must stay distinct, or the hierarchy is gone even if each one passes.
+        for scope, primary_min, secondary_min, tertiary_min in (
+            (":root", 12.0, 9.0, 7.0),        # dark: AAA target for tertiary
+            ('[data-theme="light"]', 12.0, 7.0, 4.5),  # light: AA target for tertiary
+        ):
+            tokens = _tokens(styles, scope)
+            for name in ("--text", "--text-2", "--text-3", "--surface", "--surface-2", "--surface-3"):
+                self.assertIn(name, tokens, msg=f"{scope} is missing {name}")
+            surfaces = [tokens["--surface"], tokens["--surface-2"], tokens["--surface-3"]]
+            for token, minimum in (("--text", primary_min),
+                                   ("--text-2", secondary_min),
+                                   ("--text-3", tertiary_min)):
+                worst = min(_contrast(tokens[token], surface) for surface in surfaces)
+                self.assertGreaterEqual(
+                    worst, minimum,
+                    msg=(f"{scope} {token} ({tokens[token]}) reaches only "
+                         f"{worst:.2f}:1 against the worst surface; needs >= {minimum}:1"))
 
     def test_home_dashboard_has_real_content_not_a_placeholder(self):
         """Home is a landing view, so its counters must be ids the script can fill."""

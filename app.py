@@ -21,6 +21,67 @@ from explainer import explain
 from evaluator.match_tester import test_events
 from diff_tool import diff_models
 
+_SIGMA_FIELD_NOTE = (
+    "pySigma passed Sigma field names through unchanged ({fields}). These are Sigma "
+    "conventions, not columns verified against your SIEM. The built-in renderer maps "
+    "canonical ECS fields to vendor schemas and discloses the result; this path does "
+    "not, so confirm every field against a real event before enabling."
+)
+
+# Words that appear in every dialect's boilerplate. Treating one as a field name would
+# pad the disclosure with noise and train the analyst to ignore it.
+_SIGMA_NON_FIELD = {
+    "index", "search", "where", "from", "select", "group", "having", "last", "minutes",
+    "take", "repo", "sequence", "maxspan", "events", "condition", "outcome", "meta",
+    "desc", "match", "and", "or", "not", "any", "true", "false", "null", "timestamp",
+    "level", "author", "description", "title", "status", "tags", "logsource", "detection",
+    "category", "product", "service", "ruleforge", "attack", "t1059", "t1027",
+}
+
+# Sigma/Windows field names that are single words, so the dotted-path rule misses them.
+_SIGMA_KNOWN_SINGLE = {
+    "image", "commandline", "parentimage", "parentcommandline", "username",
+    "targetfilename", "targetobject", "eventid", "integritylevel", "processname",
+    "parentprocessname", "targetprocessname", "targetcommandline", "targetusername",
+}
+
+
+def _sigma_native_fields(query: str) -> list[str]:
+    """Identifier-shaped names a pySigma output queries, for the unverified-fields note.
+
+    Deliberately conservative in the other direction: a false negative understates the
+    caveat, so this accepts a dotted path or a known single-word Sigma/ASIM field, and the
+    note is worded as "the names seen", never as an exhaustive list.
+    """
+    if not isinstance(query, str) or not query.strip():
+        return []
+    # Drop quoted literals first. Everything inside quotes is a VALUE, and harvesting it
+    # would list "a.exe" as a field, which is exactly the noise that makes an analyst
+    # stop reading the disclosure.
+    body = re.sub(r'"[^"]*"|\'[^\']*\'', " ", query)
+    found: list[str] = []
+    for token in re.findall(r"[A-Za-z_][A-Za-z0-9_.]{2,}", body):
+        head = token.split(".")[0].lower()
+        dotted = "." in token
+        # A dotted path is a field even when its head is an EQL event category:
+        # process.name, file.name and user.name are the fields those categories match on.
+        # The category stoplist only applies to a BARE category word.
+        if not dotted and (token.lower() in _SIGMA_NON_FIELD or head in _SIGMA_FIELD_STOPLIST):
+            continue
+        if dotted or head in _SIGMA_KNOWN_SINGLE or ("_" in head and head.islower()):
+            if token not in found:
+                found.append(token)
+        if len(found) >= 12:
+            break
+    return found
+
+
+# EQL event categories and structural keywords: real words, never field names.
+_SIGMA_FIELD_STOPLIST = {
+    "process", "file", "network", "registry", "dns", "authentication", "library",
+    "driver", "process_access", "module", "session", "where", "with", "by", "in",
+}
+
 
 def create_app() -> Flask:
     app = Flask(__name__)
@@ -348,10 +409,26 @@ def create_app() -> Flask:
                     if not pysigma_status()["installed"]:
                         notes = [*notes, "pySigma is not installed: built-in renderer used. Install pysigma plus a backend package for authoritative Sigma conversion."]
                 checks = target_check(siem, query)
+                # pySigma emits Sigma field names (Image, CommandLine) verbatim. That is
+                # right for Sigma, but it is NOT the vocabulary the built-in renderer emits
+                # (TargetProcessCommandLine, process.command_line), and this path carried no
+                # field_mapping at all, so the UI showed a mapping chip for one entry path
+                # and silence for the other. Disclose the difference instead of implying the
+                # imported columns were checked against any schema.
+                sigma_fields = _sigma_native_fields(query)
+                mapping = {
+                    "canonical_field": f"{len(sigma_fields)} Sigma field name(s) passed through",
+                    "native_field": ", ".join(sigma_fields[:6]) + ("..." if len(sigma_fields) > 6 else ""),
+                    "mapping_confidence": "unverified",
+                    "mapping_source": "sigma-pysigma",
+                }
+                if sigma_fields:
+                    notes = [*notes, _SIGMA_FIELD_NOTE.format(fields=", ".join(sigma_fields[:6]))]
                 outputs.append({"siem": siem, "query": query, "rule": query, "fidelity": fidelity,
                                 "notes": notes, "checks": checks,
                                 "validation": validation_level(siem, checks, py_sigma),
                                 "capability_notes": notes,
+                                "field_mapping": mapping,
                                 "section_blocks": section_blocks(query, siem)})
             else:
                 outputs.append(compile_request(det_request, siem))
