@@ -413,6 +413,32 @@ def _s(value: str) -> str:
     return value.replace("'", "\\'")
 
 
+WAZUH_MAX_FREQUENCY = 9999
+WAZUH_MAX_TIMEFRAME_SECONDS = 99999
+
+
+def _wazuh_attribute_problems(threshold: int | None, timeframe: str) -> list[str]:
+    """Wazuh-validity of a count, per the vendor's ruleset XML specification.
+
+    `frequency` is documented as 2-9999 and is meaningless at 1 (a rule that must match
+    once is just a rule with no frequency). `timeframe` is in SECONDS and is capped at
+    99999. Neither is enforced by the generic parser, so without this a request can
+    return HTTP 200 carrying attribute values Wazuh will reject or silently misread.
+    """
+    problems: list[str] = []
+    if threshold is not None and threshold > 1:
+        if threshold > WAZUH_MAX_FREQUENCY:
+            problems.append(
+                f"Wazuh frequency allows at most {WAZUH_MAX_FREQUENCY} matches; "
+                f"threshold {threshold} is out of range")
+    seconds = _minutes(timeframe) * 60
+    if seconds > WAZUH_MAX_TIMEFRAME_SECONDS:
+        problems.append(
+            f"Wazuh timeframe allows at most {WAZUH_MAX_TIMEFRAME_SECONDS} seconds; "
+            f"{timeframe} is {seconds}s")
+    return problems
+
+
 def _minutes(timeframe: str) -> int:
     quantity, unit = int(timeframe[:-1]), timeframe[-1]
     if unit == "s":
@@ -533,7 +559,7 @@ def _base_filter(request: RuleRequest, syntax: str) -> str:
 
 def _metadata(request: RuleRequest) -> str:
     attack = ", ".join(TECHNIQUES[request.technique]["mitre"]) or "Not mapped"
-    return f"Name: {request.title}\nSeverity: {request.severity.title()}\nMITRE ATT&CK: {attack}\nSchedule: every {request.timeframe}"
+    return f"Name: {request.title}\nSeverity: {request.severity.title()}\nMITRE ATT&CK: {attack}\nWindow: {request.timeframe} (lookback / count window - not a schedule)"
 
 
 def _commented(request: RuleRequest, prefix: str) -> str:
@@ -795,6 +821,13 @@ def render_wazuh(request: RuleRequest) -> str:
     severity = {"low": 4, "medium": 7, "high": 10, "critical": 14}[request.severity]
     frequency = ""
     correlator = ""
+    # Wazuh's frequency is 2-9999 and timeframe is capped at 99999 seconds. The generic
+    # parser allows a larger threshold and a 999d window, so refuse THIS target rather
+    # than emitting attribute values the manager will reject. Other selected targets are
+    # unaffected, because a multi-target compile must not fail wholesale.
+    problems = _wazuh_attribute_problems(request.threshold, request.timeframe)
+    if problems:
+        raise RuleValidationError(" ".join(problems))
     if request.threshold and request.threshold > 1:
         frequency = f' frequency="{request.threshold}" timeframe="{_minutes(request.timeframe) * 60}"'
         static_group_fields = {

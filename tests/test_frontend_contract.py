@@ -349,6 +349,56 @@ class FrontendContractTests(unittest.TestCase):
         self.assertNotRegex(self.source, r'class="section-block" open',
                             msg="sections must not be expanded by default; they are secondary")
 
+    def test_minimal_rule_fields_are_visible_and_tuning_is_collapsed(self):
+        """A minimal rule needs four things; the rest is optional and must be out of the way.
+
+        The form demanded a dozen visible inputs for a rule that fundamentally needs a
+        name, one field match, a data source and a window. Grouping, Wazuh IDs and the
+        parent-rule ID are construct-specific, so they live behind a closed disclosure -
+        present in the DOM (so they are still submitted) but not part of the first screen.
+        """
+        for core in ('id="f-title"', 'id="f-source"', 'id="f-timeframe"'):
+            self.assertIn(core, self.html, msg=f"core field {core} must stay visible")
+        # The match field itself is built by JS, so the template can only be checked for
+        # the mount point - and for that mount point to sit before the correlation
+        # disclosure rather than inside it.
+        self.assertIn('id="condition-list"', self.html,
+                      msg="the match-field row needs a mount point on the first screen")
+        self.assertLess(self.html.index('id="condition-list"'),
+                        self.html.index('id="correlation-panel"'),
+                        msg="the first match field must not be hidden behind Correlation")
+        self.assertIn("data-condition-field", self.source,
+                      msg="addCondition() must build the match-field input")
+        self.assertIn("addCondition(conditionList,", self.source,
+                      msg="a match field must be seeded on load, not left for the user to add")
+        # The tuning fields must exist, but inside a disclosure that starts closed.
+        panel = re.search(r'<details class="disclosure" id="scope-panel">(.*?)</details>',
+                          self.html, re.DOTALL)
+        self.assertIsNotNone(panel, msg="the optional tuning panel must exist")
+        for optional in ('id="f-group-by"', 'id="f-wazuh-id"', 'id="f-wazuh-parent"'):
+            self.assertIn(optional, panel.group(1),
+                          msg=f"{optional} belongs in the optional panel, not the main form")
+            self.assertNotIn(optional, self.html.split('id="scope-panel"')[0],
+                             msg=f"{optional} must not sit above the disclosure")
+        self.assertNotIn("open", panel.group(0)[:panel.group(0).index(">")],
+                         msg="the optional panel must start collapsed")
+
+    def test_window_is_not_described_as_a_schedule(self):
+        """There is no scheduler in this tool.
+
+        The generated header said 'Schedule: every 5m' and the form said 'Lookback for a
+        scheduled rule', which made a rule that fires instantly on every event look like it
+        waited first. On Wazuh the window does nothing at all without a count. Scope this
+        to the served form: the technique catalog legitimately contains the word
+        "scheduled" in ATT&CK prose, which is not what this test is about.
+        """
+        form = re.sub(r"\s+", " ", self.html.split('<script id="technique-data"')[0])
+        self.assertNotIn("scheduled rule", form,
+                         msg="no rule is scheduled; say what the window really does")
+        self.assertIn("not a delay", form)
+        self.assertIn("no effect unless", form,
+                      msg="state plainly that Wazuh ignores the window without a count")
+
     def test_text_contrast_meets_its_target_in_both_themes(self):
         """Faded text was the single most-repeated usability complaint.
 

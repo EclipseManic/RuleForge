@@ -276,35 +276,50 @@
               </section>
 
               <section class="card">
-                <div class="card-head"><span class="step">03</span><h2>Telemetry &amp; targets</h2></div>
+                <div class="card-head"><span class="step">03</span><h2>Where to look &amp; when</h2></div>
                 <div class="card-body">
-                  <div class="grid-2">
-                    <div class="field">
-                      <label for="f-source">Data source &mdash; index, table, repository or log source</label>
-                      <input id="f-source" name="data_source" value="logs-*" required>
-                      <p class="hint">Sentinel and Elastic rules use ASIM/ECS column names, so a legacy table will not work. The tool tells you when a placeholder is in play.</p>
-                    </div>
-                    <div class="field">
-                      <label for="f-group-by">Group by</label>
-                      <input id="f-group-by" name="group_by" list="field-names" value="user.name">
-                      <p class="hint">The entity each alert counts against, and the output key for correlations.</p>
-                    </div>
+                  <div class="field">
+                    <label for="f-source">Data source &mdash; index, table, repository or log source</label>
+                    <input id="f-source" name="data_source" value="logs-*" required>
+                    <p class="hint">Sentinel and Elastic rules use ASIM/ECS column names, so a legacy table will not work. The tool tells you when a placeholder is in play.</p>
                   </div>
 
                   <div class="field">
-                    <label for="f-timeframe">Detection window</label>
+                    <label for="f-timeframe">Window</label>
                     <input id="f-timeframe" name="timeframe" value="5m" list="window-options" maxlength="10">
                     <datalist id="window-options">
                       <option value="30s"></option><option value="5m"></option><option value="15m"></option><option value="1h"></option><option value="1d"></option>
                     </datalist>
-                    <p class="hint">Lookback for a scheduled rule, and the span a sequence must fit inside.</p>
+                    <p class="hint">Fires immediately on every matching event. This is a query
+                    lookback, not a delay &mdash; nothing waits before alerting. On Wazuh it has no
+                    effect unless you turn on a count.</p>
                   </div>
 
-                  <details class="disclosure">
-                    <summary><h3 class="sub">Wazuh custom-rule options</h3><span class="hint">optional</span></summary>
-                    <div class="disclosure-body grid-2">
-                      <div class="field"><label for="f-wazuh-id">Custom rule ID</label><input id="f-wazuh-id" name="wazuh_rule_id" type="number" min="100000" max="120000" value="100100"><p class="hint">Use an unused ID from 100000&ndash;120000.</p></div>
-                      <div class="field"><label for="f-wazuh-parent">Parent rule ID</label><input id="f-wazuh-parent" name="wazuh_parent_rule" inputmode="numeric" placeholder="e.g. 61615"><p class="hint">Only when extending a known rule.</p></div>
+                  <div class="row-between">
+                    <h3 class="sub">Rule scope &amp; tuning</h3>
+                    <span class="hint">optional</span>
+                  </div>
+
+                  <details class="disclosure" id="scope-panel">
+                    <summary><h3 class="sub">Grouping, Wazuh options and more</h3><span class="hint">usually not needed</span></summary>
+                    <div class="disclosure-body">
+                      <div class="grid-2">
+                        <div class="field">
+                          <label for="f-group-by">Group by</label>
+                          <input id="f-group-by" name="group_by" list="field-names" value="user.name">
+                          <p class="hint">The entity each alert counts against. Only used when you count, or for correlations.</p>
+                        </div>
+                        <div class="field">
+                          <label for="f-wazuh-id">Wazuh custom rule ID</label>
+                          <input id="f-wazuh-id" name="wazuh_rule_id" type="number" min="100000" max="120000" value="100100">
+                          <p class="hint">Use an unused ID from 100000&ndash;120000.</p>
+                        </div>
+                      </div>
+                      <div class="field">
+                        <label for="f-wazuh-parent">Wazuh parent rule ID</label>
+                        <input id="f-wazuh-parent" name="wazuh_parent_rule" inputmode="numeric" placeholder="e.g. 61615">
+                        <p class="hint">Only when extending a known rule.</p>
+                      </div>
                     </div>
                   </details>
 
@@ -323,6 +338,9 @@
                     </label>
                     {% endfor %}
                   </div>
+                  <p class="hint">The core rule needs only a name, one field match, a data
+                  source and a window. Everything above is optional and only matters for
+                  production scoping.</p>
 
                   <div class="row-between tight">
                     <label class="check"><input type="checkbox" id="strict"><span>Strict mode &mdash; refuse lossy conversions instead of labelling them</span></label>

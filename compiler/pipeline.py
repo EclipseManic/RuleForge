@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from rule_engine import RuleValidationError
+
 
 # family -> siem -> (support, note). support in exact/partial/unsupported.
 CAPABILITY: dict[str, dict[str, tuple[str, str]]] = {
@@ -226,7 +228,24 @@ def compile_request(request: Any, siem: str) -> dict[str, Any]:
             capability["fidelity"] = cm_fidelity
         capability["notes"] = [*capability["notes"], *[n for n in cm_notes if n not in capability["notes"]]]
     else:
-        query = RENDERERS[siem](native_request)
+        # A target may refuse on its own constraints (Wazuh's frequency/timeframe ranges).
+        # Refuse THIS target, exactly as strict mode does, so selecting six targets and
+        # getting one Wazuh-specific 400 would cost the analyst the other five rules too.
+        try:
+            query = RENDERERS[siem](native_request)
+        except RuleValidationError as error:
+            return {
+                "siem": siem, "name": SIEMS[siem]["name"], "language": SIEMS[siem]["language"],
+                "rule": "", "query": "", "refused": True,
+                "refusal_reason": str(error),
+                "review_note": "This target's own limits reject the requested settings. "
+                               "Adjust them or drop this target; the other targets are unaffected.",
+                "technique_label": TECHNIQUES[request.technique]["label"],
+                "field_mapping": mapping, "fidelity": "unsupported",
+                "capability": capability["per_family"], "capability_notes": capability["notes"],
+                "checks": [str(error)], "warnings": [], "validation": "failed",
+                "section_blocks": [],
+            }
     if siem == "wazuh" and request.condition_logic == "any" and len(request.conditions) > 1:
         capability["fidelity"] = "partial"
         capability["notes"] = [*capability["notes"], "boolean: OR branches render as ANDed <field> elements — split into separate rules."]

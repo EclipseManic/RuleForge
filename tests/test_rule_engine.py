@@ -221,6 +221,50 @@ p | join kind=inner DeviceNetworkEvents on DeviceId"""
         self.assertIn("TimeGenerated", rules[1]["rule"])
         self.assertIn("process where", rules[2]["rule"])
 
+    def test_wazuh_refuses_out_of_range_counts_per_target(self):
+        """Wazuh frequency is 2-9999 and timeframe is capped at 99999 SECONDS.
+
+        The generic parser accepted a threshold of 10000 and a 999d window, so a request
+        could return HTTP 200 carrying attribute values Wazuh rejects. It must refuse, and
+        it must refuse THIS target: rejecting the whole request would cost the analyst
+        every other selected target because of one Wazuh setting.
+        """
+        from rule_engine import _wazuh_attribute_problems
+        self.assertEqual(_wazuh_attribute_problems(1, "5m"), [],
+                         msg="threshold 1 emits no frequency, so it is always valid")
+        self.assertEqual(_wazuh_attribute_problems(9999, "5m"), [])
+        self.assertTrue(_wazuh_attribute_problems(10000, "5m"),
+                        msg="frequency 10000 exceeds the documented 9999 maximum")
+        self.assertTrue(_wazuh_attribute_problems(5, "999d"),
+                        msg="999d is 86,313,600s, far past the 99999s cap")
+        self.assertEqual(_wazuh_attribute_problems(5, "1d"), [])
+
+        # Per-target refusal: the other targets still compile.
+        rules = generate_rules(example(threshold=10000, use_threshold=True,
+                                      siems=["splunk", "wazuh", "sentinel"]))
+        by_siem = {r["siem"]: r for r in rules}
+        self.assertTrue(by_siem["wazuh"].get("refused"),
+                        msg="Wazuh must refuse an out-of-range frequency")
+        self.assertEqual(by_siem["wazuh"]["rule"], "",
+                         msg="a refused target must not emit a rule body")
+        self.assertIn("9999", by_siem["wazuh"]["refusal_reason"])
+        for other in ("splunk", "sentinel"):
+            self.assertFalse(by_siem[other].get("refused"),
+                             msg=f"{other} must be unaffected by the Wazuh refusal")
+            self.assertTrue(by_siem[other]["rule"].strip(),
+                            msg=f"{other} must still produce a rule")
+
+    def test_generated_header_does_not_claim_a_schedule(self):
+        """`Schedule: every 5m` was wrong: nothing schedules these rules.
+
+        The value is a query lookback (and a count window when thresholding). Calling it
+        a schedule is what made a single-event rule look like it waited before firing.
+        """
+        rule = generate_rules(example(use_threshold=False, siems=["splunk"]))[0]["rule"]
+        self.assertNotIn("Schedule:", rule, msg="there is no scheduler in this tool")
+        self.assertIn("Window:", rule)
+        self.assertIn("not a schedule", rule)
+
     def test_threshold_is_rendered(self):
         rules = generate_rules(example(threshold=5, siems=["sentinel"]))
         self.assertIn("EventCount >= 5", rules[0]["rule"])
