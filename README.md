@@ -29,6 +29,25 @@ Then visit `http://127.0.0.1:5000`.
 
 The tool produces normalized-field templates, not production-approved rules. Map fields to your telemetry schema, confirm required log sources and event IDs, test with representative data, tune allowlists, and follow your organization’s change-control process before enabling an alert.
 
+## Verification status — read this before trusting an output
+
+Be precise about what "validated" means here, because the difference matters when a rule silently never fires.
+
+**What is actually verified**
+
+- Generated SPL, KQL, EQL, AQL, CQL, YARA-L, Wazuh XML, and Sigma are passed through structural parsers that check clause order, delimiters, balanced expressions, and required sections. A `validated: structure-parsed` tag means that check passed.
+- When `pySigma` and a matching backend package are installed, genuine Sigma YAML is converted by the **vendor-authored backend** and tagged authoritative.
+- A cross-product render sweep compiles every catalogued pattern against every target.
+
+**What is NOT verified**
+
+- **No live SIEM.** No rule here has been executed against a running Splunk, Sentinel, Elastic, QRadar, SecOps, Falcon, or Wazuh instance. A structural parse cannot tell you that a column exists, that a table is joined, or that your data source name is right.
+- **Wazuh and QRadar field names are inferred.** Neither publishes a fixed field schema, so those mappings are conventions, not verified columns. They are labelled `inferred` in the UI for this reason.
+- **Advanced constructs are mostly not portable.** EQL is the only supported target with a native sequence operator. For `sequence`, `join`, `aggregation`, and `absence`, the other targets receive a labelled `partial` projection or an explicit "rebuild this by hand" note. Treat a `partial` output as a drafting aid, not an equivalent rule.
+- **A pass in CI is not a live-engine result.** The test suite proves internal consistency and grammar conformance. It cannot prove a rule fires in your environment.
+
+Field translations are drawn from published schemas where they exist. See [Mappings and their sources](docs/readiness-assessment.md) for per-target provenance.
+
 ## References used for the design
 
 - [Splunk correlation search overview](https://help.splunk.com/en/splunk-enterprise-security-7/administer/7.3/correlation-searches/correlation-search-overview-for-splunk-enterprise-security) — SPL searches can aggregate data and drive adaptive response actions.
