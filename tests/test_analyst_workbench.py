@@ -1099,6 +1099,59 @@ class AuditFixTests(unittest.TestCase):
         self.assertNotIn("inferred_target", by_siem["splunk"]["field_mapping"],
                          msg="a target with a published schema must not be marked inferred")
 
+    def test_no_wazuh_placeholder_is_emitted_when_flattening_yields_nothing(self):
+        """A second fabrication site, in the Wazuh flattener rather than the projection.
+
+        It emitted `process.name contains example.exe` with a note. A note does not undo the
+        fact that the output then carried a field and a value the submitted rule never
+        mentioned, in copyable, downloadable XML. A NOT or aggregation-only condition has
+        no Wazuh equivalent and must be refused.
+        """
+        from compiler.sigma_compiler import compile_model
+        from models.correlation import CorrelationModel, LogicNode, Predicate
+        from rule_engine import RuleValidationError
+        # logic that flattens to zero predicates: a NOT over the whole tree
+        model = CorrelationModel(logic=LogicNode(op="not", children=[Predicate("a", "equals", "1")]))
+        with self.assertRaises(RuleValidationError):
+            compile_model(model, "wazuh")
+        not_rule = ("title: Not selection\nlogsource:\n  product: windows\ndetection:\n  selection:\n"
+                    "    EventID: 4625\n  condition: not selection\n")
+        rule = self.client.post("/api/generate", json={
+            "title": "t", "description": "d", "severity": "high", "technique": "custom",
+            "timeframe": "5m", "group_by": "user.name", "data_source": "*",
+            "threshold": 1, "use_threshold": False,
+            "siems": ["wazuh"], "sigma": not_rule}).get_json()["rules"][0]
+        self.assertTrue(rule.get("refused"))
+        self.assertNotIn("example.exe", rule.get("rule", ""))
+        self.assertEqual(rule["rule"], "")
+
+    def test_strict_accepts_the_string_forms_a_client_actually_sends(self):
+        """bool("false") is True, so the string "false" silently enabled strict mode and
+        refused the target. A checkbox that posts a string must mean what it says."""
+        sigma = ("title: Ops\nlogsource:\n  product: windows\ndetection:\n  sel1:\n"
+                 "    Image: a.exe\n  sel2:\n    Image: b.exe\n  condition: sel1 or sel2\n")
+        base = {"title": "t", "description": "d", "severity": "high", "technique": "custom",
+                "timeframe": "5m", "group_by": "user.name", "data_source": "*",
+                "threshold": 1, "use_threshold": False, "siems": ["wazuh"], "sigma": sigma}
+        for off in ("false", "0", "off", "no", False, None, ""):
+            rule = self.client.post("/api/generate", json={**base, "strict": off}).get_json()["rules"][0]
+            self.assertFalse(rule.get("refused"),
+                             msg=f"strict={off!r} must not enable strict mode")
+            self.assertTrue(rule["rule"].strip())
+        for on in (True, "true", "on", "1", "yes"):
+            rule = self.client.post("/api/generate", json={**base, "strict": on}).get_json()["rules"][0]
+            self.assertTrue(rule.get("refused"), f"strict={on!r} must refuse a lossy conversion")
+
+    def test_an_unknown_target_is_a_request_error_not_a_per_target_refusal(self):
+        """It answered 200 with a refusal that blamed the Sigma rule for a bad target name."""
+        sigma = "title: Ops\nlogsource:\n  product: windows\ndetection:\n  sel:\n    Image: a.exe\n  condition: sel\n"
+        rv = self.client.post("/api/generate", json={
+            "title": "t", "description": "d", "severity": "high", "technique": "custom",
+            "timeframe": "5m", "group_by": "user.name", "data_source": "*",
+            "threshold": 1, "use_threshold": False, "siems": ["not-a-siem"], "sigma": sigma})
+        self.assertEqual(rv.status_code, 400)
+        self.assertIn("not-a-siem", rv.get_json()["error"])
+
     def test_a_pasted_sigma_rule_reaches_the_authoritative_backend(self):
         """The UI could paste real Sigma YAML and never reach the vendor-authored backend.
 

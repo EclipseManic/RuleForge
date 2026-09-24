@@ -163,8 +163,14 @@ def compile_model(model: CorrelationModel, siem: str) -> tuple[str, str, list[st
                         if d["operator"] not in {"contains", "equals", "starts_with", "ends_with",
                                                  "regex", "exists", "windash", "in_list"}})
         if not cond_dicts:
-            cond_dicts = [{"field": "process.name", "operator": "contains", "value": "example.exe"}]
-            notes.append("Empty logic; placeholder rule emitted.")
+            # This used to emit `process.name contains example.exe` with a note. A note does
+            # not undo the fact that the output then contained a field and a value the
+            # submitted rule never mentioned, in copyable, downloadable XML. Refuse instead.
+            from rule_engine import RuleValidationError as _RuleValidationError
+            raise _RuleValidationError(
+                "Wazuh flattening produced no field predicate for this rule, so no faithful "
+                "custom rule can be written. A NOT or aggregation-only condition has no Wazuh "
+                "equivalent - rebuild it natively.")
         first = cond_dicts[0]
         top_or = isinstance(model.logic, LogicNode) and model.logic.op == "or"
         req = RuleRequest(title="Sigma-derived", description="Derived from canonical model", severity="medium",

@@ -10,8 +10,8 @@ from models.correlation import Predicate
 from flask import Flask, jsonify, render_template, request
 
 from rule_engine import (FIELD_MAPPINGS, INFERRED_TARGETS, OPERATOR_ALIASES, SIEMS, TECHNIQUES,
-                         RuleValidationError, analyze_rule, detect_siem, generate_rules,
-                         generate_workbench, supported_siems)
+                         RuleValidationError, _strict_flag, analyze_rule, detect_siem,
+                         generate_rules, generate_workbench, supported_siems)
 from storage import RuleStore
 from section_view import section_blocks
 from compiler.validators import faithfulness, sigma_check, target_check
@@ -339,6 +339,12 @@ def create_app() -> Flask:
         targets = list(dict.fromkeys(raw_targets))
         if not targets:
             return jsonify({"error": "Select at least one target."}), 400
+        # Membership is a request error, not a per-target outcome. Validating it here stops
+        # an unknown name surfacing later as a 200 whose refusal blames the Sigma rule.
+        unknown = [s for s in targets if s not in SIEMS]
+        if unknown:
+            return jsonify({"error": f"Unsupported target(s): {', '.join(unknown)}. "
+                                     f"Choose from: {', '.join(sorted(SIEMS))}."}), 400
         try:
             workbench = (_sigma_workbench(payload, targets)
                          if use_sigma else generate_workbench(payload))
@@ -801,19 +807,34 @@ def _sigma_workbench(payload: dict[str, Any], targets: list[str]) -> dict[str, A
     from compiler.validators import target_warnings, validation_level
 
     sigma_yaml = str(payload.get("sigma", ""))
-    strict = bool(payload.get("strict"))
+    # bool("false") is True, so a client sending the string "false" silently enabled strict
+    # mode and refused the target. _strict_flag exists precisely to read these correctly.
+    strict = _strict_flag(payload.get("strict"))
     rules: list[dict[str, Any]] = []
     outcomes: dict[str, str] = {}
     # Built at most once, and only if some target actually needs the fallback.
     fallback: tuple[Any, str] | None = None
 
     def fallback_model() -> tuple[Any, str]:
+        """Build the normalized projection at most once, or report why it is impossible.
+
+        A malformed Sigma document is a request error and propagates as a 400. A valid
+        Sigma rule that simply has no portable single-event predicate is cached as
+        unrepresentable, so each target can refuse on its own without re-parsing.
+        """
         nonlocal fallback
         if fallback is None:
             try:
                 model, _ = _payload_to_model({**payload, **_request_from_sigma(sigma_yaml)})
-            except (RuleValidationError, ValueError) as error:
+            except RuleValidationError as error:
+                # RuleValidationError subclasses ValueError, so it must be handled before
+                # the bare ValueError clause below or it is re-raised and the whole request
+                # 400s instead of refusing the targets that need the fallback.
+                if "no single-event predicate" not in str(error):
+                    raise
                 fallback = (None, str(error))
+            except (ValueError, RecursionError):
+                raise
             else:
                 fallback = (model, "")
         return fallback
