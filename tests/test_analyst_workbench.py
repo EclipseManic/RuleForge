@@ -881,6 +881,50 @@ class AuditFixTests(unittest.TestCase):
                 self.assertIn(cell["fidelity"], {"exact", "safe_normalized", "partial", "unsupported"})
 
 
+    def test_coverage_publishes_both_sweeps_and_a_denominator(self):
+        """The single-event sweep flatters every target, so it cannot be shown alone.
+
+        Every one of the 339 technique templates compiles to the same faithful projection on
+        all 8 targets, so the Home widget read "0 exact, 339 safe normalized, 0 partial,
+        0 unsupported" - which looks like full coverage and says nothing about the advanced
+        constructs, where 30 of 40 target/family cells are partial and 5 fail their own
+        structural check. The widget must carry both sweeps, the denominator, and a
+        definition of the fidelity words, or it is decoration rather than measurement.
+        """
+        cov = self.client.get("/api/coverage").get_json()
+        self.assertEqual(cov["denominator"]["techniques"], cov["total"])
+        self.assertEqual(cov["denominator"]["families"], len(cov["families"]))
+        self.assertEqual(sorted(cov["summary"]), sorted(cov["advanced"]))
+        for siem, adv in cov["advanced"].items():
+            counted = sum(v for k, v in adv.items() if k != "validation_failed")
+            self.assertEqual(counted, len(cov["families"]), siem)
+            self.assertGreaterEqual(adv["validation_failed"], 0)
+        # The advanced sweep is where fidelity actually varies; if it ever reads all-clean
+        # the aggregation is not measuring what the matrix shows.
+        advanced_cells = [c for row in cov["families"] for c in row["targets"].values()]
+        self.assertTrue(any(c["fidelity"] == "partial" for c in advanced_cells),
+                        msg="families do degrade, so the summary must be able to show it")
+        self.assertTrue(any(c["validation"] == "failed" for c in advanced_cells),
+                        msg="some family output does not parse, and that must be countable")
+        levels = {item["level"] for item in cov["legend"]}
+        self.assertEqual(levels, {"exact", "safe_normalized", "partial", "unsupported"})
+        for item in cov["legend"]:
+            self.assertTrue(len(item["meaning"]) > 40,
+                            msg=f"legend entry {item['level']} must actually explain itself")
+
+    def test_coverage_widget_shows_the_denominator_and_the_legend(self):
+        """Backend honesty is not enough if the UI renders only the flattering numbers."""
+        source = APP_JS.read_text(encoding="utf-8")
+        self.assertIn("denom.techniques", source,
+                      msg="each coverage card must say what the count is out of")
+        self.assertIn("denom.families", source,
+                      msg="the advanced sweep needs its own denominator")
+        self.assertIn("body.legend", source, msg="the fidelity words must be defined for the reader")
+        self.assertIn("validation_failed", source,
+                      msg="a cell that failed its own structural check must be counted, not hidden")
+        self.assertIn("coverage-caution", source,
+                      msg="a target needing review must say so on its own card")
+
     def test_pysigma_backends_produce_native_queries(self):
         from compiler.sigma_compiler import compile_sigma_with_pysigma, pysigma_status
         status = pysigma_status()

@@ -478,10 +478,30 @@ async function loadCoverage() {
   try {
     const body = await (await fetch('/api/coverage')).json();
     if (!body || !body.techniques) { matrix.innerHTML = '<p>Coverage unavailable.</p>'; return; }
-    summary.innerHTML = Object.entries(body.summary).map(([siem, counts]) =>
-      `<div class="coverage-card"><b>${escapeHtml(siem)}</b>` +
-      Object.entries(counts).map(([level, n]) => `<span class="${escapeHtml(level)}">${n} ${escapeHtml(level.replace('_', ' '))}</span>`).join('') +
-      `</div>`).join('');
+    const denom = body.denominator || {techniques: body.total || 0, families: (body.families || []).length};
+    /* The single-event sweep makes every target look identical and fully covered, which is
+       true and useless on its own. The advanced families are where fidelity drops, so both
+       halves sit on the same card with their denominators, and a failing parse is counted
+       rather than hidden behind a reassuring fidelity word. */
+    summary.innerHTML = Object.entries(body.summary).map(([siem, counts]) => {
+      const adv = (body.advanced || {})[siem] || {};
+      /* The denominator is the number of construct probes, so the failed-check count must
+         not be folded into it: adding it reported "7 of 7 advanced cells" for 5 probes. */
+      const advCells = Object.entries(adv).filter(([k]) => k !== 'validation_failed')
+        .reduce((a, [, b]) => a + b, 0);
+      const notClean = advCells - (adv.safe_normalized || 0) + (adv.validation_failed || 0);
+      return `<div class="coverage-card"><b>${escapeHtml(siem)}</b>` +
+        `<span class="coverage-denom">${denom.techniques} single-event templates</span>` +
+        Object.entries(counts).map(([level, n]) => `<span class="${escapeHtml(level)}">${n} ${escapeHtml(level.replace('_', ' '))}</span>`).join('') +
+        (advCells ? `<span class="coverage-denom">${denom.families} advanced constructs</span>` +
+          Object.entries(adv).filter(([k]) => k !== 'validation_failed').map(([level, n]) => `<span class="${escapeHtml(level)}">${n} ${escapeHtml(level.replace('_', ' '))}</span>`).join('') +
+          (adv.validation_failed ? `<span class="failed">${adv.validation_failed} failed its own structural check</span>` : '') : '') +
+        (notClean ? `<span class="coverage-caution">${notClean} of ${advCells} advanced cells need review</span>` : '') +
+        `</div>`;
+    }).join('') +
+      ((body.legend || []).length ? `<div class="coverage-legend">` +
+        body.legend.map(item => `<p><b class="${escapeHtml(item.level)}">${escapeHtml(item.level.replace('_', ' '))}</b> ${escapeHtml(item.meaning)}</p>`).join('') +
+        `</div>` : '');
     const head = `<tr><th>technique</th>${body.targets.map(t => `<th>${escapeHtml(t)}</th>`).join('')}</tr>`;
     const rows = body.techniques.map(row =>
       `<tr><td>${escapeHtml(row.label)}${row.mitre && row.mitre.length ? ` <small>${escapeHtml(row.mitre.join(','))}</small>` : ''}</td>` +
@@ -725,10 +745,30 @@ async function renderHome() {
       for (const counts of Object.values(body.summary)) {
         for (const [level, n] of Object.entries(counts)) totals[level] = (totals[level] || 0) + n;
       }
+      /* The technique sweep alone reads as 2712/2712 faithful with nothing partial, which
+         is true of single-event templates and silent about every advanced construct. The
+         aggregate is therefore shown next to the advanced sweep, not instead of it, with
+         the cells that failed their own structural check counted out loud. */
+      const advanced = body.advanced || {};
+      const advTotals = {};
+      let advFailed = 0;
+      for (const counts of Object.values(advanced)) {
+        for (const [level, n] of Object.entries(counts)) {
+          if (level === 'validation_failed') { advFailed += n; continue; }
+          advTotals[level] = (advTotals[level] || 0) + n;
+        }
+      }
       const order = ['exact', 'safe_normalized', 'partial', 'unsupported', 'failed', 'unknown'];
-      coverage.innerHTML = Object.keys(totals).sort((a, b) => order.indexOf(a) - order.indexOf(b))
-        .map(level => `<div><b>${totals[level]}</b><span>${escapeHtml(level.replace(/_/g, ' '))}</span></div>`).join('');
-      if (coveragePill) coveragePill.textContent = `${body.targets.length} targets × ${body.techniques.length} patterns`;
+      const block = (label, counts, denom) => `<div class="coverage-block"><p class="coverage-block-label">${escapeHtml(label)}</p><div class="coverage-nums">` +
+        Object.keys(counts).sort((a, b) => order.indexOf(a) - order.indexOf(b))
+          .map(level => `<div class="${escapeHtml(level)}"><b>${counts[level]}</b><span>${escapeHtml(level.replace(/_/g, ' '))}</span></div>`).join('') +
+        `</div><p class="coverage-block-denom">${denom}</p></div>`;
+      const denom = body.denominator || {techniques: (body.techniques || []).length, families: (body.families || []).length};
+      coverage.innerHTML = block('single-event templates', totals, `out of ${body.targets.length} targets × ${denom.techniques} patterns`) +
+        (Object.keys(advTotals).length ? block('advanced constructs', advTotals,
+          `out of ${body.targets.length} targets × ${denom.families} constructs` +
+          (advFailed ? ` · ${advFailed} failed their own structural check` : '')) : '');
+      if (coveragePill) coveragePill.textContent = `${body.targets.length} targets × ${denom.techniques} patterns, measured`;
     } catch {
       coverage.innerHTML = '<div><b>—</b><span>unavailable</span></div>';
       if (coveragePill) coveragePill.textContent = 'unavailable';

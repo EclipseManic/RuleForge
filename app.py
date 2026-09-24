@@ -277,8 +277,36 @@ def create_app() -> Flask:
                 except (ValueError, KeyError) as error:
                     row["targets"][siem] = {"fidelity": "unsupported", "validation": "failed", "error": str(error)[:120]}
             families.append(row)
+        # The technique sweep alone flatters every target: a single-event template compiles
+        # to a faithful normalized projection everywhere, so the summary would read as full
+        # coverage with a reassuring word in it. The advanced families are where fidelity
+        # actually drops, so they are aggregated here too and the denominator is published
+        # next to every count. A reader must not have to know this to trust the number.
+        advanced = {siem: {"exact": 0, "safe_normalized": 0, "partial": 0, "unsupported": 0,
+                          "validation_failed": 0} for siem in targets}
+        for row in families:
+            for siem, cell in row["targets"].items():
+                if cell.get("fidelity") in advanced[siem]:
+                    advanced[siem][cell["fidelity"]] += 1
+                if cell.get("validation") == "failed":
+                    advanced[siem]["validation_failed"] += 1
+        legend = [
+            {"level": "exact",
+             "meaning": "The target's own construct, not a projection. Nothing to translate."},
+            {"level": "safe_normalized",
+             "meaning": "Semantics preserved as a normalized projection. It will match the "
+                        "same events, but it is not the vendor's native construct, so you still "
+                        "map fields and set the rule's own scheduling."},
+            {"level": "partial",
+             "meaning": "Some of the rule's meaning is lost or reordered. A drafting aid, not an "
+                        "equivalent rule - read the capability notes before trusting it."},
+            {"level": "unsupported",
+             "meaning": "No faithful equivalent in this dialect. Rebuild it natively."},
+        ]
         payload = {"techniques": rows, "targets": targets, "summary": summary,
-                   "families": families, "total": len(rows)}
+                   "families": families, "advanced": advanced, "legend": legend,
+                   "denominator": {"techniques": len(rows), "families": len(families)},
+                   "total": len(rows)}
         _coverage_cache["key"] = _coverage_cache_key()
         _coverage_cache["value"] = payload
         return jsonify(payload)

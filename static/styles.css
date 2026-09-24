@@ -497,6 +497,14 @@ td { font-family: var(--mono); font-size: 0.74rem; font-variant-numeric: tabular
 tbody tr:hover { background: var(--surface-2); }
 
 .coverage-summary { display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 14px; }
+.coverage-block { flex: 1 1 300px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface-2); padding: 11px 13px; }
+.coverage-block-label { margin: 0 0 8px; color: var(--text-2); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.07em; }
+.coverage-block-denom { margin: 8px 0 0; color: var(--text-3); font-size: 0.68rem; }
+.coverage-nums { display: flex; gap: 18px; flex-wrap: wrap; }
+.coverage-nums div { display: flex; flex-direction: column; }
+.coverage-nums div.exact b, .coverage-nums div.safe_normalized b { color: var(--ok); }
+.coverage-nums div.partial b { color: var(--warn); }
+.coverage-nums div.unsupported b { color: var(--bad); }
 .coverage-summary div { display: flex; flex-direction: column; }
 .coverage-summary b { font: 700 1.3rem/1.2 var(--mono); font-variant-numeric: tabular-nums; }
 .coverage-summary span { font-size: 0.68rem; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; }
@@ -603,7 +611,18 @@ tbody tr:hover { background: var(--surface-2); }
 .negated-check { display: inline-flex; align-items: center; gap: 5px; font-size: 0.72rem; color: var(--text-3); }
 
 .attack-row { display: grid; grid-template-columns: auto 1fr auto; gap: 10px; align-items: center; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface-2); }
-.coverage-card { padding: 11px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface-2); }
+.coverage-card { padding: 11px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface-2); min-width: 190px; }
+/* The count spans carried fidelity words as bare class names with no colour rule at all, so
+   "4 partial" looked identical to "4 exact". They now read at a glance. */
+.coverage-card .exact, .coverage-card .safe_normalized { color: var(--ok); }
+.coverage-card .partial { color: var(--warn); }
+.coverage-card .unsupported, .coverage-card .failed { color: var(--bad); }
+.coverage-denom { margin-top: 7px; color: var(--text-3); font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.07em; border-top: 1px solid var(--line); padding-top: 6px; }
+.coverage-caution { margin-top: 5px; color: var(--warn); font-size: 0.66rem; letter-spacing: 0; text-transform: none; }
+.coverage-legend { flex-basis: 100%; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface-2); padding: 11px 13px; }
+.coverage-legend p { margin: 0 0 6px; color: var(--text-2); font-size: 0.74rem; line-height: 1.5; }
+.coverage-legend p:last-child { margin-bottom: 0; }
+.coverage-legend b { color: var(--text); text-transform: uppercase; letter-spacing: 0.06em; font-size: 0.68rem; margin-right: 5px; }
 .coverage-table, .match-table, .diff-table { width: 100%; border-collapse: collapse; font-size: 0.77rem; }
 .diff-add { color: var(--ok); }
 .diff-remove { color: var(--bad); }
