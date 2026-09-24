@@ -1504,6 +1504,8 @@ def analyze_rule(rule_text: Any, siem: Any) -> dict[str, Any]:
         from compiler.validators import target_check as _target_check
         parse_problems = _target_check("wazuh", text)
         parse_summary = {"dialect": "wazuh", "structured": False}
+    else:
+        parse_summary = {"dialect": str(target), "pipeline_stages": 1, "structured": False}
 
     if target != "wazuh":
         structure = _boolean_structure(logic_text)
@@ -1527,6 +1529,17 @@ def analyze_rule(rule_text: Any, siem: Any) -> dict[str, Any]:
         unsupported_features.extend(name for name, present in (("sequence model", bool(sequences)), ("join model", bool(joins)), ("aggregation model", complex_aggregation), ("lookup model", bool(lookups))) if present)
     if native_metadata.get("parent_rules") or native_metadata.get("same_fields"):
         unsupported_features.append("Wazuh chained correlation")
+    # A multi-stage pipeline that was flattened into flat predicates is lossy, and the loss
+    # was invisible: a 3-stage Splunk search (`| where ... | stats count by ... | where
+    # count >= 1`) came back mode=simple, ONE condition, fidelity=exact. The post-aggregate
+    # filter was simply gone, and the verdict told the analyst nothing was lost. Extraction
+    # may only be called exact when the whole document was consumed. `parse_summary` is the
+    # full-document summary; `structure` above is the boolean-only view and has no stage count.
+    if int(parse_summary.get("pipeline_stages", 1) or 1) > 1 and target not in {"sigma", "wazuh"}:
+        unsupported_features.append(
+            f"multi-stage pipeline: {parse_summary['pipeline_stages']} stages were flattened into "
+            f"{len(conditions)} field predicate(s) - aggregation, post-aggregate filters, joins "
+            f"and time buckets are not represented")
     unsupported_features = list(dict.fromkeys(unsupported_features))
     if wazuh_mixed_layout:
         unsupported_features.append("mixed Wazuh layout: a negated field was found outside <match>")

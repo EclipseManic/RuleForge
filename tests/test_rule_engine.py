@@ -25,10 +25,27 @@ def example(**overrides):
 
 class GeneratorTests(unittest.TestCase):
     def test_analyzes_simple_pasted_rule(self):
+        """Payload extraction still works on a 2-stage Splunk rule.
+
+        The rule is `index | search | stats`, so it is NOT simple: the aggregate stage is
+        dropped by extraction and that loss is now reported. This test used to assert
+        mode=simple, which is exactly the silent-wrong verdict that let a flattened
+        pipeline read as faithful. The extraction assertions are kept; the classification
+        one belongs with the loss test below.
+        """
         result = analyze_rule('index=auth | search user="alice" | stats count by host', "splunk")
-        self.assertEqual(result["mode"], "simple")
         self.assertEqual(result["payload_defaults"]["field"], "user")
         self.assertEqual(result["payload_defaults"]["operator"], "equals")
+        self.assertIn("multi-stage pipeline", " ".join(result["unsupported_features"]))
+        self.assertEqual(result["fidelity"], "partial")
+
+    def test_a_single_stage_rule_is_still_exact(self):
+        """The pipeline guard must not blanket-downgrade everything, or it stops meaning
+        anything. One search term and nothing else is consumed whole."""
+        result = analyze_rule('index=auth | search user="alice"', "splunk")
+        self.assertEqual(result["mode"], "simple")
+        self.assertEqual(result["fidelity"], "exact")
+        self.assertEqual(result["unsupported_features"], [])
 
     def test_analyzes_multiline_siem_rule(self):
         rule = """index=windows
@@ -441,6 +458,52 @@ p | join kind=inner DeviceNetworkEvents on DeviceId"""
                                           siems=["elastic"],
                                           correlation={"aggregations": [{"function": "dc", "field": "destination.ip", "alias": "d"}]}))[0]["rule"]
         self.assertIn('threshold_window: "30s"', rendered)
+
+    def test_a_flattened_pipeline_may_never_be_called_exact(self):
+        """Measured defect: a 3-stage Splunk search came back mode=simple, ONE condition
+        and fidelity=exact. The post-aggregate filter was simply gone, and the verdict
+        claimed nothing was lost. A parser may only be called exact when it consumed the
+        whole document.
+        """
+        rule = ('index=windows EventCode=10 | where TargetImage="*lsass.exe*" '
+                '| stats count by host SourceImage TargetImage User | where count >= 1')
+        result = analyze_rule(rule, "splunk")
+        self.assertEqual(len(result["conditions"]), 1,
+                         msg="baseline: the aggregate and post-filter stages are dropped")
+        self.assertEqual(result["fidelity"], "partial")
+        self.assertIn("multi-stage pipeline", " ".join(result["unsupported_features"]))
+        # Every reduction must be named, not just flagged in general.
+        for missing in ("aggregation", "post-aggregate"):
+            self.assertIn(missing, " ".join(result["unsupported_features"]))
+
+    def test_attack_catalog_does_not_advertise_empty_templates_as_buildable(self):
+        """93% of the catalog (317 of 339) carries default_value "*" - a wildcard matching
+        every event - so clicking one produced a field with no predicate. 164 rows were
+        advertised as buildable with a ready template. That is a headline number built on
+        content that cannot produce a usable rule.
+        """
+        from rule_engine import TECHNIQUES
+        from app import create_app
+        payload = create_app().test_client().get("/api/attack").get_json()
+        cl = payload
+        # Three buckets, not two: techniques with a usable template, techniques whose only
+        # template is a wildcard, and techniques in the MITRE catalog with no template at
+        # all. The old single "buildable" flag collapsed the last two together.
+        with_template = sum(1 for r in cl["techniques"] if r.get("templates"))
+        self.assertEqual(cl["buildable"], sum(1 for r in cl["techniques"] if r["buildable"]))
+        self.assertEqual(cl["guidance_only"],
+                         sum(1 for r in cl["techniques"] if r.get("guidance_only")))
+        self.assertEqual(cl["buildable"] + cl["guidance_only"], with_template)
+        self.assertLess(with_template, cl["total"])
+        for row in cl["techniques"]:
+            usable = [tid for tid in row.get("templates", [])
+                      if (TECHNIQUES.get(tid, {}).get("default_value") or "*") not in {"*", ""}]
+            if row["buildable"]:
+                self.assertTrue(usable, f"{row['id']} is buildable with no usable template")
+            if row.get("templates") and not usable:
+                self.assertTrue(row["guidance_only"], f"{row['id']} is mislabelled")
+        self.assertLess(cl["buildable"], cl["total"] // 2,
+                        msg="if most templates are usable the honesty claim is false")
 
     def test_generated_header_does_not_claim_a_schedule(self):
         """`Schedule: every 5m` was wrong: nothing schedules these rules.

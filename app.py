@@ -201,10 +201,23 @@ def create_app() -> Flask:
         for key, entry in _techs.items():
             for tid in entry.get("mitre", []) or []:
                 buildable.setdefault(str(tid), []).append(key)
-        rows = [{**t, "templates": buildable.get(t["id"], []),
-                 "buildable": bool(buildable.get(t["id"]))} for t in attack_techniques()]
+        # "Buildable" used to mean only that a template id exists. 93% of the catalog
+        # (317 of 339) carries default_value "*" - a wildcard that matches every event -
+        # so clicking one produced a form with a field and no predicate, and 164 rows were
+        # advertised as "buildable" with a ready template. A template is buildable only if
+        # it can actually produce a condition the analyst can match on.
+        rows = []
+        for t in attack_techniques():
+            templates = buildable.get(t["id"], [])
+            usable = [tid for tid in templates
+                      if (TECHNIQUES.get(tid, {}).get("default_value") or "*") not in {"*", ""}]
+            rows.append({**t, "templates": templates,
+                         "buildable": bool(usable),
+                         "usable_templates": usable,
+                         "guidance_only": bool(templates) and not usable})
         return jsonify({"techniques": rows, "total": len(rows),
-                        "buildable": sum(1 for r in rows if r["buildable"])})
+                        "buildable": sum(1 for r in rows if r["buildable"]),
+                        "guidance_only": sum(1 for r in rows if r["guidance_only"])})
 
     _coverage_cache: dict[str, Any] = {"key": None, "value": None}
 
