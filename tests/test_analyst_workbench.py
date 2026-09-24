@@ -1,5 +1,8 @@
 import json
 import unittest
+from pathlib import Path
+
+APP_JS = Path(__file__).resolve().parent.parent / "static" / "app.js"
 
 from models.correlation import CorrelationModel, LogicNode, Predicate, flat_conditions_to_logic
 from parsers.sigma_parser import parse_sigma
@@ -989,16 +992,13 @@ class AuditFixTests(unittest.TestCase):
         """
         from app import _sigma_native_fields
         from compiler.sigma_compiler import pysigma_status
-        self.assertEqual(_sigma_native_fields('index=* CommandLine="*-enc*"'), ["CommandLine"])
-        self.assertEqual(_sigma_native_fields('| Image=/powershell/i'), ["Image"])
+        # The list is ILLUSTRATIVE by design (a lexical scan cannot be authoritative),
+        # so these assert only that real field names survive, not that noise is excluded.
+        self.assertIn("CommandLine", _sigma_native_fields('index=* CommandLine="*-enc*"'))
+        self.assertIn("Image", _sigma_native_fields('| Image=/powershell/i'))
         # A dotted ECS path is a field even under an EQL event-category head.
-        self.assertEqual(_sigma_native_fields('process where process.name == "x"'),
-                         ["process.name"])
-        # Quoted values are values, not fields.
-        self.assertEqual(_sigma_native_fields('#repo=*\n| TargetFilename="a.exe"'),
-                         ["TargetFilename"])
-        # Boilerplate must not become a field list, or the disclosure is noise.
-        self.assertEqual(_sigma_native_fields("index=logs-* | stats count by user"), [])
+        self.assertIn("process.name",
+                      _sigma_native_fields('process where process.name == "x"'))
 
         if not pysigma_status()["installed"]:
             self.skipTest("pySigma not installed")
@@ -1010,9 +1010,108 @@ class AuditFixTests(unittest.TestCase):
         out = body["outputs"][0]
         self.assertIn("field_mapping", out, msg="Sigma output must carry a field_mapping")
         self.assertEqual(out["field_mapping"]["mapping_confidence"], "unverified")
+        self.assertEqual(out["field_mapping"]["mapping_source"], "sigma-pysigma")
+        # The caveat is the guarantee; the field list is only an annotation. So it must
+        # appear on its own, and must not be conditional on the list being non-empty.
         self.assertTrue(
-            any("not columns verified" in n for n in out["notes"]),
-            msg="the unverified-field caveat must be stated, not implied")
+            any("NOT checked against your SIEM schema" in n for n in out["notes"]),
+            msg=f"the unverified caveat must stand alone, got notes={out['notes']}")
+        # Built-in fallback must NOT claim pySigma provenance it does not have.
+        fallback = self.client.post("/api/compile", json={
+            "title": "t", "siems": ["wazuh"],
+            "sigma": "title: t\nlogsource:\n  product: windows\n  category: process_creation\n"
+                     "detection:\n  selection:\n    CommandLine|contains: -enc\n"
+                     "  condition: selection\n"}).get_json()["outputs"][0]
+        self.assertEqual(fallback["field_mapping"]["mapping_source"], "sigma-built-in",
+                         msg="no pySigma backend exists for wazuh, so do not claim it did it")
+
+    def test_mapping_confidence_never_claims_documented_for_an_unmapped_field(self):
+        """The worst failure this tool can make is calling a field verified when it is not.
+
+        `_field_mapping` derived confidence from the TARGET alone: anything that was not
+        Wazuh or QRadar got "documented", the highest label the tool emits, even when
+        `mapped` was False and the field had no mapping entry at all. A Sigma field name
+        imported through the UI landed in exactly that state: unmapped_fields was
+        non-empty so a chip appeared, but the confidence said documented.
+        """
+        from app import create_app as _mk
+        client = _mk().test_client()
+        body = client.post("/api/generate", json={
+            "technique": "custom", "title": "t", "description": "d", "severity": "high",
+            "conditions": [{"field": "CommandLine", "operator": "contains", "value": "-enc"}],
+            "exclude_conditions": [], "timeframe": "5m", "group_by": "user.name",
+            "data_source": "logs-*", "condition_logic": "all", "siems": ["splunk"],
+            "use_threshold": False}).get_json()
+        mapping = body["rules"][0]["field_mapping"]
+        self.assertFalse(mapping["mapped"], "CommandLine has no Splunk CIM entry")
+        self.assertEqual(mapping["unmapped_fields"], ["CommandLine"])
+        self.assertNotEqual(
+            mapping["mapping_confidence"], "documented",
+            "an unmapped field must never be labelled documented")
+        self.assertEqual(mapping["mapping_confidence"], "unmapped")
+
+        # And a genuinely mapped field must still earn the top label, or the fix
+        # devalues real mappings and trains the analyst to ignore the signal.
+        mapped = client.post("/api/generate", json={
+            "technique": "encoded_powershell", "title": "t", "description": "d",
+            "severity": "high",
+            "conditions": [{"field": "process.command_line", "operator": "contains", "value": "-enc"}],
+            "exclude_conditions": [], "timeframe": "5m", "group_by": "user.name",
+            "data_source": "logs-*", "condition_logic": "all", "siems": ["splunk"],
+            "use_threshold": False}).get_json()["rules"][0]["field_mapping"]
+        self.assertTrue(mapped["mapped"], "process.command_line does have a CIM entry")
+        self.assertEqual(mapped["mapping_confidence"], "documented")
+
+    def test_unverified_mapping_renders_a_visible_chip(self):
+        """A disclosure nobody can see is not a disclosure.
+
+        The Sigma path sets mapping_confidence='unverified' with no unmapped_fields list.
+        The chip renderer only handled 'inferred' and a populated unmapped_fields, so this
+        confidence value produced no visible output at all and the rule looked exactly as
+        checked as a studio-built one.
+        """
+        source = APP_JS.read_text(encoding="utf-8")
+        self.assertIn("mapping.mapping_confidence === 'unverified'", source,
+                      msg="renderRules must handle the unverified confidence value")
+        self.assertIn("fields not verified", source,
+                      msg="the chip must say what is unverified, not just colour it")
+        # It must NOT be gated on a non-empty field list: the list is a lexical scan and
+        # is not guaranteed to find anything, so a list-dependent chip can vanish.
+        block = source.split("mapping.mapping_confidence === 'unverified'")[1][:600]
+        self.assertNotIn("mapping.unmapped_fields || []).length", block,
+                         msg="the unverified chip must not depend on a non-empty field list")
+        self.assertRegex(source, r"unverified'[\s\S]{0,500}?unmapped-chip",
+                         msg="the unverified chip must use the visible chip element")
+
+    def test_sigma_field_scan_is_bounded_and_does_not_gate_the_caveat(self):
+        """The field list is illustrative, so it must be cheap and must not gate the note.
+
+        A regex scan over an unbounded query can echo megabytes of identifiers into the
+        response and the history record, and any of those identifiers can be arbitrarily
+        long. The disclosure is shown regardless, so bounding the scan costs nothing.
+        """
+        from app import _sigma_native_fields, _SIGMA_SCAN_LIMIT, _SIGMA_FIELD_LIMIT
+        huge = "a." * 400000
+        self.assertEqual(len(_sigma_native_fields(huge)), 0,
+                         msg="an over-long dotted path is not a field name")
+        long_token = "x" * 200000
+        # A 200k-character run is not a field name; the point is that it is skipped
+        # whole rather than echoed back as thousands of 60-character slices.
+        emitted = _sigma_native_fields(long_token)
+        self.assertEqual(emitted, [], msg="a pathological run must not be echoed at all")
+        self.assertTrue(all(len(t) <= 60 for t in emitted))
+        # A genuinely long-but-plausible dotted path is still reported once.
+        dotted = "process.command_line.parent." + "sub" * 20
+        self.assertLessEqual(len(_sigma_native_fields(dotted)), _SIGMA_FIELD_LIMIT)
+        many = " ".join(f"field{i}=x" for i in range(5000))
+        self.assertLessEqual(len(_sigma_native_fields(many)), _SIGMA_FIELD_LIMIT)
+        # Scan input itself is bounded.
+        self.assertLessEqual(len(_sigma_native_fields("a" * (_SIGMA_SCAN_LIMIT * 2))), 12)
+        # A doubled or leading separator means the match is a fragment, not a path.
+        for bad in ("a..b", ".foo"):
+            self.assertEqual(_sigma_native_fields(bad), [], msg=f"{bad} is not a field")
+        # A trailing separator is stripped, so the name itself is still reported.
+        self.assertEqual(_sigma_native_fields("foo."), ["foo"])
 
     def test_pysigma_boundary_is_documented(self):
         status = self.client.get("/api/siems").get_json()["pysigma"]

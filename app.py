@@ -22,65 +22,65 @@ from evaluator.match_tester import test_events
 from diff_tool import diff_models
 
 _SIGMA_FIELD_NOTE = (
-    "pySigma passed Sigma field names through unchanged ({fields}). These are Sigma "
-    "conventions, not columns verified against your SIEM. The built-in renderer maps "
-    "canonical ECS fields to vendor schemas and discloses the result; this path does "
-    "not, so confirm every field against a real event before enabling."
+    "Fields in this output were NOT checked against your SIEM schema. They come from the "
+    "Sigma rule as written{fields}. Rules built in the studio are translated to vendor "
+    "columns and labelled with the mapping; this one is not. Confirm every field against a "
+    "real event before enabling it."
 )
 
-# Words that appear in every dialect's boilerplate. Treating one as a field name would
-# pad the disclosure with noise and train the analyst to ignore it.
-_SIGMA_NON_FIELD = {
-    "index", "search", "where", "from", "select", "group", "having", "last", "minutes",
-    "take", "repo", "sequence", "maxspan", "events", "condition", "outcome", "meta",
-    "desc", "match", "and", "or", "not", "any", "true", "false", "null", "timestamp",
-    "level", "author", "description", "title", "status", "tags", "logsource", "detection",
-    "category", "product", "service", "ruleforge", "attack", "t1059", "t1027",
-}
-
-# Sigma/Windows field names that are single words, so the dotted-path rule misses them.
-_SIGMA_KNOWN_SINGLE = {
-    "image", "commandline", "parentimage", "parentcommandline", "username",
-    "targetfilename", "targetobject", "eventid", "integritylevel", "processname",
-    "parentprocessname", "targetprocessname", "targetcommandline", "targetusername",
-}
+# Bounds for the illustrative scan. The disclosure is unconditional, so these only
+# limit the annotation, never the caveat itself.
+_SIGMA_SCAN_LIMIT = 20000
+_SIGMA_FIELD_LIMIT = 8
 
 
 def _sigma_native_fields(query: str) -> list[str]:
-    """Identifier-shaped names a pySigma output queries, for the unverified-fields note.
+    """Field-looking identifiers in a pySigma output, purely ILLUSTRATIVE.
 
-    Deliberately conservative in the other direction: a false negative understates the
-    caveat, so this accepts a dotted path or a known single-word Sigma/ASIM field, and the
-    note is worded as "the names seen", never as an exhaustive list.
+    This is a lexical scan, so it cannot be authoritative in either direction: it misses
+    short, quoted, hyphenated and non-ASCII field names, and it picks up SELECT aliases,
+    table placeholders and rule names. The unverified-field disclosure therefore does NOT
+    depend on this list being correct - it is shown unconditionally, and this only
+    annotates it. Do not add more stopwords chasing precision; the note is the guarantee,
+    not the inventory.
     """
     if not isinstance(query, str) or not query.strip():
         return []
-    # Drop quoted literals first. Everything inside quotes is a VALUE, and harvesting it
-    # would list "a.exe" as a field, which is exactly the noise that makes an analyst
-    # stop reading the disclosure.
-    body = re.sub(r'"[^"]*"|\'[^\']*\'', " ", query)
+    body = query[:_SIGMA_SCAN_LIMIT]
     found: list[str] = []
-    for token in re.findall(r"[A-Za-z_][A-Za-z0-9_.]{2,}", body):
-        head = token.split(".")[0].lower()
-        dotted = "." in token
-        # A dotted path is a field even when its head is an EQL event category:
-        # process.name, file.name and user.name are the fields those categories match on.
-        # The category stoplist only applies to a BARE category word.
-        if not dotted and (token.lower() in _SIGMA_NON_FIELD or head in _SIGMA_FIELD_STOPLIST):
+    # finditer with an early exit, and a hard per-token cap, so a pathological query
+    # cannot be amplified into megabytes of echoed identifiers across the response and
+    # the history record.
+    for match in re.finditer(r"[A-Za-z_][A-Za-z0-9_.\-]{1,60}", body):
+        token = match.group(0).strip(".-")
+        if not token or len(token) < 2:
             continue
-        if dotted or head in _SIGMA_KNOWN_SINGLE or ("_" in head and head.islower()):
-            if token not in found:
-                found.append(token)
-        if len(found) >= 12:
+        # A match that begins immediately after a dot continues an existing path, so
+        # ".foo" is a fragment of "a.foo", not a standalone field. Requiring the preceding
+        # character to be absent or a delimiter keeps dotted paths intact and drops
+        # fragments; a trailing dot is stripped below rather than rejected.
+        if match.start() > 0 and body[match.start() - 1] in "_.":
+            continue
+        if match.start() > 0 and body[match.start() - 1].isalnum():
+            continue
+        # A match that runs into more identifier characters is a truncated long token.
+        if match.end() < len(body) and (body[match.end()].isalnum() or body[match.end()] in "_."):
+            continue
+        # A run longer than the match window is one pathological token, not several. Skip
+        # the rest of it so a 200k-character run cannot become a list of 60-char slices.
+        if match.end() < len(body) and body[match.end()].isalnum():
+            continue
+        parts = token.split(".")
+        if any(not part for part in parts) or len(parts) > 8:
+            continue
+        if len(found) >= _SIGMA_FIELD_LIMIT:
             break
+        if token not in found:
+            found.append(token)
     return found
 
 
-# EQL event categories and structural keywords: real words, never field names.
-_SIGMA_FIELD_STOPLIST = {
-    "process", "file", "network", "registry", "dns", "authentication", "library",
-    "driver", "process_access", "module", "session", "where", "with", "by", "in",
-}
+
 
 
 def create_app() -> Flask:
@@ -415,15 +415,34 @@ def create_app() -> Flask:
                 # field_mapping at all, so the UI showed a mapping chip for one entry path
                 # and silence for the other. Disclose the difference instead of implying the
                 # imported columns were checked against any schema.
-                sigma_fields = _sigma_native_fields(query)
-                mapping = {
-                    "canonical_field": f"{len(sigma_fields)} Sigma field name(s) passed through",
-                    "native_field": ", ".join(sigma_fields[:6]) + ("..." if len(sigma_fields) > 6 else ""),
-                    "mapping_confidence": "unverified",
-                    "mapping_source": "sigma-pysigma",
-                }
-                if sigma_fields:
-                    notes = [*notes, _SIGMA_FIELD_NOTE.format(fields=", ".join(sigma_fields[:6]))]
+                # pySigma emits Sigma field names (Image, CommandLine) verbatim. The
+                # built-in renderer maps canonical ECS fields to vendor columns and says
+                # which ones. This path does neither, so it must say so unconditionally -
+                # not only when the illustrative field list happens to be non-empty,
+                # which is the case a regex scan cannot guarantee.
+                sigma_fields = _sigma_native_fields(query) if py_sigma else []
+                if py_sigma:
+                    # The caveat stands alone. The scanned names are an annotation that
+                    # helps, not the disclosure - a lexical scan cannot be authoritative,
+                    # so it must never gate whether the analyst is warned.
+                    notes = [*notes, _SIGMA_FIELD_NOTE.format(
+                        fields=(f" Field names seen: {', '.join(sigma_fields)}."
+                                if sigma_fields else ""))]
+                    mapping = {
+                        "canonical_field": "Sigma rule fields, passed through",
+                        "native_field": ", ".join(sigma_fields) or "not enumerated",
+                        "mapping_confidence": "unverified",
+                        "mapping_source": "sigma-pysigma",
+                    }
+                else:
+                    # Built-in fallback for targets with no pySigma backend. Do NOT claim
+                    # pySigma provenance for output it did not produce.
+                    mapping = {
+                        "canonical_field": "Sigma rule fields, built-in renderer",
+                        "native_field": "see output",
+                        "mapping_confidence": "unverified",
+                        "mapping_source": "sigma-built-in",
+                    }
                 outputs.append({"siem": siem, "query": query, "rule": query, "fidelity": fidelity,
                                 "notes": notes, "checks": checks,
                                 "validation": validation_level(siem, checks, py_sigma),

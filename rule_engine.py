@@ -566,9 +566,29 @@ def _native_request(request: RuleRequest, siem: str) -> tuple[RuleRequest, dict[
         "mapped": not unmapped,
         "unmapped_fields": sorted(set(unmapped)),
         "inferred_fields": sorted(set(inferred)),
-        "mapping_confidence": "inferred" if siem in INFERRED_TARGETS else "documented",
+        # Confidence describes THIS FIELD's provenance, not the vendor's schema maturity.
+        # It previously read "documented" for any target that was not Wazuh/QRadar, so a
+        # field with no mapping at all - a Sigma field name passed through, say - was
+        # labelled with the highest confidence the tool emits while `mapped` was False.
+        "mapping_confidence": _mapping_confidence(siem, unmapped, inferred),
         "inferred_target": siem if siem in INFERRED_TARGETS else "",
     }
+
+
+def _mapping_confidence(siem: str, unmapped: list[str], inferred: list[str]) -> str:
+    """How much to trust the field names in this output.
+
+    unmapped   - the field has no entry in this target's mapping table at all, so the name
+                 in the output is whatever the analyst typed. Least trustworthy.
+    inferred   - the target publishes no schema (Wazuh, QRadar), so the name is a plausible
+                 convention rather than a documented column.
+    documented - the field came from this target's published mapping table.
+    """
+    if unmapped:
+        return "unmapped"
+    if inferred or siem in INFERRED_TARGETS:
+        return "inferred"
+    return "documented"
 
 
 def replace_condition(condition: dict[str, str], fields: dict[str, str]) -> dict[str, str]:
