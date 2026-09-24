@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="RuleForge - a local detection engineering workbench. Draft vendor-native detection rules across eight SIEM targets, with every mapping and caveat shown.">
+  <title>RuleForge &middot; Detection Engineering Workbench</title>
+  <link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+<a class="skip-link" href="#work">Skip to workbench</a>
+
+<div class="app" id="top">
+
+  <!-- ══ Top bar: brand · primary tabs · live stats ═════════════════════ -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">RF</span>
+      <span class="brand-text">Rule<em>Forge</em></span>
+    </div>
+
+    <div role="tablist" aria-label="Primary" class="primary-tabs" id="primary-tabs">
+      <button class="primary-tab active" role="tab" id="ptab-home" aria-selected="true" aria-controls="view-home" data-primary="home" type="button">
+        <span class="primary-label">Home</span>
+      </button>
+      <button class="primary-tab" role="tab" id="ptab-studio" aria-selected="false" aria-controls="view-studio" data-primary="studio" tabindex="-1" type="button">
+        <span class="primary-label">Rule Studio</span>
+      </button>
+    </div>
+
+    <div class="topbar-meta">
+      <div class="stat" title="SIEM targets with a structural parser">
+        <b>{{ siems|length }}</b><span>targets</span>
+      </div>
+      <div class="stat" title="ATT&amp;CK techniques in the reference catalog">
+        <b id="stat-techniques">&mdash;</b><span>techniques</span>
+      </div>
+      <div class="stat" title="Verified field translations">
+        <b id="stat-mapped">&mdash;</b><span>mapped fields</span>
+      </div>
+      <span class="privacy" title="No telemetry leaves this machine.">
+        <span class="dot" aria-hidden="true"></span> local only
+      </span>
+      <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Switch to light theme">
+        <span aria-hidden="true">&#9681;</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- ══ Sub bar: Rule Studio modes, centred under the primary tabs ════ -->
+  <div class="subbar" id="subbar">
+    <div role="tablist" aria-label="Rule Studio modes" class="sub-tabs" id="sub-tabs">
+      <button class="sub-tab active" role="tab" id="tab-compose" aria-selected="true" aria-controls="view-compose" data-tab="compose" type="button">
+        <span class="sub-ico" aria-hidden="true">&#9679;</span>
+        <span class="sub-label">Compose</span>
+      </button>
+      <button class="sub-tab" role="tab" id="tab-import" aria-selected="false" aria-controls="view-import" data-tab="import" tabindex="-1" type="button">
+        <span class="sub-ico" aria-hidden="true">&#8600;</span>
+        <span class="sub-label">Import</span>
+      </button>
+      <button class="sub-tab" role="tab" id="tab-test" aria-selected="false" aria-controls="view-test" data-tab="test" tabindex="-1" type="button">
+        <span class="sub-ico" aria-hidden="true">&#9654;</span>
+        <span class="sub-label">Test</span>
+      </button>
+      <button class="sub-tab" role="tab" id="tab-attack" aria-selected="false" aria-controls="view-attack" data-tab="attack" tabindex="-1" type="button">
+        <span class="sub-ico" aria-hidden="true">&#9635;</span>
+        <span class="sub-label">ATT&amp;CK</span>
+      </button>
+      <button class="sub-tab" role="tab" id="tab-coverage" aria-selected="false" aria-controls="view-coverage" data-tab="coverage" tabindex="-1" type="button">
+        <span class="sub-ico" aria-hidden="true">&#9636;</span>
+        <span class="sub-label">Coverage</span>
+      </button>
+      <button class="sub-tab" role="tab" id="tab-mappings" aria-selected="false" aria-controls="view-mappings" data-tab="mappings" tabindex="-1" type="button">
+        <span class="sub-ico" aria-hidden="true">&#8644;</span>
+        <span class="sub-label">Mappings</span>
+      </button>
+      <button class="sub-tab" role="tab" id="tab-history" aria-selected="false" aria-controls="view-history" data-tab="history" tabindex="-1" type="button">
+        <span class="sub-ico" aria-hidden="true">&#8635;</span>
+        <span class="sub-label">History</span>
+      </button>
+    </div>
+  </div>
+
+  <main id="work" class="views">
+
+    <!-- ── Home ───────────────────────────────────────────────────────── -->
+    <section class="shell active" id="view-home" role="tabpanel" aria-labelledby="ptab-home" tabindex="0">
+      <div class="hero">
+        <p class="hero-eyebrow">local detection engineering</p>
+        <h1>Draft vendor-native detection rules without inventing a single field name.</h1>
+        <p class="hero-sub">Describe a behaviour once and get a reviewable draft for every SIEM you run &mdash; each with its fidelity, its validation level, and every unmapped field called out. Nothing is deployed, and nothing leaves this machine.</p>
+        <div class="hero-actions">
+          <button type="button" class="btn primary" data-jump="compose">Open Rule Studio <span aria-hidden="true">&rarr;</span></button>
+          <button type="button" class="btn ghost" data-jump="import">Import an existing rule</button>
+          <button type="button" class="btn ghost" data-jump="attack">Browse ATT&amp;CK</button>
+        </div>
+      </div>
+
+      <div class="home-stats">
+        <div class="home-stat"><b id="home-techniques">&mdash;</b><span>ATT&amp;CK techniques</span></div>
+        <div class="home-stat"><b id="home-buildable">&mdash;</b><span>ready templates</span></div>
+        <div class="home-stat"><b id="home-mapped">&mdash;</b><span>verified field translations</span></div>
+        <div class="home-stat"><b>{{ siems|length }}</b><span>SIEM targets</span></div>
+      </div>
+
+      <div class="home-grid">
+        <section class="card">
+          <div class="card-head"><h2>Where to start</h2></div>
+          <div class="card-body">
+            <div class="quick-grid">
+              <button type="button" class="quick-card" data-jump="compose">
+                <b>Compose</b>
+                <span>Build a rule from a behaviour pattern and compile it for every target you select.</span>
+              </button>
+              <button type="button" class="quick-card" data-jump="import">
+                <b>Import</b>
+                <span>Paste a log event or an existing rule. The analyser extracts the predicates for you.</span>
+              </button>
+              <button type="button" class="quick-card" data-jump="test">
+                <b>Test</b>
+                <span>Evaluate the rule against sample events clause by clause, then pin the result as a fixture.</span>
+              </button>
+              <button type="button" class="quick-card" data-jump="attack">
+                <b>ATT&amp;CK</b>
+                <span>Search the technique catalog and jump into any pattern that already has a buildable template.</span>
+              </button>
+              <button type="button" class="quick-card" data-jump="coverage">
+                <b>Coverage</b>
+                <span>See what every pattern actually produces per target, measured through the real pipeline.</span>
+              </button>
+              <button type="button" class="quick-card" data-jump="mappings">
+                <b>Mappings</b>
+                <span>Pin your own field names, and read where each built-in translation came from.</span>
+              </button>
+              <button type="button" class="quick-card" data-jump="history">
+                <b>History</b>
+                <span>Revisit everything you generated or analysed. Stored only on this machine.</span>
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-head"><h2>Measured fidelity</h2><span class="pill" id="home-coverage-pill">loading&hellip;</span></div>
+          <div class="card-body">
+            <div id="home-coverage" class="coverage-summary"></div>
+            <p class="hint">Every pattern compiled against every target and structurally parsed on this build. Wazuh and QRadar publish no fixed field schema, so their names are inferred conventions rather than verified columns.</p>
+          </div>
+        </section>
+      </div>
+
+      <section class="card">
+        <div class="card-head"><h2>Recent work</h2><span class="pill" id="home-history-pill">0</span></div>
+        <div class="card-body">
+          <div id="home-history" class="history-list"><p class="hint">No history yet.</p></div>
+        </div>
+      </section>
+    </section>
+
+    <!-- ── Rule Studio ────────────────────────────────────────────────── -->
+    <section class="shell" id="view-studio" role="tabpanel" aria-labelledby="ptab-studio" tabindex="0">
+      <div class="viewhead">
+        <h1 id="view-title">Compose a detection</h1>
+        <p id="view-sub">Describe the behaviour once. Get a reviewable, vendor-native rule for every target you run.</p>
+      </div>
+
+      <!-- ── Compose ──────────────────────────────────────────────────── -->
+      <section class="view active" id="view-compose" role="tabpanel" aria-labelledby="tab-compose" tabindex="0">
+        <div class="split">
+          <div class="split-main">
+            <form id="rule-form" class="stack" novalidate>
+
+              <section class="card">
+                <div class="card-head"><span class="step">01</span><h2>Rule context</h2></div>
+                <div class="card-body grid-2">
+                  <div class="field">
+                    <label for="f-title">Rule name</label>
+                    <input id="f-title" name="title" maxlength="140" value="Encoded PowerShell execution" required>
+                  </div>
+                  <div class="field">
+                    <label for="f-severity">Severity</label>
+                    <select id="f-severity" name="severity">
+                      <option value="low">Low</option>
+                      <option value="medium">Medium</option>
+                      <option value="high" selected>High</option>
+                      <option value="critical">Critical</option>
+                    </select>
+                  </div>
+                  <div class="field span-2">
+                    <label for="f-description">Description</label>
+                    <textarea id="f-description" name="description" maxlength="500" rows="2" required>Detects PowerShell started with an encoded command switch.</textarea>
+                  </div>
+                </div>
+              </section>
+
+              <section class="card">
+                <div class="card-head"><span class="step">02</span><h2>Detection logic</h2></div>
+                <div class="card-body">
+                  <div id="imported-model" class="imported-model" hidden></div>
+
+                  <div class="field">
+                    <label for="technique">Behaviour pattern</label>
+                    <input id="technique" name="technique" list="technique-list" value="encoded_powershell" autocomplete="off">
+                    <datalist id="technique-list">
+                      {% for t in techniques %}<option value="{{ t.id }}">{{ t.label }}{% if t.mitre %} &middot; {{ t.mitre|join(', ') }}{% endif %}</option>{% endfor %}
+                    </datalist>
+                    <p class="hint">Type to search {{ techniques|length }} patterns by name, id, or ATT&amp;CK technique.</p>
+                  </div>
+
+                  <div class="row-between">
+                    <div class="field inline">
+                      <label for="condition-logic">Match logic</label>
+                      <select id="condition-logic" name="condition_logic">
+                        <option value="all">ALL conditions</option>
+                        <option value="any">ANY condition</option>
+                      </select>
+                    </div>
+                    <button type="button" class="btn ghost" id="add-condition">+ Condition</button>
+                  </div>
+
+                  <div id="condition-list" class="rows"></div>
+
+                  <div class="row-between mt">
+                    <h3 class="sub">Exclusions</h3>
+                    <button type="button" class="btn ghost" id="add-exclusion">+ Exclusion</button>
+                  </div>
+                  <div id="exclusion-list" class="rows"></div>
+
+                  <details class="disclosure" id="correlation-panel">
+                    <summary><h3 class="sub">Correlation</h3><span class="hint">optional multi-event logic</span></summary>
+                    <div class="disclosure-body">
+                      <div class="field">
+                        <label for="correlation-type">Type</label>
+                        <select id="correlation-type">
+                          <option value="single">Single event</option>
+                          <option value="sequence">Sequence (ordered stages)</option>
+                          <option value="join">Join (two streams)</option>
+                          <option value="aggregation">Aggregation</option>
+                        </select>
+                        <p class="hint">Absence lives inside a sequence &mdash; tick <em>Negated</em> on a stage. Stage conditions are EQL where-clauses; leave blank to reuse the logic above.</p>
+                      </div>
+
+                      <div id="sequence-editor" class="editor" hidden>
+                        <div class="grid-2">
+                          <div class="field"><label for="sequence-join-by">Join by</label><input id="sequence-join-by" value="host.name"></div>
+                          <div class="field"><label for="sequence-maxspan">Max span</label><input id="sequence-maxspan" value="10m"></div>
+                        </div>
+                        <div id="stage-list" class="rows"></div>
+                        <button type="button" class="btn ghost" id="add-stage">+ Stage</button>
+                      </div>
+
+                      <div id="join-editor" class="editor" hidden>
+                        <div class="grid-2">
+                          <div class="field"><label for="join-kind">Kind</label><select id="join-kind"><option>inner</option><option>leftouter</option><option>leftanti</option><option>rightouter</option><option>fullouter</option><option>equality</option></select></div>
+                          <div class="field"><label for="join-on">On</label><input id="join-on" value="process.entity_id"></div>
+                          <div class="field"><label for="join-left">Left</label><input id="join-left" value="process"></div>
+                          <div class="field"><label for="join-right">Right</label><input id="join-right" value="network"></div>
+                        </div>
+                      </div>
+
+                      <div id="aggregation-editor" class="editor" hidden>
+                        <div class="grid-2">
+                          <div class="field"><label for="agg-function">Function</label><select id="agg-function"><option>count</option><option selected>dc</option><option>values</option><option>sum</option><option>min</option><option>max</option></select></div>
+                          <div class="field"><label for="agg-field">Field</label><input id="agg-field" value="destination.ip"></div>
+                          <div class="field"><label for="agg-alias">Alias</label><input id="agg-alias" value="dest_hosts"></div>
+                        </div>
+                      </div>
+                    </div>
+                  </details>
+                </div>
+              </section>
+
+              <section class="card">
+                <div class="card-head"><span class="step">03</span><h2>Telemetry &amp; targets</h2></div>
+                <div class="card-body">
+                  <div class="grid-2">
+                    <div class="field">
+                      <label for="f-source">Data source &mdash; index, table, repository or log source</label>
+                      <input id="f-source" name="data_source" value="logs-*" required>
+                      <p class="hint">Sentinel and Elastic rules use ASIM/ECS column names, so a legacy table will not work. The tool tells you when a placeholder is in play.</p>
+                    </div>
+                    <div class="field">
+                      <label for="f-group-by">Group by</label>
+                      <input id="f-group-by" name="group_by" list="field-names" value="user.name">
+                      <p class="hint">The entity each alert counts against, and the output key for correlations.</p>
+                    </div>
+                  </div>
+
+                  <div class="field">
+                    <label for="f-timeframe">Detection window</label>
+                    <input id="f-timeframe" name="timeframe" value="5m" list="window-options" maxlength="10">
+                    <datalist id="window-options">
+                      <option value="30s"></option><option value="5m"></option><option value="15m"></option><option value="1h"></option><option value="1d"></option>
+                    </datalist>
+                    <p class="hint">Lookback for a scheduled rule, and the span a sequence must fit inside.</p>
+                  </div>
+
+                  <details class="disclosure">
+                    <summary><h3 class="sub">Wazuh custom-rule options</h3><span class="hint">optional</span></summary>
+                    <div class="disclosure-body grid-2">
+                      <div class="field"><label for="f-wazuh-id">Custom rule ID</label><input id="f-wazuh-id" name="wazuh_rule_id" type="number" min="100000" max="120000" value="100100"><p class="hint">Use an unused ID from 100000&ndash;120000.</p></div>
+                      <div class="field"><label for="f-wazuh-parent">Parent rule ID</label><input id="f-wazuh-parent" name="wazuh_parent_rule" inputmode="numeric" placeholder="e.g. 61615"><p class="hint">Only when extending a known rule.</p></div>
+                    </div>
+                  </details>
+
+                  <div class="row-between">
+                    <h3 class="sub">Compile for</h3>
+                    <button type="button" class="btn ghost" id="toggle-targets">Select all</button>
+                  </div>
+                  <div class="targets">
+                    {% for siem in siems %}
+                    <label class="target" style="--vendor: {{ siem.accent }}">
+                      <input type="checkbox" name="siems" value="{{ siem.id }}" {% if siem.id in ['splunk','sentinel','elastic'] %}checked{% endif %}>
+                      <span class="target-body">
+                        <b>{{ siem.name }}</b>
+                        <small>{{ siem.language }}</small>
+                      </span>
+                    </label>
+                    {% endfor %}
+                  </div>
+
+                  <div class="row-between tight">
+                    <label class="check"><input type="checkbox" id="strict"><span>Strict mode &mdash; refuse lossy conversions instead of labelling them</span></label>
+                    <label class="check"><input type="checkbox" id="use-threshold" checked><span>Use threshold</span></label>
+                  </div>
+                </div>
+              </section>
+
+              <div id="form-error" class="alert error" role="alert" hidden></div>
+              <button class="btn primary block" type="submit">
+                <span>Compile rule templates</span><span aria-hidden="true">&rarr;</span>
+              </button>
+            </form>
+          </div>
+
+          <aside class="split-aside">
+            <section class="card sticky">
+              <div class="card-head"><h2>Output</h2><span class="pill" id="output-count">0 targets</span></div>
+              <div class="card-body">
+                <p class="hint" id="output-empty">Compile to see vendor-native rules with their fidelity, validation level and field-mapping caveats.</p>
+                <div id="quality-gates" class="gates"></div>
+                <div id="explainer-cards" class="explainers"></div>
+                <div id="evasion-result" class="inline-result" aria-live="polite"></div>
+                <div class="row-between mt">
+                  <button id="download-all" class="btn ghost" type="button" disabled>Download bundle</button>
+                  <button id="run-evasion" class="btn ghost" type="button" disabled>Evasion self-test</button>
+                </div>
+              </div>
+            </section>
+          </aside>
+        </div>
+
+        <section id="results" class="results" hidden>
+          <div class="row-between results-head">
+            <h2>Compiled rules</h2>
+          </div>
+          <div id="siem-tabs" class="siem-tabs" role="tablist" aria-label="Compiled SIEM outputs"></div>
+          <div id="result-list"></div>
+        </section>
+      </section>
+
+      <!-- ── Import ───────────────────────────────────────────────────── -->
+      <section class="view" id="view-import" role="tabpanel" aria-labelledby="tab-import" tabindex="0" hidden>
+        <div class="split">
+          <div class="split-main">
+            <section class="card">
+              <div class="card-head"><h2>Paste a log event or an existing rule</h2></div>
+              <div class="card-body">
+                <p class="hint">A single event from your console works &mdash; JSON, key=value, or XML. So does a full rule in SPL, KQL, EQL, AQL, YARA-L, CQL, Sigma or Wazuh XML. The analyser extracts the predicates so you can edit rather than retype.</p>
+                <div class="grid-2">
+                  <div class="field">
+                    <label for="import-siem">Source SIEM</label>
+                    <select id="import-siem">
+                      <option value="auto">Auto-detect</option>
+                      {% for siem in siems %}<option value="{{ siem.id }}">{{ siem.name }}</option>{% endfor %}
+                    </select>
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="import-rule">Event or rule</label>
+                  <textarea id="import-rule" rows="10" spellcheck="false" placeholder='{"process": {"name": "certutil.exe"}, "user": {"name": "svc_backup"}}&#10;&#10;or&#10;&#10;index=main | search Image="rundll32.exe"' aria-describedby="import-validation"></textarea>
+                </div>
+                <div class="row-between">
+                  <div id="import-validation" class="validation-live" aria-live="polite"></div>
+                  <button type="button" class="btn primary" id="analyze-rule">Analyse and configure <span aria-hidden="true">&nearr;</span></button>
+                </div>
+                <div id="analysis-result" class="inline-result" aria-live="polite"></div>
+              </div>
+            </section>
+          </div>
+          <aside class="split-aside">
+            <section class="card sticky">
+              <div class="card-head"><h2>Why this matters</h2></div>
+              <div class="card-body prose">
+                <p>Importing is the fast path when you already know the behaviour. The analyser shows what it understood, what it could not represent, and which predicates need checking against your own schema.</p>
+                <p class="hint">Negated predicates are kept as exclusions, so an imported rule does not silently invert itself.</p>
+              </div>
+            </section>
+          </aside>
+        </div>
+      </section>
+
+      <!-- ── Test ──────────────────────────────────────────────────────── -->
+      <section class="view" id="view-test" role="tabpanel" aria-labelledby="tab-test" tabindex="0" hidden>
+        <div class="split">
+          <div class="split-main">
+            <section class="card">
+              <div class="card-head"><h2>Test against sample events</h2><span class="pill">local evaluation</span></div>
+              <div class="card-body">
+                <p class="hint">Paste JSON, NDJSON or CSV events and evaluate the current rule clause by clause. Nothing is sent anywhere.</p>
+                <div class="preset-row">
+                  <button type="button" class="btn ghost" data-preset="match">Matching PowerShell</button>
+                  <button type="button" class="btn ghost" data-preset="excluded">Excluded admin</button>
+                  <button type="button" class="btn ghost" data-preset="nomatch">Benign</button>
+                </div>
+                <div class="tune">
+                  <span class="tune-label">Tune</span>
+                  <span class="tune-group">
+                    <span id="thr-caption" class="tune-name">Threshold</span>
+                    <span class="stepper">
+                      <input id="threshold" name="threshold" type="number" min="1" max="10000" step="1" value="1" class="visually-hidden-input">
+                      <button type="button" id="thr-minus" aria-label="Decrease threshold" aria-controls="threshold">&minus;</button>
+                      <output id="thr-value" for="threshold">1</output>
+                      <button type="button" id="thr-plus" aria-label="Increase threshold" aria-controls="threshold">+</button>
+                    </span>
+                  </span>
+                  <span class="tune-group">
+                    <span id="window-caption" class="tune-name">Window</span>
+                    <span class="window-presets" role="group" aria-labelledby="window-caption">
+                      <button type="button" data-window="5m" aria-pressed="true">5m</button>
+                      <button type="button" data-window="15m" aria-pressed="false">15m</button>
+                      <button type="button" data-window="1h" aria-pressed="false">1h</button>
+                      <button type="button" data-window="1d" aria-pressed="false">1d</button>
+                    </span>
+                  </span>
+                </div>
+                <div class="field">
+                  <label for="test-events">Sample events (JSON / NDJSON / CSV)</label>
+                  <textarea id="test-events" rows="8" spellcheck="false" placeholder='[{"process.name": "powershell.exe", "process.command_line": "powershell -enc abc", "user.name": "alice"}]'> </textarea>
+                  <p class="hint">A single JSON object, a JSON array, NDJSON, or CSV with a header row all work. Saving a fixture additionally needs an <code>_expected</code> true/false on every event, and Ingest will ask before assuming one.</p>
+                </div>
+                <div id="status" class="sr-status" role="status" aria-live="polite"></div>
+                <div class="row-between">
+                  <div class="row">
+                    <button type="button" class="btn primary" id="run-match-test">Run test</button>
+                    <button type="button" class="btn ghost" id="save-fixture">Save as fixture</button>
+                    <button type="button" class="btn ghost" id="replay-fixtures">Replay fixtures</button>
+                    <button type="button" class="btn ghost" id="run-diff">Compare revisions</button>
+                  </div>
+                </div>
+                <div id="tester-result" class="inline-result" aria-live="polite"></div>
+                <div id="fixture-result" class="inline-result" aria-live="polite"></div>
+                <div id="diff-result" class="inline-result" aria-live="polite"></div>
+              </div>
+            </section>
+
+            <section class="card">
+              <div class="card-head"><h2>Ingest a log file</h2></div>
+              <div class="card-body">
+                <div class="grid-2">
+                  <div class="field">
+                    <label for="ingest-format">Format</label>
+                    <select id="ingest-format">
+                      <option value="json">JSON</option>
+                      <option value="ndjson">NDJSON</option>
+                      <option value="csv">CSV</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="ingest-file">File</label>
+                  <input id="ingest-file" type="file">
+                </div>
+                <button type="button" class="btn ghost" id="run-ingest">Ingest</button>
+                <div id="ingest-status" class="inline-result" aria-live="polite"></div>
+              </div>
+            </section>
+          </div>
+          <aside class="split-aside">
+            <section class="card sticky">
+              <div class="card-head"><h2>Before you enable</h2></div>
+              <div class="card-body">
+                <ol class="checklist">
+                  <li>Point the rule at the table or index you actually ingest.</li>
+                  <li>Confirm every unmapped field against a real event.</li>
+                  <li>Test with known good <em>and</em> known bad events.</li>
+                  <li>Tune exclusions with an analyst who knows the noise.</li>
+                </ol>
+                <p class="hint">These outputs are starting points, not production changes. Nothing is deployed by this tool.</p>
+              </div>
+            </section>
+          </aside>
+        </div>
+      </section>
+
+      <!-- ── ATT&CK ───────────────────────────────────────────────────── -->
+      <section class="view" id="view-attack" role="tabpanel" aria-labelledby="tab-attack" tabindex="0" hidden>
+        <section class="card">
+          <div class="card-head"><h2>MITRE ATT&amp;CK reference</h2><span class="pill" id="attack-summary">loading&hellip;</span></div>
+          <div class="card-body">
+            <div class="field">
+              <label for="attack-search">Search techniques</label>
+              <input id="attack-search" type="search" placeholder="T1059, PowerShell, credential access&hellip;" autocomplete="off">
+            </div>
+            <div id="attack-list" class="attack-list" aria-live="polite"></div>
+          </div>
+        </section>
+      </section>
+
+      <!-- ── Coverage ─────────────────────────────────────────────────── -->
+      <section class="view" id="view-coverage" role="tabpanel" aria-labelledby="tab-coverage" tabindex="0" hidden>
+        <section class="card">
+          <div class="card-head"><h2>Measured coverage by target</h2></div>
+          <div class="card-body">
+            <p class="hint">Every catalogued pattern is compiled against every target through the real pipeline and structurally parsed. Fidelity is measured, not claimed.</p>
+            <div id="coverage-summary" class="coverage-summary"></div>
+            <div id="coverage-matrix" class="table-scroll" aria-live="polite"></div>
+          </div>
+        </section>
+      </section>
+
+      <!-- ── Mappings ──────────────────────────────────────────────────── -->
+      <section class="view" id="view-mappings" role="tabpanel" aria-labelledby="tab-mappings" tabindex="0" hidden>
+        <div class="split">
+          <div class="split-main">
+            <section class="card">
+              <div class="card-head"><h2>Pin an org-specific field name</h2></div>
+              <div class="card-body">
+                <p class="hint">Your deployment's field names win over the built-in table. Each pin records who set it and why, so a later reader can tell an org convention from a generated guess.</p>
+                <div class="grid-2">
+                  <div class="field"><label for="ov-target">Target</label><select id="ov-target">{% for siem in siems %}<option value="{{ siem.id }}">{{ siem.name }}</option>{% endfor %}</select></div>
+                  <div class="field"><label for="ov-canonical">Canonical field (ECS)</label><input id="ov-canonical" list="field-names" placeholder="process.command_line"></div>
+                  <div class="field"><label for="ov-native">Native field in your SIEM</label><input id="ov-native" placeholder="TargetProcessCommandLine"></div>
+                  <div class="field"><label for="ov-reason">Reason (optional)</label><input id="ov-reason" placeholder="our CIM alias"></div>
+                </div>
+                <div class="row">
+                  <button type="button" class="btn primary" id="ov-save">Pin mapping</button>
+                  <button type="button" class="btn ghost" id="ov-clear">Remove pin</button>
+                </div>
+                <div id="ov-status" class="inline-result" aria-live="polite"></div>
+              </div>
+            </section>
+            <section class="card">
+              <div class="card-head"><h2>Pinned mappings</h2><span class="pill" id="ov-count">0</span></div>
+              <div class="card-body"><div id="ov-list" class="rows"></div></div>
+            </section>
+          </div>
+          <aside class="split-aside">
+            <section class="card sticky">
+              <div class="card-head"><h2>Mapping provenance</h2></div>
+              <div class="card-body"><div id="ov-provenance" class="prose"></div></div>
+            </section>
+          </aside>
+        </div>
+      </section>
+
+      <!-- ── History ───────────────────────────────────────────────────── -->
+      <section class="view" id="view-history" role="tabpanel" aria-labelledby="tab-history" tabindex="0" hidden>
+        <section class="card">
+          <div class="card-head">
+            <h2>Rule history</h2>
+            <div class="row">
+              <button id="refresh-history" class="btn ghost" type="button">Refresh</button>
+              <button id="clear-history" class="btn ghost danger" type="button">Clear</button>
+            </div>
+          </div>
+          <div class="card-body">
+            <p class="hint">Every generated or analysed rule is recorded locally so you can revisit previous work.</p>
+            <div id="history-list" class="history-list"><p class="hint">No history yet.</p></div>
+          </div>
+        </section>
+      </section>
+
+    </section>
+    </main>
+</div>
+
+<datalist id="field-names">
+  {% for f in field_names %}<option value="{{ f }}"></option>{% endfor %}
+</datalist>
+<script id="technique-data" type="application/json">{{ techniques_json|tojson }}</script>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

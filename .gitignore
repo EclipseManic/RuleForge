@@ -1,0 +1,29 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime state, not source.
+# data/ruleforge.db is ~43MB of local history, fixtures and mapping overrides.
+# It is created on first run and is machine-specific, so it must never be committed.
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# Editor / agent tooling state
+.kilo/
+.DS_Store
+Thumbs.db
+
+# Local environment overrides
+.env
+.env.*

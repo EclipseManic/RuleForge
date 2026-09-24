@@ -1,0 +1,12 @@
+Flask>=3.0,<4.0
+PyYAML>=6.0.3,<7.0
+
+# Authoritative Sigma conversion (optional at runtime, verified present here).
+# Installed and probed on every request: pysigma_status() reports what actually imports,
+# and the built-in renderer stays the fallback so the tool works offline either way.
+pysigma>=1.5,<2.0
+pysigma-backend-splunk>=2.1,<3.0
+pysigma-backend-elasticsearch>=2.1,<3.0
+pysigma-backend-qradar>=0.3,<1.0
+pysigma-backend-crowdstrike>=3.0,<4.0
+pysigma-backend-azure>=0.1,<1.0
