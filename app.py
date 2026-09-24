@@ -9,8 +9,9 @@ from models.correlation import Predicate
 
 from flask import Flask, jsonify, render_template, request
 
-from rule_engine import (FIELD_MAPPINGS, OPERATOR_ALIASES, SIEMS, TECHNIQUES, RuleValidationError, analyze_rule,
-                         detect_siem, generate_rules, generate_workbench, supported_siems)
+from rule_engine import (FIELD_MAPPINGS, INFERRED_TARGETS, OPERATOR_ALIASES, SIEMS, TECHNIQUES,
+                         RuleValidationError, analyze_rule, detect_siem, generate_rules,
+                         generate_workbench, supported_siems)
 from storage import RuleStore
 from section_view import section_blocks
 from compiler.validators import faithfulness, sigma_check, target_check
@@ -129,7 +130,7 @@ def create_app() -> Flask:
 
     @app.get("/api/techniques")
     def techniques() -> Any:
-        from rule_engine import INFERRED_TARGETS, mapping_provenance
+        from rule_engine import mapping_provenance
         taxonomy = field_taxonomy()
         # `mapped_field_count` used to be the length of ONE target's table (sigma) while the
         # UI labelled it "verified field translations", which reads as a global coverage
@@ -329,8 +330,17 @@ def create_app() -> Flask:
         # mapping at all. The UI can only reach this through /api/generate, so the Sigma
         # path has to live here too or it is unreachable in practice.
         use_sigma = bool(str(payload.get("sigma", "")).strip()) and payload.get("sigma_authoritative", True) is not False
+        # This branch ran before the normal request validation, so a malformed target
+        # container iterated as a non-sequence raised TypeError and answered 500 where the
+        # form path answers 400. Normalize once, the same way for both paths.
+        raw_targets = payload.get("siems")
+        if not isinstance(raw_targets, list) or any(not isinstance(s, str) for s in raw_targets):
+            return jsonify({"error": "siems must be a list of target names."}), 400
+        targets = list(dict.fromkeys(raw_targets))
+        if not targets:
+            return jsonify({"error": "Select at least one target."}), 400
         try:
-            workbench = (_sigma_workbench(payload, [s for s in payload.get("siems", []) if isinstance(s, str)])
+            workbench = (_sigma_workbench(payload, targets)
                          if use_sigma else generate_workbench(payload))
         except (RuleValidationError, ValueError, RecursionError) as error:
             return jsonify({"error": str(error)}), 400
@@ -777,21 +787,58 @@ def _sigma_workbench(payload: dict[str, Any], targets: list[str]) -> dict[str, A
     with no mapping, and never reach the vendor-authored backend that was already wired
     into /api/compile. This reuses that path and reshapes it into the `rules` contract the
     UI already renders, so the form and the API agree on which conversion is authoritative.
+
+    Two rules govern the shape of this function:
+
+    * A vendor backend is tried FIRST, per target, and the normalized fallback projection
+      is built lazily and at most once. Building it eagerly meant a Sigma rule the local
+      editor cannot represent was rejected with a 400 before pySigma ever ran, so one
+      unrepresentable rule sank every selected target.
+    * A target that cannot be produced is refused, never approximated. Nothing here may
+      synthesize a field, table or value the submitted rule did not contain.
     """
     from compiler.sigma_compiler import compile_model, compile_sigma_with_pysigma, pysigma_status
     from compiler.validators import target_warnings, validation_level
 
     sigma_yaml = str(payload.get("sigma", ""))
-    model, _ = _payload_to_model({**payload, **_request_from_sigma(sigma_yaml)})
+    strict = bool(payload.get("strict"))
     rules: list[dict[str, Any]] = []
-    authoritative = 0
+    outcomes: dict[str, str] = {}
+    # Built at most once, and only if some target actually needs the fallback.
+    fallback: tuple[Any, str] | None = None
+
+    def fallback_model() -> tuple[Any, str]:
+        nonlocal fallback
+        if fallback is None:
+            try:
+                model, _ = _payload_to_model({**payload, **_request_from_sigma(sigma_yaml)})
+            except (RuleValidationError, ValueError) as error:
+                fallback = (None, str(error))
+            else:
+                fallback = (model, "")
+        return fallback
+
+    def refuse(siem: str, reason: str, kind: str, note: str) -> dict[str, Any]:
+        meta = SIEMS.get(siem, {"name": siem, "language": ""})
+        return {"siem": siem, "name": meta.get("name", siem),
+                "language": meta.get("language", ""), "rule": "", "query": "",
+                "technique_label": _sigma_technique_label(sigma_yaml),
+                "fidelity": "unsupported", "refused": True, "refusal_kind": kind,
+                "refusal_reason": reason, "review_note": note,
+                "capability_notes": [reason], "checks": [reason], "warnings": [],
+                "validation": "failed", "section_blocks": [],
+                "field_mapping": {"canonical_field": "Sigma rule fields, not emitted",
+                                  "native_field": "not emitted",
+                                  "mapping_confidence": "unverified",
+                                  "mapping_source": "sigma-unavailable"}}
+
     for siem in targets:
         meta = SIEMS.get(siem, {"name": siem, "language": ""})
         converted = compile_sigma_with_pysigma(sigma_yaml, siem)
         if converted is not None:
             query, notes = converted
             fidelity = "exact"
-            authoritative += 1
+            outcomes[siem] = "converted"
             seen = _sigma_native_fields(query)
             notes = [*notes, _SIGMA_FIELD_NOTE.format(
                 fields=(f" Field names seen: {', '.join(seen)}." if seen else ""))]
@@ -799,29 +846,47 @@ def _sigma_workbench(payload: dict[str, Any], targets: list[str]) -> dict[str, A
                        "native_field": ", ".join(seen) or "not enumerated",
                        "mapping_confidence": "unverified", "mapping_source": "sigma-pysigma"}
         else:
+            model, failure = fallback_model()
+            if model is None:
+                outcomes[siem] = "unrepresentable"
+                rules.append(refuse(
+                    siem, failure or "This Sigma rule has no portable single-event projection.",
+                    "target_constraint",
+                    "The normalized editor cannot carry this Sigma rule and no vendor backend "
+                    "is installed for this target, so nothing was emitted. The other targets "
+                    "are unaffected."))
+                continue
             try:
                 query, fidelity, notes = compile_model(model, siem)
             except RuleValidationError as refusal:
-                rules.append({"siem": siem, "name": meta.get("name", siem),
-                              "language": meta.get("language", ""), "rule": "", "query": "",
-                              "fidelity": "unsupported", "refused": True,
-                              "refusal_kind": "target_constraint",
-                              "refusal_reason": str(refusal),
-                              "review_note": "This target's own limits reject the requested settings. "
-                                             "Adjust them or drop this target; the other targets are unaffected.",
-                              "capability_notes": [str(refusal)], "checks": [str(refusal)],
-                              "warnings": [], "validation": "failed", "section_blocks": [],
-                              "field_mapping": {"canonical_field": "Sigma rule fields, built-in renderer",
-                                                "native_field": "not emitted",
-                                                "mapping_confidence": "unverified",
-                                                "mapping_source": "sigma-built-in"}})
+                outcomes[siem] = "refused"
+                rules.append(refuse(
+                    siem, str(refusal), "target_constraint",
+                    "This target's own limits reject the requested settings. Adjust them or drop "
+                    "this target; the other targets are unaffected."))
                 continue
+            if strict and fidelity in {"partial", "unsupported"}:
+                # Strict mode refuses lossy conversions. It was silently ignored on this path,
+                # so a labelled partial draft came back as if the control did not exist.
+                outcomes[siem] = "refused"
+                rules.append(refuse(
+                    siem, f"Strict mode: this Sigma rule has no faithful {meta.get('name', siem)} "
+                          f"equivalent in the built-in renderer (reported fidelity: {fidelity}).",
+                    "strict_fidelity",
+                    "Strict mode refuses lossy conversions. Disable strict mode to get a labelled "
+                    "partial draft, or use a target with a vendor backend installed."))
+                continue
+            outcomes[siem] = "fallback"
             if not pysigma_status()["installed"]:
                 notes = [*notes, "pySigma is not installed: built-in renderer used. Install pysigma "
                                  "plus a backend package for authoritative Sigma conversion."]
             mapping = {"canonical_field": "Sigma rule fields, built-in renderer",
                        "native_field": "see output", "mapping_confidence": "unverified",
                        "mapping_source": "sigma-built-in"}
+        if siem in INFERRED_TARGETS:
+            # The target-level classification is a separate axis from field provenance and
+            # must survive: Wazuh and QRadar publish no field schema whatever the converter.
+            mapping = {**mapping, "inferred_target": siem}
         # Both halves: target_warnings is where the placeholder-scope caveats live (an
         # unscoped index=*, the Sentinel table placeholder). Dropping it hid exactly the
         # warnings that say the output is not deployable as written.
@@ -830,6 +895,7 @@ def _sigma_workbench(payload: dict[str, Any], targets: list[str]) -> dict[str, A
         rules.append({
             "siem": siem, "name": meta.get("name", siem), "language": meta.get("language", ""),
             "rule": query, "query": query, "fidelity": fidelity,
+            "technique_label": _sigma_technique_label(sigma_yaml),
             "review_note": (f"Converted from your Sigma rule by the vendor-authored "
                             f"{meta.get('name', siem)} backend. Field names are whatever that "
                             "backend emitted - map them to your data model before enabling."),
@@ -837,25 +903,62 @@ def _sigma_workbench(payload: dict[str, Any], targets: list[str]) -> dict[str, A
             "validation": validation_level(siem, checks, converted is not None),
             "field_mapping": mapping, "section_blocks": [],
         })
+
+    emitted = [r for r in rules if not r.get("refused")]
+    converted_n = sum(1 for o in outcomes.values() if o == "converted")
+    unrepresentable = sorted(s for s, o in outcomes.items() if o == "unrepresentable")
+    refused = sorted(s for s, o in outcomes.items() if o == "refused")
+    total = len(targets)
     gates: list[dict[str, Any]] = []
-    if authoritative and authoritative < len(targets):
-        gates.append({"level": "warn", "title": "Partial authoritative conversion",
-                      "detail": f"{authoritative} of {len(targets)} targets were converted by a "
-                                "vendor-authored backend; the rest used the built-in renderer, "
-                                "which is a draft, not an equivalent rule."})
-    elif not authoritative:
+    if converted_n and converted_n < total:
+        detail = (f"{converted_n} of {total} targets were converted by a vendor-authored backend. "
+                  "The rest were not, because ")
+        detail += (f"{', '.join(unrepresentable)} cannot be projected by the normalized editor"
+                   if unrepresentable else "")
+        if refused:
+            detail += ("; " if unrepresentable else "") + f"{', '.join(refused)} refused"
+        detail += ". Treat those as drafts, not equivalent rules."
+        gates.append({"level": "warn", "title": "Partial authoritative conversion", "detail": detail})
+    elif not converted_n and emitted:
         gates.append({"level": "warn", "title": "No vendor backend for these targets",
                       "detail": "None of the selected targets has a pySigma backend here, so the "
                                 "built-in renderer produced these. Treat them as drafts."})
+    if unrepresentable:
+        gates.append({"level": "warn", "title": "Sigma rule not representable in the editor",
+                      "detail": f"{', '.join(unrepresentable)} emitted nothing. Their Sigma condition "
+                                "is not a single-event field match, so no field name could be "
+                                "derived from it and none was invented."})
+    all_native = bool(emitted) and converted_n == len(emitted) == total
     return {
         "rules": rules,
         "quality_gates": gates,
         "compile_contract": {"source": {
-            "mode": "sigma_native" if authoritative else "sigma_built_in",
-            "fidelity": "exact" if authoritative and authoritative == len(targets) else "partial",
-            "equivalent": authoritative == len(targets)}},
-        "compile_allowed": bool(rules),
+            "mode": ("sigma_native" if all_native else
+                     "sigma_mixed" if emitted and converted_n else "sigma_built_in"),
+            "fidelity": "exact" if all_native else "partial",
+            "equivalent": all_native,
+            "converted_by_vendor_backend": converted_n,
+            "emitted_targets": sorted(r["siem"] for r in emitted),
+            "refused_targets": refused,
+            "reason": ([] if all_native else
+                       [f"{total - len(emitted)} of {total} selected targets emitted no rule."])}},
+        "compile_allowed": bool(emitted),
     }
+
+
+def _sigma_technique_label(sigma_yaml: str) -> str:
+    """Title from the Sigma document, for the per-target download filename.
+
+    Every workbench rule carries a technique_label and downloadRule() dereferences it, so a
+    missing key made the download button throw for every Sigma result.
+    """
+    for line in sigma_yaml.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("title:"):
+            title = stripped.split(":", 1)[1].strip().strip("'\"")
+            if title:
+                return title[:140]
+    return "Sigma rule"
 
 
 def _request_from_sigma(sigma_yaml: str) -> dict[str, Any]:
@@ -897,7 +1000,16 @@ def _request_from_sigma(sigma_yaml: str) -> dict[str, Any]:
         else:
             conditions.append({"field": node.field, "operator": node.operator, "value": value})
     if not conditions:
-        conditions = [{"field": "process.name", "operator": "contains", "value": "example.exe"}]
+        # Previously this fabricated `process.name contains example.exe`. A Sigma rule can
+        # be perfectly valid and still yield no portable predicate - an aggregation
+        # condition such as `selection | count() by User > 5` is the common case - and the
+        # fabricated field and value then appeared in real, copyable, downloadable output
+        # for a target the analyst never asked about. Inventing an executable placeholder is
+        # the one thing this tool must never do, so refuse the projection instead.
+        raise RuleValidationError(
+            "This Sigma rule has no single-event predicate the normalized editor can carry "
+            "(an aggregation, threshold or sequence condition is not a field match). Convert "
+            "it with a vendor backend where one exists, or rebuild the construct natively.")
     exclusions = []
     for excl in sigma_model.exclusions or []:
         stack = [excl]
@@ -917,10 +1029,10 @@ def _request_from_sigma(sigma_yaml: str) -> dict[str, Any]:
         "description": str(meta.get("description") or "Converted from Sigma YAML.")[:500],
         "severity": severity,
         "technique": "custom",
-        "field": conditions[0]["field"] if conditions else "process.name",
-        "operator": conditions[0]["operator"] if conditions else "contains",
-        "value": conditions[0]["value"] if conditions else "example.exe",
-        "conditions": conditions or [{"field": "process.name", "operator": "contains", "value": "example.exe"}],
+        "field": conditions[0]["field"],
+        "operator": conditions[0]["operator"],
+        "value": conditions[0]["value"],
+        "conditions": conditions,
         "condition_logic": "all",
         "exclude_conditions": exclusions,
         "threshold": sigma_model.threshold or 1,

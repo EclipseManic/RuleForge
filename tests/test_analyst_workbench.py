@@ -986,6 +986,119 @@ class AuditFixTests(unittest.TestCase):
         self.assertIn("OPERATOR_ALIAS", source,
                       msg="the select write must normalize even if the API drifts")
 
+    def test_a_sigma_rule_with_no_portable_predicate_is_refused_not_invented(self):
+        """A valid Sigma aggregation has no single-event field match to carry across.
+
+        The projection used to fabricate `process.name contains example.exe`, and that
+        invented field and value landed in real, copyable, downloadable SPL and AQL for
+        targets the analyst never mentioned. Inventing an executable placeholder is the one
+        thing this tool must never do, so the target must be refused with an empty body.
+        """
+        agg = ("title: Brute Force Logons\nlogsource:\n  product: windows\n  service: security\n"
+               "detection:\n  selection:\n    EventID: 4625\n"
+               "  condition: selection | count() by User > 5\nlevel: medium\n")
+        body = self.client.post("/api/generate", json={
+            "title": "t", "description": "d", "severity": "high", "technique": "custom",
+            "timeframe": "5m", "group_by": "user.name", "data_source": "*",
+            "threshold": 1, "use_threshold": False,
+            "siems": ["splunk", "qradar"], "sigma": agg}).get_json()
+        for rule in body["rules"]:
+            self.assertTrue(rule.get("refused"), f"{rule['siem']} must refuse, not approximate")
+            self.assertEqual(rule["rule"], "", f"{rule['siem']} emitted a rule body")
+            self.assertNotIn("example.exe", rule.get("rule", ""),
+                             msg="the fabricated value reached a real artifact")
+            self.assertNotIn("process.name", rule.get("rule", ""),
+                             msg="the fabricated field reached a real artifact")
+        self.assertFalse(body["compile_allowed"],
+                         msg="nothing was emitted, so nothing is deployable")
+        self.assertFalse(body["compile_contract"]["source"]["equivalent"])
+        self.assertTrue(any("not representable" in g["title"].lower() for g in body["quality_gates"]),
+                        msg="the analyst must be told why nothing came out")
+
+    def test_pysigma_runs_before_the_editor_projection_is_built(self):
+        """A Sigma rule the local editor cannot represent must not block the vendor backend.
+
+        The normalized projection was built eagerly, so a rule with more predicates than the
+        form allows (or a modifier the form operator vocabulary rejects) returned 400 before
+        pySigma ever ran, and one locally unrepresentable rule sank every selected target.
+        """
+        predicates = "\n".join(f"    Field{i}: value{i}" for i in range(25))
+        many = ("title: Wide\nlogsource:\n  product: windows\ndetection:\n  sel:\n"
+                f"{predicates}\n  condition: sel\n")
+        rv = self.client.post("/api/generate", json={
+            "title": "t", "description": "d", "severity": "high", "technique": "custom",
+            "timeframe": "5m", "group_by": "user.name", "data_source": "*",
+            "threshold": 1, "use_threshold": False, "siems": ["splunk"], "sigma": many})
+        self.assertEqual(rv.status_code, 200,
+                         msg="a wide Sigma rule must reach the vendor backend, not 400")
+        body = rv.get_json()
+        converted = [r for r in body["rules"]
+                     if r["field_mapping"].get("mapping_source") == "sigma-pysigma"]
+        self.assertTrue(converted, "pySigma never ran for a wide but valid Sigma rule")
+        self.assertTrue(converted[0]["rule"].strip())
+        # And the form projection alone must still be refused rather than invented.
+        from app import _request_from_sigma
+        from rule_engine import RuleValidationError
+        with self.assertRaises(RuleValidationError):
+            _request_from_sigma("title: A\nlogsource:\n  product: windows\ndetection:\n"
+                                "  sel:\n    EventID: 4625\n  condition: sel | count() by User > 5\n")
+
+    def test_strict_mode_is_honoured_on_the_sigma_fallback_path(self):
+        """Strict mode was wired into the form path and silently ignored on the Sigma one."""
+        or_rule = ("title: A or B\nlogsource:\n  product: windows\ndetection:\n  sel1:\n"
+                   "    Image: a.exe\n  sel2:\n    Image: b.exe\n  condition: sel1 or sel2\n")
+        base = {"title": "t", "description": "d", "severity": "high", "technique": "custom",
+                "timeframe": "5m", "group_by": "user.name", "data_source": "*",
+                "threshold": 1, "use_threshold": False}
+        strict = self.client.post("/api/generate", json={
+            **base, "siems": ["wazuh"], "sigma": or_rule, "strict": True}).get_json()["rules"][0]
+        self.assertTrue(strict.get("refused"), "strict mode must refuse a lossy conversion")
+        self.assertEqual(strict["refusal_kind"], "strict_fidelity")
+        self.assertEqual(strict["rule"], "", "a strict refusal must not emit a query")
+        loose = self.client.post("/api/generate", json={
+            **base, "siems": ["wazuh"], "sigma": or_rule}).get_json()["rules"][0]
+        self.assertFalse(loose.get("refused"),
+                         msg="without strict mode the labelled draft is still allowed")
+        self.assertTrue(loose["rule"].strip())
+
+    def test_sigma_targets_are_validated_and_deduplicated_like_the_form_path(self):
+        """The Sigma branch iterated the target container before validating it, so
+        `siems: null` or `siems: 7` answered 500 where the form path answers 400."""
+        sigma = "title: Ops\nlogsource:\n  product: windows\ndetection:\n  sel:\n    Image: a.exe\n  condition: sel\n"
+        base = {"title": "t", "description": "d", "severity": "high", "technique": "custom",
+                "timeframe": "5m", "group_by": "user.name", "data_source": "*",
+                "threshold": 1, "use_threshold": False, "sigma": sigma}
+        for bad in (None, 7, "splunk", [1, 2], []):
+            rv = self.client.post("/api/generate", json={**base, "siems": bad})
+            self.assertEqual(rv.status_code, 400, f"siems={bad!r} must be rejected, not 500")
+        dupes = self.client.post("/api/generate", json={**base, "siems": ["splunk", "splunk", "sentinel"]})
+        self.assertEqual(dupes.status_code, 200)
+        emitted = [r["siem"] for r in dupes.get_json()["rules"]]
+        self.assertEqual(emitted, ["splunk", "sentinel"],
+                         msg="a repeated target inflates the rule count and the denominators")
+
+    def test_every_sigma_rule_carries_the_fields_the_ui_dereferences(self):
+        """downloadRule() dereferences technique_label, so its absence threw for every
+        Sigma result. Wazuh and QRadar must also keep their inferred-target marker, which is
+        a separate axis from the field-level unverified label."""
+        sigma = "title: Brute Force\nlogsource:\n  product: windows\ndetection:\n  sel:\n    Image: a.exe\n  condition: sel\n"
+        body = self.client.post("/api/generate", json={
+            "title": "t", "description": "d", "severity": "high", "technique": "custom",
+            "timeframe": "5m", "group_by": "user.name", "data_source": "*",
+            "threshold": 1, "use_threshold": False,
+            "siems": ["splunk", "wazuh", "qradar"], "sigma": sigma}).get_json()
+        by_siem = {r["siem"]: r for r in body["rules"]}
+        from rule_engine import SIEMS
+        for siem, rule in by_siem.items():
+            self.assertTrue(rule.get("technique_label"), f"{siem} has no technique_label")
+            self.assertEqual(rule["name"], SIEMS[siem]["name"], siem)
+            self.assertIn("language", rule, siem)
+        for siem in ("wazuh", "qradar"):
+            self.assertEqual(by_siem[siem]["field_mapping"].get("inferred_target"), siem,
+                             f"{siem} publishes no field schema; the marker must survive")
+        self.assertNotIn("inferred_target", by_siem["splunk"]["field_mapping"],
+                         msg="a target with a published schema must not be marked inferred")
+
     def test_a_pasted_sigma_rule_reaches_the_authoritative_backend(self):
         """The UI could paste real Sigma YAML and never reach the vendor-authored backend.
 
