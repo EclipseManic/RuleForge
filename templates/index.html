@@ -28,8 +28,14 @@
       <button class="primary-tab active" role="tab" id="ptab-home" aria-selected="true" aria-controls="view-home" data-primary="home" type="button">
         <span class="primary-label">Home</span>
       </button>
-      <button class="primary-tab" role="tab" id="ptab-studio" aria-selected="false" aria-controls="view-studio" data-primary="studio" tabindex="-1" type="button">
-        <span class="primary-label">Rule Studio</span>
+      <button class="primary-tab" role="tab" id="ptab-workbench" aria-selected="false" aria-controls="view-workbench" data-primary="workbench" tabindex="-1" type="button">
+        <span class="primary-label">Workbench</span>
+      </button>
+      <button class="primary-tab" role="tab" id="ptab-attack" aria-selected="false" aria-controls="view-attack" data-primary="attack" tabindex="-1" type="button">
+        <span class="primary-label">ATT&amp;CK</span>
+      </button>
+      <button class="primary-tab" role="tab" id="ptab-history" aria-selected="false" aria-controls="view-history" data-primary="history" tabindex="-1" type="button">
+        <span class="primary-label">History</span>
       </button>
     </div>
 
@@ -52,36 +58,24 @@
     </div>
   </header>
 
-  <!-- ══ Sub bar: Rule Studio modes, centred under the primary tabs ════ -->
+  <!-- ══ Sub bar: the Workbench flow, centred under the primary tabs ═══ -->
   <div class="subbar" id="subbar">
-    <div role="tablist" aria-label="Rule Studio modes" class="sub-tabs" id="sub-tabs">
-      <button class="sub-tab active" role="tab" id="tab-compose" aria-selected="true" aria-controls="view-compose" data-tab="compose" type="button">
-        <span class="sub-ico" aria-hidden="true">&#9679;</span>
-        <span class="sub-label">Compose</span>
+    <div role="tablist" aria-label="Workbench steps" class="sub-tabs" id="sub-tabs">
+      <button class="sub-tab" role="tab" id="tab-start" aria-selected="false" aria-controls="view-start" data-tab="start" tabindex="-1" type="button">
+        <span class="sub-ico" aria-hidden="true">&#9654;</span>
+        <span class="sub-label">Start</span>
       </button>
-      <button class="sub-tab" role="tab" id="tab-import" aria-selected="false" aria-controls="view-import" data-tab="import" tabindex="-1" type="button">
-        <span class="sub-ico" aria-hidden="true">&#8600;</span>
-        <span class="sub-label">Import</span>
+      <button class="sub-tab active" role="tab" id="tab-rule" aria-selected="true" aria-controls="view-rule" data-tab="rule" type="button">
+        <span class="sub-ico" aria-hidden="true">&#9679;</span>
+        <span class="sub-label">Rule</span>
       </button>
       <button class="sub-tab" role="tab" id="tab-test" aria-selected="false" aria-controls="view-test" data-tab="test" tabindex="-1" type="button">
-        <span class="sub-ico" aria-hidden="true">&#9654;</span>
+        <span class="sub-ico" aria-hidden="true">&#9655;</span>
         <span class="sub-label">Test</span>
       </button>
-      <button class="sub-tab" role="tab" id="tab-attack" aria-selected="false" aria-controls="view-attack" data-tab="attack" tabindex="-1" type="button">
-        <span class="sub-ico" aria-hidden="true">&#9635;</span>
-        <span class="sub-label">ATT&amp;CK</span>
-      </button>
-      <button class="sub-tab" role="tab" id="tab-coverage" aria-selected="false" aria-controls="view-coverage" data-tab="coverage" tabindex="-1" type="button">
+      <button class="sub-tab" role="tab" id="tab-review" aria-selected="false" aria-controls="view-review" data-tab="review" tabindex="-1" type="button">
         <span class="sub-ico" aria-hidden="true">&#9636;</span>
-        <span class="sub-label">Coverage</span>
-      </button>
-      <button class="sub-tab" role="tab" id="tab-mappings" aria-selected="false" aria-controls="view-mappings" data-tab="mappings" tabindex="-1" type="button">
-        <span class="sub-ico" aria-hidden="true">&#8644;</span>
-        <span class="sub-label">Mappings</span>
-      </button>
-      <button class="sub-tab" role="tab" id="tab-history" aria-selected="false" aria-controls="view-history" data-tab="history" tabindex="-1" type="button">
-        <span class="sub-ico" aria-hidden="true">&#8635;</span>
-        <span class="sub-label">History</span>
+        <span class="sub-label">Review</span>
       </button>
     </div>
   </div>
@@ -95,8 +89,8 @@
         <h1>Draft vendor-native detection rules without inventing a single field name.</h1>
         <p class="hero-sub">Describe a behaviour once and get a reviewable draft for every SIEM you run &mdash; each with its fidelity, its validation level, and every unmapped field called out. Nothing is deployed, and nothing leaves this machine.</p>
         <div class="hero-actions">
-          <button type="button" class="btn primary" data-jump="compose">Open Rule Studio <span aria-hidden="true">&rarr;</span></button>
-          <button type="button" class="btn ghost" data-jump="import">Import an existing rule</button>
+          <button type="button" class="btn primary" data-jump="rule">Open the Workbench <span aria-hidden="true">&rarr;</span></button>
+          <button type="button" class="btn ghost" data-jump="start">Import an existing rule</button>
           <button type="button" class="btn ghost" data-jump="attack">Browse ATT&amp;CK</button>
         </div>
       </div>
@@ -113,29 +107,25 @@
           <div class="card-head"><h2>Where to start</h2></div>
           <div class="card-body">
             <div class="quick-grid">
-              <button type="button" class="quick-card" data-jump="compose">
-                <b>Compose</b>
-                <span>Build a rule from a behaviour pattern and compile it for every target you select.</span>
+              <button type="button" class="quick-card" data-jump="start">
+                <b>Start</b>
+                <span>Import an existing rule or a raw event, and let the analyser extract the predicates for you.</span>
               </button>
-              <button type="button" class="quick-card" data-jump="import">
-                <b>Import</b>
-                <span>Paste a log event or an existing rule. The analyser extracts the predicates for you.</span>
+              <button type="button" class="quick-card" data-jump="rule">
+                <b>Rule</b>
+                <span>Build a rule from a behaviour pattern and compile it for every target you select.</span>
               </button>
               <button type="button" class="quick-card" data-jump="test">
                 <b>Test</b>
                 <span>Evaluate the rule against sample events clause by clause, then pin the result as a fixture.</span>
               </button>
+              <button type="button" class="quick-card" data-jump="review">
+                <b>Review</b>
+                <span>See what every pattern actually produces per target, measured through the real pipeline.</span>
+              </button>
               <button type="button" class="quick-card" data-jump="attack">
                 <b>ATT&amp;CK</b>
                 <span>Search the technique catalog and jump into any pattern that already has a buildable template.</span>
-              </button>
-              <button type="button" class="quick-card" data-jump="coverage">
-                <b>Coverage</b>
-                <span>See what every pattern actually produces per target, measured through the real pipeline.</span>
-              </button>
-              <button type="button" class="quick-card" data-jump="mappings">
-                <b>Mappings</b>
-                <span>Pin your own field names, and read where each built-in translation came from.</span>
               </button>
               <button type="button" class="quick-card" data-jump="history">
                 <b>History</b>
@@ -162,15 +152,15 @@
       </section>
     </section>
 
-    <!-- ── Rule Studio ────────────────────────────────────────────────── -->
-    <section class="shell" id="view-studio" role="tabpanel" aria-labelledby="ptab-studio" tabindex="0">
+    <!-- ── Workbench ──────────────────────────────────────────────────── -->
+    <section class="shell" id="view-workbench" role="tabpanel" aria-labelledby="ptab-workbench" tabindex="0">
       <div class="viewhead">
         <h1 id="view-title">Compose a detection</h1>
         <p id="view-sub">Describe the behaviour once. Get a reviewable, vendor-native rule for every target you run.</p>
       </div>
 
-      <!-- ── Compose ──────────────────────────────────────────────────── -->
-      <section class="view active" id="view-compose" role="tabpanel" aria-labelledby="tab-compose" tabindex="0">
+      <!-- ── Rule ─────────────────────────────────────────────────────── -->
+      <section class="view active" id="view-rule" role="tabpanel" aria-labelledby="tab-rule" tabindex="0">
         <div class="split">
           <div class="split-main">
             <form id="rule-form" class="stack" novalidate>
@@ -382,12 +372,12 @@
         </section>
       </section>
 
-      <!-- ── Import ───────────────────────────────────────────────────── -->
-      <section class="view" id="view-import" role="tabpanel" aria-labelledby="tab-import" tabindex="0" hidden>
+      <!-- ── Start ─────────────────────────────────────────────────────── -->
+      <section class="view" id="view-start" role="tabpanel" aria-labelledby="tab-start" tabindex="0" hidden>
         <div class="split">
           <div class="split-main">
             <section class="card">
-              <div class="card-head"><h2>Paste a log event or an existing rule</h2></div>
+              <div class="card-head"><h2>Start: paste a log event or an existing rule</h2></div>
               <div class="card-body">
                 <p class="hint">A single event from your console works &mdash; JSON, key=value, or XML. So does a full rule in SPL, KQL, EQL, AQL, YARA-L, CQL, Sigma or Wazuh XML. The analyser extracts the predicates so you can edit rather than retype.</p>
                 <div class="grid-2">
@@ -516,22 +506,8 @@
         </div>
       </section>
 
-      <!-- ── ATT&CK ───────────────────────────────────────────────────── -->
-      <section class="view" id="view-attack" role="tabpanel" aria-labelledby="tab-attack" tabindex="0" hidden>
-        <section class="card">
-          <div class="card-head"><h2>MITRE ATT&amp;CK reference</h2><span class="pill" id="attack-summary">loading&hellip;</span></div>
-          <div class="card-body">
-            <div class="field">
-              <label for="attack-search">Search techniques</label>
-              <input id="attack-search" type="search" placeholder="T1059, PowerShell, credential access&hellip;" autocomplete="off">
-            </div>
-            <div id="attack-list" class="attack-list" aria-live="polite"></div>
-          </div>
-        </section>
-      </section>
-
-      <!-- ── Coverage ─────────────────────────────────────────────────── -->
-      <section class="view" id="view-coverage" role="tabpanel" aria-labelledby="tab-coverage" tabindex="0" hidden>
+      <!-- ── Review ───────────────────────────────────────────────────── -->
+      <section class="view" id="view-review" role="tabpanel" aria-labelledby="tab-review" tabindex="0" hidden>
         <section class="card">
           <div class="card-head"><h2>Measured coverage by target</h2></div>
           <div class="card-body">
@@ -540,10 +516,6 @@
             <div id="coverage-matrix" class="table-scroll" aria-live="polite"></div>
           </div>
         </section>
-      </section>
-
-      <!-- ── Mappings ──────────────────────────────────────────────────── -->
-      <section class="view" id="view-mappings" role="tabpanel" aria-labelledby="tab-mappings" tabindex="0" hidden>
         <div class="split">
           <div class="split-main">
             <section class="card">
@@ -577,23 +549,45 @@
         </div>
       </section>
 
-      <!-- ── History ───────────────────────────────────────────────────── -->
-      <section class="view" id="view-history" role="tabpanel" aria-labelledby="tab-history" tabindex="0" hidden>
-        <section class="card">
-          <div class="card-head">
-            <h2>Rule history</h2>
-            <div class="row">
-              <button id="refresh-history" class="btn ghost" type="button">Refresh</button>
-              <button id="clear-history" class="btn ghost danger" type="button">Clear</button>
-            </div>
-          </div>
-          <div class="card-body">
-            <p class="hint">Every generated or analysed rule is recorded locally so you can revisit previous work.</p>
-            <div id="history-list" class="history-list"><p class="hint">No history yet.</p></div>
-          </div>
-        </section>
-      </section>
+    </section>
 
+    <!-- ── ATT&CK ─────────────────────────────────────────────────────── -->
+    <section class="shell" id="view-attack" role="tabpanel" aria-labelledby="ptab-attack" tabindex="0">
+      <div class="viewhead">
+        <h1>MITRE ATT&amp;CK reference</h1>
+        <p>Browse the catalog and jump straight into a buildable pattern.</p>
+      </div>
+      <section class="card">
+        <div class="card-head"><h2>Techniques in this build</h2><span class="pill" id="attack-summary">loading&hellip;</span></div>
+        <div class="card-body">
+          <div class="field">
+            <label for="attack-search">Search techniques</label>
+            <input id="attack-search" type="search" placeholder="T1059, PowerShell, credential access&hellip;" autocomplete="off">
+          </div>
+          <div id="attack-list" class="attack-list" aria-live="polite"></div>
+        </div>
+      </section>
+    </section>
+
+    <!-- ── History ────────────────────────────────────────────────────── -->
+    <section class="shell" id="view-history" role="tabpanel" aria-labelledby="ptab-history" tabindex="0">
+      <div class="viewhead">
+        <h1>Rule history</h1>
+        <p>Everything you generated or analysed, kept locally so you can revisit it.</p>
+      </div>
+      <section class="card">
+        <div class="card-head">
+          <h2>Recorded on this machine</h2>
+          <div class="row">
+            <button id="refresh-history" class="btn ghost" type="button">Refresh</button>
+            <button id="clear-history" class="btn ghost danger" type="button">Clear</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <p class="hint">Every generated or analysed rule is recorded locally so you can revisit previous work.</p>
+          <div id="history-list" class="history-list"><p class="hint">No history yet.</p></div>
+        </div>
+      </section>
     </section>
     </main>
 </div>

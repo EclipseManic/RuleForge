@@ -63,3 +63,7 @@ SIEM dialects, parsers, and data models vary by product version. Generated queri
 ### Wazuh deployment workflow
 
 The Wazuh output is a local custom-rule template. Choose an unused ID between `100000` and `120000`, map its `<field>` name to the field emitted by your installed decoder, and add an optional parent rule ID only when you are extending a confirmed existing rule. Save the reviewed XML under `/var/ossec/etc/rules/`, test it with `wazuh-logtest`, and restart the Wazuh manager only after it passes.
+
+Wazuh caps `frequency` at 9999 matches and `timeframe` at 99999 seconds. If a request exceeds either, RuleForge refuses the Wazuh target by itself and says why, rather than emitting a rule the manager would reject. Your other selected targets are still produced. Neither attribute appears at all when you turn the count off, so a long window on its own does not limit Wazuh.
+
+The window is a query lookback and, with a count, the window the count is measured over. It is not a schedule: a rule with no count fires on every matching event as soon as it is ingested.

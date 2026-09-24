@@ -289,31 +289,80 @@ class FrontendContractTests(unittest.TestCase):
         self.assertRegex(self.source, r"outputCount\.textContent\s*=",
                          msg="the compiled target count must be written back to the panel")
 
-    def test_exactly_two_primary_tabs_centred_at_the_top(self):
-        """The shell is Home + Rule Studio. Anything else re-creates the crowded rail."""
+    def test_every_id_and_navigation_target_actually_exists(self):
+        """Nav is wired by string, so a rename leaves the page serving 200 and doing nothing.
+
+        app.js reaches into the DOM with `querySelector('#id')` and the tabs resolve their
+        panels as `view-<name>`. None of that is a template-time error: the page loads, the
+        nav appears, and clicking does nothing. Pin the wiring.
+        """
+        referenced = set(re.findall(r"querySelector\(['\"]#([A-Za-z0-9_-]+)['\"]\)", self.source))
+        served = set(re.findall(r'id="([A-Za-z0-9_-]+)"', self.html))
+        missing = sorted(referenced - served)
+        self.assertEqual(missing, [], msg=f"app.js queries ids the page does not serve: {missing}")
+
+        panels = set(re.findall(r'class="view[^"]*" id="view-([a-z-]+)"', self.html))
+        shells = set(re.findall(r'class="shell[^"]*" id="view-([a-z-]+)"', self.html))
+        for step in re.findall(r'data-tab="([a-z-]+)"', self.html):
+            self.assertIn(step, panels, msg=f"step tab {step} has no view panel")
+        for primary in re.findall(r'data-primary="([a-z-]+)"', self.html):
+            self.assertIn(primary, shells, msg=f"top-level tab {primary} has no shell panel")
+
+        jumps = set(re.findall(r'data-jump="([a-z-]+)"', self.html))
+        destinations = panels | shells
+        for jump in sorted(jumps):
+            self.assertIn(jump, destinations,
+                          msg=f"data-jump={jump} would land the analyst nowhere")
+
+        duplicates = sorted({i for i in served if self.html.count(f'id="{i}"') > 1})
+        self.assertEqual(duplicates, [],
+                         msg=f"duplicate ids break querySelector and label targeting: {duplicates}")
+
+    def test_four_top_level_tabs_and_no_side_rail(self):
+        """The shell is Home / Workbench / ATT&CK / History.
+
+        ATT&CK and History used to be buried as sub-tabs of a two-tab shell, so browsing
+        the technique catalog and looking back at past work were both hidden one level
+        down. The intent behind the old two-tab rule - no crowded side rail - still holds,
+        so the rail must stay gone.
+        """
         primaries = re.findall(r'data-primary="([a-z]+)"', self.html)
-        self.assertEqual(primaries, ["home", "studio"],
-                         msg="there must be exactly two primary tabs, in order: home, studio")
+        self.assertEqual(primaries, ["home", "workbench", "attack", "history"],
+                         msg="four top-level destinations, in that order")
         self.assertNotIn('class="rail', self.html,
-                         msg="the side rail must be gone; its modes are sub-tabs now")
-        for shell in ("view-home", "view-studio"):
+                         msg="the side rail must stay gone")
+        for shell in ("view-home", "view-workbench", "view-attack", "view-history"):
             self.assertIn(f'id="{shell}"', self.html, msg=f"missing shell panel {shell}")
         self.assertEqual(self.html.count('class="shell active"'), 1,
                          msg="exactly one shell may be active on load")
+        # A top-level tab is a destination, not a mode: it must not need a second click to
+        # reveal its content, so its panel is a shell rather than a .view sub-panel.
+        self.assertNotIn('class="view" id="view-attack"', self.html,
+                         msg="ATT&CK is a destination now, not a mode of the Workbench")
+        self.assertNotIn('class="view" id="view-history"', self.html,
+                         msg="History is a destination now, not a mode of the Workbench")
+        self.assertIn("'workbench'", self.source,
+                      msg="only the Workbench shows the step row")
 
-    def test_studio_subtabs_sit_below_the_primary_tabs(self):
-        """The modes row must be a sibling after the primary nav, not a side column."""
+    def test_the_workbench_is_a_start_rule_test_review_flow(self):
+        """Seven equal sub-tabs gave no sense of order. The Workbench is a sequence, and
+        every step's panel must exist under the id its tab names."""
         self.assertLess(self.html.index('id="primary-tabs"'), self.html.index('id="sub-tabs"'),
-                        msg="primary tabs must be served above the sub-tab row")
-        modes = re.findall(r'class="sub-tab[^"]*" role="tab"[^>]*data-tab="([a-z]+)"', self.html)
-        expected = ["compose", "import", "test", "attack", "coverage", "mappings", "history"]
-        self.assertEqual(modes, expected,
-                         msg="every former rail mode must survive as a Rule Studio sub-tab")
+                        msg="the step row must sit below the top-level nav")
+        steps = re.findall(r'class="sub-tab[^"]*" role="tab"[^>]*data-tab="([a-z]+)"', self.html)
+        self.assertEqual(steps, ["start", "rule", "test", "review"],
+                         msg="the Workbench flow is Start, Rule, Test, Review - in that order")
         panels = re.findall(r'class="view[^"]*" id="view-([a-z]+)"', self.html)
-        for mode in modes:
-            self.assertIn(mode, panels, msg=f"sub-tab {mode} has no panel")
+        for step in steps:
+            self.assertIn(step, panels, msg=f"step {step} has no panel")
         self.assertEqual(self.html.count('class="view active"'), 1,
-                         msg="exactly one sub-view may be active on load")
+                         msg="exactly one step panel may be active on load")
+        # Every step the Home page advertises must resolve to something that exists.
+        jumps = set(re.findall(r'data-jump="([a-z]+)"', self.html))
+        destinations = set(re.findall(r'data-primary="([a-z]+)"', self.html))
+        for jump in jumps:
+            self.assertTrue(jump in steps or jump in destinations,
+                            msg=f"data-jump={jump} would land nowhere")
 
     def test_nav_state_is_declared_before_the_init_calls_that_use_it(self):
         """A `let` declared beside its consumer is in its temporal dead zone at init.
@@ -557,8 +606,8 @@ class FrontendContractTests(unittest.TestCase):
                       msg="the MITRE id is kept separately, for display only")
         self.assertNotIn('data-technique="${escapeHtml(t.id)}"', self.source,
                          msg="passing the MITRE id makes the loaded form uncompilable")
-        self.assertIn("showTab('compose')", self.source,
-                      msg="clicking a buildable row must navigate to the composer")
+        self.assertIn("showTab('rule')", self.source,
+                      msg="clicking a buildable row must navigate to the Rule step")
         self.assertIn("dispatchEvent(new Event('change'", self.source,
                       msg="the composer must prefill from the chosen technique")
         self.assertIn('class="attack-row static"', self.source,

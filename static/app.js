@@ -1,12 +1,9 @@
 const patternDefaults = (() => { try { const raw = JSON.parse(document.querySelector('#technique-data').textContent || '{}'); const out = {}; for (const [id, t] of Object.entries(raw)) out[id] = {field: t.field || '', value: t.value || '', description: t.description || ''}; if (!out.custom) out.custom = {field: 'process.name', value: 'example.exe', description: ''}; return out; } catch { return {custom: {field: 'process.name', value: 'example.exe', description: ''}}; } })();
 const VIEW_META = {
-  compose:   ['Compose a detection', 'Describe the behaviour once. Get a reviewable, vendor-native rule for every target you run.'],
-  import:    ['Import a rule or event', 'Paste something you already have. The analyser extracts the predicates so you edit instead of retyping.'],
-  test:      ['Test against sample events', 'Evaluate the rule clause by clause against real events, locally. Nothing is deployed.'],
-  attack:    ['MITRE ATT&CK reference', 'Browse the catalog and jump straight into a buildable pattern.'],
-  coverage:  ['Measured coverage', 'Every pattern compiled against every target and structurally parsed. Fidelity is measured, not claimed.'],
-  mappings:  ['Field mappings', 'Pin your own field names, and see where each built-in mapping came from.'],
-  history:   ['Rule history', 'Everything you generated or analysed, kept locally so you can revisit it.'],
+  start:    ['Start: bring in something you have', 'Paste a log event or an existing rule. The analyser extracts the predicates so you edit instead of retyping.'],
+  rule:     ['Describe the behaviour', 'One form, every target you run. Each output carries its fidelity, its checks and every unmapped field.'],
+  test:     ['Test against sample events', 'Evaluate the rule clause by clause against real events, locally. Nothing is deployed.'],
+  review:   ['Review before you deploy', 'What each pattern really produces per target, measured through the real pipeline - plus the field names your deployment pins.'],
 };
 
 const primaryTabs = [...document.querySelectorAll('.primary-tab')];
@@ -22,7 +19,7 @@ function storeKey(key, value) { try { localStorage.setItem(`ruleforge.${key}`, v
 function readKey(key) { try { return localStorage.getItem(`ruleforge.${key}`); } catch { return null; } }
 
 function showSubTab(id, focusTab) {
-  if (!subTabs.some(t => t.dataset.tab === id)) id = 'compose';
+  if (!subTabs.some(t => t.dataset.tab === id)) id = 'rule';
   subTabs.forEach(t => { const active = t.dataset.tab === id; t.classList.toggle('active', active); t.setAttribute('aria-selected', active ? 'true' : 'false'); t.tabIndex = active ? 0 : -1; if (active && focusTab) t.focus(); });
   subPanels.forEach(p => { const active = p.id === `view-${id}`; p.classList.toggle('active', active); p.hidden = !active; });
   const meta = VIEW_META[id] || [];
@@ -31,22 +28,28 @@ function showSubTab(id, focusTab) {
   if (title && meta[0]) title.textContent = meta[0];
   if (sub && meta[1]) sub.textContent = meta[1];
   storeKey('activeTab', id);
-  if (id === 'attack') loadAttack();
-  if (id === 'coverage') loadCoverage();
-  if (id === 'mappings') loadMappings();
-  if (id === 'history') loadHistory();
+  if (id === 'review') { loadCoverage(); loadMappings(); }
 }
 
 function showPrimary(id, focusTab) {
   if (!primaryTabs.some(t => t.dataset.primary === id)) id = 'home';
   primaryTabs.forEach(t => { const active = t.dataset.primary === id; t.classList.toggle('active', active); t.setAttribute('aria-selected', active ? 'true' : 'false'); t.tabIndex = active ? 0 : -1; if (active && focusTab) t.focus(); });
   shells.forEach(s => s.classList.toggle('active', s.id === `view-${id}`));
-  if (subbar) subbar.classList.toggle('on', id === 'studio');
+  if (subbar) subbar.classList.toggle('on', id === 'workbench');
   storeKey('primary', id);
   if (id === 'home') loadHome();
+  if (id === 'attack') loadAttack();
+  if (id === 'history') loadHistory();
 }
 
-function showTab(id) { showPrimary('studio'); showSubTab(id); }
+/* Home's shortcut cards address a step (start/rule/test/review) or a whole top-level
+   section (attack/history); both must land the analyst where the label promised. */
+const TOP_LEVEL_JUMPS = new Set(['home', 'workbench', 'attack', 'history']);
+function showTab(id) {
+  if (TOP_LEVEL_JUMPS.has(id)) { showPrimary(id); return; }
+  showPrimary('workbench');
+  showSubTab(id);
+}
 
 function wireRovingTablist(container, onActivate) { if (!container || container.dataset.wired) return; container.dataset.wired = 'true'; const items = () => [...container.querySelectorAll('[role="tab"]')]; container.addEventListener('keydown', event => { const list = items(); const current = list.indexOf(document.activeElement); if (current < 0) return; let next = null; if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (current + 1) % list.length; else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = (current - 1 + list.length) % list.length; else if (event.key === 'Home') next = 0; else if (event.key === 'End') next = list.length - 1; if (next !== null) { event.preventDefault(); list[next].focus(); onActivate(list[next]); } }); }
 primaryTabs.forEach(tab => tab.addEventListener('click', () => showPrimary(tab.dataset.primary)));
@@ -57,7 +60,7 @@ document.querySelectorAll('[data-jump]').forEach(button => button.addEventListen
 const savedPrimary = readKey('primary');
 const savedSub = readKey('activeTab');
 showPrimary(primaryTabs.some(t => t.dataset.primary === savedPrimary) ? savedPrimary : 'home');
-showSubTab(subTabs.some(t => t.dataset.tab === savedSub) ? savedSub : 'compose');
+showSubTab(subTabs.some(t => t.dataset.tab === savedSub) ? savedSub : 'rule');
 
 /* Theme: the people using this live in consoles all day, so dark is the default. */
 const themeToggle = document.querySelector('#theme-toggle');
@@ -524,7 +527,7 @@ async function loadAttack() {
         const field = document.querySelector('#technique');
         field.value = button.dataset.technique;
         field.dispatchEvent(new Event('change', { bubbles: true }));
-        showTab('compose');
+        showTab('rule');
         const templates = (attackIndex.find(t => t.id === button.dataset.mitre) || {}).templates || [];
         announce(`Loaded ${button.dataset.technique} into the composer` +
           (templates.length > 1 ? ` (first of ${templates.length} templates for ${button.dataset.mitre}).` : '.'));
@@ -535,8 +538,10 @@ async function loadAttack() {
   } catch { summary.textContent = 'ATT&CK catalog unavailable.'; }
 }
 document.querySelector('#refresh-history').addEventListener('click', loadHistory);
-loadAttack();
-loadCoverage();
+/* The ATT&CK catalog (697 techniques) and the coverage matrix are both heavy, and both
+   are now on-demand: showPrimary/loadHome fetch them when their destination is opened.
+   Firing them on every page load wasted the work for anyone who only opened Home, and
+   navigating away mid-flight left an aborted request in the console. */
 const eventPresets = {
   match: [{ 'process.name': 'powershell.exe', 'process.command_line': 'powershell -enc aGVsbG8=', 'user.name': 'alice', 'host.name': 'ws-01' }, { 'process.name': 'powershell.exe', 'process.command_line': 'powershell -enc d29ybGQ=', 'user.name': 'alice', 'host.name': 'ws-01' }],
   excluded: [{ 'process.name': 'powershell.exe', 'process.command_line': 'powershell -enc aGVsbG8=', 'user.name': 'trusted-admin', 'host.name': 'ws-01' }],
@@ -583,6 +588,11 @@ document.querySelector('#run-ingest').addEventListener('click', async () => {
   } catch (error) { box.innerHTML = `<div role="alert">Error: ${escapeHtml(error.message)}</div>`; }
 });
 function syncThrValue() { document.querySelector('#thr-value').textContent = document.querySelector('#threshold').value; }
+/* The stepper buttons drive the count, but the input is the value of record and can be set
+   from outside (an import, a restored state). Without this the visible readout could show a
+   different number than the one that gets compiled. */
+document.querySelector('#threshold').addEventListener('input', syncThrValue);
+document.querySelector('#threshold').addEventListener('change', syncThrValue);
 document.querySelector('#thr-minus').addEventListener('click', () => { const input = document.querySelector('#threshold'); input.value = Math.max(1, (+input.value || 1) - 1); syncThrValue(); });
 document.querySelector('#thr-plus').addEventListener('click', () => { const input = document.querySelector('#threshold'); input.value = Math.min(10000, (+input.value || 1) + 1); syncThrValue(); });
 document.querySelectorAll('[data-window]').forEach(button => button.addEventListener('click', () => { document.querySelector('[name="timeframe"]').value = button.dataset.window; document.querySelectorAll('[data-window]').forEach(b => { const on = b === button; b.classList.toggle('on', on); b.setAttribute('aria-pressed', on ? 'true' : 'false'); }); announce(`Time window set to ${button.dataset.window}.`); }));
@@ -688,7 +698,6 @@ document.querySelector('#ov-clear')?.addEventListener('click', () => postOverrid
 
 syncThrValue();
 document.querySelector('#clear-history').addEventListener('click', async () => { if (!window.confirm('Clear all saved rule history?')) return; const response = await fetch('/api/history', {method: 'DELETE'}); if (response.ok) loadHistory(); });
-loadHistory();
 
 /* ══ Home dashboard ═══════════════════════════════════════════════════ */
 
