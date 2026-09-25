@@ -33,12 +33,15 @@ SCHEMA_VERSION = "2.0"
 
 # A v1 name that means the same thing under v2's canonical vocabulary. This is a NAMED
 # normalisation, not a silent coercion: the adapter records that it happened.
+#
+# Every entry must be (a) a truthful synonym and (b) a target that actually exists in the
+# vocabulary it feeds. Two earlier entries broke (b): `gt -> gte` widened a strictly-greater
+# predicate, and `ne -> not_equals` pointed at a name absent from v1's CANONICAL_OPERATORS.
+# Both are gone. `eq`/`ne` need no alias at all - the adapter's COMPARISON_MAP already maps
+# them - so keeping them only created a second, disagreeing spelling of the same thing.
 OPERATOR_ALIASES = {
     "endswith": "ends_with",
     "startswith": "starts_with",
-    "eq": "equals",
-    "ne": "not_equals",
-    "gt": "gte",
 }
 
 # --------------------------------------------------------------------------

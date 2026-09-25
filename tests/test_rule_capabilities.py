@@ -21,12 +21,14 @@ from dataclasses import replace
 from models.rule_capabilities import (EMITTERS, EQUIVALENT, NATIVE, NODE_TYPES, OPERATORS,
                                       PLANNED_EMITTERS, PROFILES, REFUSED, audit, emitters_for,
                                       find_profile, lower, primitive_of, registered_dialects,
-                                      resolve, resolve_for_product)
-from models.rule_ir import (Aggregate, Arith, Arrange, BoolOp, Call, Comparison, Derive, Duration,
-                            Emit, EventExpr, Expand, FieldExpr, FieldRef, Filter, Frame, InList,
-                            Join as IRJoin, Literal, Measure, MeasureExpr, ParseLoss, Pattern,
-                            PRIMITIVE_NAMES, Read, RuleIR, RuleIRValidationError, SetOp,
-                            SourceSelector, Stage as IRStage)
+                                      resolve, resolve_for_product, vocabulary)
+from models.rule_ir import (OPERATOR_ALIASES, Aggregate, Arith, Arrange, BoolOp, Call, Comparison,
+                            Derive, Duration, Emit, EventExpr, Expand, FieldExpr, FieldRef,
+                            Filter, Frame, InList, Join as IRJoin, Literal, Measure, MeasureExpr,
+                            ParseLoss, Pattern, PRIMITIVE_NAMES, Read, RuleIR,
+                            RuleIRValidationError, SetOp, SourceSelector, Stage as IRStage,
+                            canonical_operator)
+from rule_engine import CANONICAL_OPERATORS
 from tests.corpus.rule_corpus import RULES
 from tests.corpus.rule_matrix import all_cells
 
@@ -872,12 +874,16 @@ class PreflightCoverageTests(unittest.TestCase):
         self.assertEqual(resolve(ir, AQL()).refusal_code, "UNVERIFIED_FIELD_REFERENCE")
 
     def test_an_unverified_field_inside_an_inlist_is_refused(self):
+        """`InList` is a standalone boolean expression, not a Comparison operator.
+
+        The model has no `in` comparison - the vocabulary is six ops - so membership is
+        expressed by making the InList itself the predicate.
+        """
         self._with_emitters()
         ir = simple_graph()
         node = Filter(id="flt", input="read",
-                      condition=Comparison("in", FieldExpr(FieldRef("a")),
-                                           InList(FieldRef("b", confidence="unverified"),
-                                                  (Literal(1), Literal(2)))))
+                      condition=InList(FieldRef("b", confidence="unverified"),
+                                       (Literal(1), Literal(2))))
         self.assertEqual(resolve(self._swap(ir, "flt", node), AQL()).refusal_code,
                          "UNVERIFIED_FIELD_REFERENCE")
 
@@ -1005,6 +1011,65 @@ class LoweringIntegrityTests(unittest.TestCase):
         with self.assertRaises(RuleIRValidationError) as caught:
             lower(self._graph(), AQL())
         self.assertNotIn(secret, str(caught.exception))
+
+
+class VocabularyTests(unittest.TestCase):
+    """The preflight's vocabularies come from the model, not from a second hand-written copy.
+
+    An earlier draft hard-coded 21 comparison operators including `exists`, `is_null`,
+    `between` and `contains`. The IR permits six. The only effect of the extra fifteen was
+    to wave unknown operators through a check built to refuse them.
+    """
+
+    def test_the_comparison_vocabulary_is_exactly_the_model_six(self):
+        self.assertEqual(vocabulary()["comparison"],
+                         frozenset({"=", "!=", "<", "<=", ">", ">="}))
+
+    def test_no_vocabulary_resolves_empty(self):
+        for name, allowed in vocabulary().items():
+            self.assertTrue(allowed, f"vocabulary {name!r} is empty; the check would refuse "
+                                     f"every value rather than every unknown one")
+
+    def test_operators_the_model_cannot_express_are_not_accepted(self):
+        for op in ("exists", "is_null", "between", "contains", "matches_regex", "approximately"):
+            self.assertNotIn(op, vocabulary()["comparison"],
+                             f"{op!r} is not a Comparison op but was being accepted")
+
+    def test_the_boolean_and_setop_vocabularies_match_the_model(self):
+        self.assertEqual(vocabulary()["boolean"], frozenset({"and", "or", "not"}))
+        self.assertEqual(vocabulary()["set_op"],
+                         frozenset({"union", "intersect", "except", "append", "except_both"}))
+
+    def test_audit_fails_if_a_vocabulary_cannot_be_resolved(self):
+        """An empty vocabulary must be a loud failure, not a strict-looking no-op."""
+        import models.rule_capabilities as rc
+        original = rc._COMPARISON_OPS
+        rc._COMPARISON_OPS = frozenset()
+        try:
+            problems = rc.audit()
+            self.assertTrue(any("EMPTY" in p for p in problems), problems)
+        finally:
+            rc._COMPARISON_OPS = original
+
+
+class OperatorAliasTests(unittest.TestCase):
+    """A synonym table may not alter meaning, not even in the message it produces."""
+
+    def test_no_alias_widens_a_predicate(self):
+        for source, target in OPERATOR_ALIASES.items():
+            self.assertNotEqual((source, target), ("gt", "gte"),
+                                "gt means strictly greater; mapping it to gte widens it")
+            self.assertNotEqual(target, "gte", f"{source!r} widens into gte")
+
+    def test_every_alias_is_a_truthful_synonym_in_the_v1_vocabulary(self):
+        for source, target in OPERATOR_ALIASES.items():
+            self.assertIn(target, CANONICAL_OPERATORS,
+                          f"{source!r} maps to {target!r}, which is not a canonical operator")
+
+    def test_gt_survives_normalisation_so_the_refusal_names_what_was_written(self):
+        operator, changed = canonical_operator("gt")
+        self.assertEqual(operator, "gt")
+        self.assertFalse(changed, "gt must not be reported as a normalised operator")
 
 
 class ShadowModeTests(unittest.TestCase):

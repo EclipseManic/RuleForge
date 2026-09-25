@@ -55,11 +55,12 @@ import dataclasses
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal, get_args, get_origin, get_type_hints
 
-from models.rule_ir import (Aggregate, Arrange, BoolOp, Call, Comparison, Derive, Emit, Expand,
-                            FieldRef, Filter, Iterate, Join, Pattern, PRIMITIVE_NAMES, Read,
-                            RuleIR, RuleIRValidationError, SetOp, SourceSelector, validate_ir)
+from models.rule_ir import (FUNCTION_CONTRACTS, Aggregate, Arrange, BoolOp, Call, Comparison,
+                            Derive, Emit, Expand, FieldRef, Filter, Iterate, Join, Pattern,
+                            PRIMITIVE_NAMES, Read, RuleIR, RuleIRValidationError, SetOp,
+                            SourceSelector, validate_ir)
 
 #: Support levels. `partial` is defined and is NOT allowed to yield a downloadable artifact.
 NATIVE = "native"
@@ -511,7 +512,7 @@ def _walk_values(value: Any, owner: str, depth: int) -> tuple[str, str] | None:
             return ("FUNCTION_DIALECT_UNDECLARED",
                     f"{owner!r} calls {value.function!r}, whose contract requires an explicit "
                     f"dialect declaration; an undeclared regex dialect is not portable")
-    if isinstance(value, BoolOp) and value.op not in ("and", "or", "not"):
+    if isinstance(value, BoolOp) and value.op not in _BOOL_OPS:
         return ("UNKNOWN_BOOLEAN_OPERATOR",
                 f"{owner!r} uses unknown boolean operator {value.op!r}")
     if isinstance(value, Comparison) and value.op not in _COMPARISON_OPS:
@@ -537,11 +538,42 @@ def _walk_values(value: Any, owner: str, depth: int) -> tuple[str, str] | None:
     return None
 
 
-_COMPARISON_OPS = frozenset({
-    "=", "!=", "<", "<=", ">", ">=", "contains", "not_contains", "in", "not_in",
-    "startswith", "endswith", "matches", "matches_regex", "exists", "not_exists",
-    "between", "is_null", "is_not_null", "subset", "superset", "overlaps", "same_as",
-})
+def _literal_values(cls: type, field_name: str) -> frozenset[str]:
+    """The strings a `Literal[...]` annotation on `cls.field_name` permits.
+
+    The operator vocabularies are read from the model rather than restated here. An earlier
+    draft hard-coded a 21-entry comparison allowlist including `exists`, `is_null`,
+    `between` and `contains` - fifteen operators the IR cannot express. The only effect was
+    to wave unknown operators through a check whose entire job is to refuse them: a gate
+    that fails open, in the component built to fail closed. A second hand-written copy of a
+    vocabulary is guaranteed to drift from the one it claims to describe.
+
+    `get_type_hints` is required because the model uses `from __future__ import
+    annotations`, so the raw field type is a string and `get_origin` would find nothing -
+    which would quietly yield an EMPTY allowlist and refuse every comparison.
+    """
+    annotation = get_type_hints(cls).get(field_name)
+    if get_origin(annotation) is not Literal:
+        return frozenset()
+    return frozenset(str(arg) for arg in get_args(annotation))
+
+
+_COMPARISON_OPS = _literal_values(Comparison, "op")
+_BOOL_OPS = _literal_values(BoolOp, "op")
+_SET_OPS = _literal_values(SetOp, "op")
+_SOURCE_STRATEGIES = _literal_values(SourceSelector, "strategy")
+_EXPRESSION_FUNCTIONS = frozenset(FUNCTION_CONTRACTS)
+
+
+def vocabulary() -> dict[str, frozenset[str]]:
+    """Every vocabulary the preflight enforces, read from the model itself."""
+    return {
+        "comparison": _COMPARISON_OPS,
+        "boolean": _BOOL_OPS,
+        "set_op": _SET_OPS,
+        "source_strategy": _SOURCE_STRATEGIES,
+        "scalar_function": _EXPRESSION_FUNCTIONS,
+    }
 
 
 def _check_selector(node: Read) -> tuple[str, str] | None:
@@ -554,7 +586,7 @@ def _check_selector(node: Read) -> tuple[str, str] | None:
         return ("UNVERIFIED_SOURCE_REFERENCE",
                 f"source of {node.id!r} is named {selector.name!r} at confidence "
                 f"{selector.confidence!r}; it is not documented")
-    if selector.strategy not in ("raw", "accelerated", "reference", "prior_emission"):
+    if selector.strategy not in _SOURCE_STRATEGIES:
         return ("UNKNOWN_SOURCE_STRATEGY",
                 f"source {node.id!r} uses unknown strategy {selector.strategy!r}")
     if selector.strategy == "accelerated" and not (selector.schema_id or "").strip():
@@ -762,10 +794,11 @@ def audit() -> list[str]:
     A capability layer that disagrees with the model it describes is worse than no
     capability layer, so this is callable from a test rather than being a comment.
 
-    It also checks the two things an earlier draft missed, both of which had let a clean
-    audit stand in for proof of honesty while the registry was returning false positives:
-    every registered emitter must have a callable lowering, and no planned emitter may have
-    leaked into the registered set.
+    It also checks the things an earlier draft missed, each of which had let a clean audit
+    stand in for proof of honesty while the registry was returning false positives: every
+    registered emitter must have a callable lowering, no planned emitter may have leaked
+    into the registered set, and every enforced vocabulary must have been resolved from the
+    model rather than silently coming back empty.
     """
     problems: list[str] = []
     for primitive in PRIMITIVE_NAMES:
@@ -776,6 +809,16 @@ def audit() -> list[str]:
     for primitive in OPERATORS:
         if primitive not in PRIMITIVE_NAMES:
             problems.append(f"operator spec {primitive} is not a kernel primitive")
+
+    for name, allowed in vocabulary().items():
+        if not allowed:
+            # An empty vocabulary means the model's Literal annotation failed to resolve.
+            # Silently refusing every expression would look like a working strict check.
+            problems.append(f"vocabulary {name!r} resolved EMPTY from the model; the preflight "
+                            f"would refuse every value instead of every unknown one")
+    if vocabulary()["comparison"] != frozenset({"=", "!=", "<", "<=", ">", ">="}):
+        problems.append(f"the model's comparison vocabulary changed: "
+                        f"{sorted(vocabulary()['comparison'])}")
 
     for emitter in EMITTERS:
         if not isinstance(emitter, Emitter):
