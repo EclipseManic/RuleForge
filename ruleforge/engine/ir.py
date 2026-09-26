@@ -769,6 +769,32 @@ class Join:
     temporal: tuple[tuple[FieldRef, FieldRef, Duration, Duration, bool, bool], ...] = ()
     left_prefix: str = "l_"
     right_prefix: str = "r_"
+    #: bare column name -> the prefixed name this join actually stores it under.
+    #:
+    #: THIS EXISTS SO A RENDERER NEVER HAS TO GUESS. The prefixes are an
+    #: implementation detail of the merged row, and in a single-namespace dialect
+    #: like KQL the author's own text has them bare. Recovering the bare name by
+    #: stripping the prefix is WRONG: `l_Process` is a legal KQL field name, so a
+    #: blind strip would silently rewrite a rule about `l_Process` into a rule
+    #: about `Process`. Only the join that renamed a column knows which is which,
+    #: so that is where the answer is recorded.
+    #:
+    #: Names present on BOTH sides and not proven equal by a join key are
+    #: deliberately ABSENT -- the rule does not say which one it means, so there
+    #: is no correct answer to record.
+    column_map: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def rename(self) -> dict[str, str]:
+        return dict(self.column_map)
+
+    def bare(self, name: str) -> str:
+        """The author's spelling of `name`, or `name` itself if this join did not
+        rename it."""
+        for original, stored in self.column_map:
+            if stored == name:
+                return original
+        return name
 
     def __post_init__(self) -> None:
         if not self.on and not self.temporal:

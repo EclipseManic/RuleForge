@@ -28,6 +28,7 @@ rule, which would show one `where` while the join quietly did extra work.
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any
 
@@ -163,11 +164,21 @@ def _lower_pipeline(text: str, prefix: str,
         if operator == "join":
             column_map = _column_map_for_join(
                 node_id, current, args, _nodes_so_far(nodes, known), produced)
-        current = _lower_operator(operator, args, current, node_id,
-                                 diagnostics, produced, aliases)
-        nodes.append(_LAST_NODE)
+        current, node = _lower_operator(operator, args, current, node_id,
+                                        diagnostics, produced, aliases)
+        if operator == "join" and column_map and isinstance(node, Join):
+            # RECORD THE RENAMES ON THE NODE. A renderer has to turn `r_LoginTime`
+            # back into `LoginTime`, and it cannot do that by stripping a prefix:
+            # `l_Process` is a legal KQL field name, so a blind strip would
+            # rewrite a rule about `l_Process` into a rule about `Process`. Only
+            # the join that renamed the column knows, so the answer lives here --
+            # the same class of defect as the duplicate field resolver, a second
+            # source of truth for what a name means.
+            node = replace(node,
+                           column_map=tuple(sorted(column_map.items())))
+        nodes.append(node)
         if known is not None:
-            known[_LAST_NODE.id] = _LAST_NODE
+            known[node.id] = node
     return nodes
 
 
@@ -351,43 +362,45 @@ def _split_operator(stage: str) -> tuple[str, str]:
 def _lower_operator(operator: str, args: str, source: str, node_id: str,
                     diagnostics: list[Diagnostic],
                     produced: dict[str, str],
-                    aliases: dict[str, str]) -> str:
-    global _LAST_NODE
+                    aliases: dict[str, str]) -> tuple[str, Any]:
+    """Lower one operator. Returns `(next_node_id, node)`.
+
+    IT USED TO STASH THE NODE IN A MODULE-LEVEL `_LAST_NODE`. That global was
+    read by `_lower_pipeline`, so the moment the pipeline needed to inspect the
+    node -- to record a join's column map on it -- Python treated the name as a
+    function-local and every call raised UnboundLocalError. A mutable module
+    global is a second, invisible channel between two functions; returning the
+    node makes the data flow explicit and the class of bug goes away.
+    """
+    node: Any
     if operator == "where":
         condition = _expression(args)
-        _LAST_NODE = Filter(id=node_id, input=source, condition=condition)
+        node = Filter(id=node_id, input=source, condition=condition)
     elif operator == "project":
-        _LAST_NODE = Derive(id=node_id, input=source,
-                            assignments=tuple(_assignments(args, diagnostics)))
+        node = Derive(id=node_id, input=source,
+                      assignments=tuple(_assignments(args, diagnostics)))
     elif operator == "extend":
-        _LAST_NODE = Derive(id=node_id, input=source,
-                            assignments=tuple(_assignments(args, diagnostics)))
+        node = Derive(id=node_id, input=source,
+                      assignments=tuple(_assignments(args, diagnostics)))
     elif operator == "summarize":
-        _LAST_NODE = _summarize(args, source, node_id, diagnostics)
+        node = _summarize(args, source, node_id, diagnostics)
     elif operator == "join":
-        _LAST_NODE = _join(args, source, node_id, diagnostics, produced, aliases)
+        node = _join(args, source, node_id, diagnostics, produced, aliases)
     elif operator in ("sort", "order"):
-        _LAST_NODE = Arrange(id=node_id, input=source,
-                             order_by=tuple(_order_by(args)))
+        node = Arrange(id=node_id, input=source,
+                       order_by=tuple(_order_by(args)))
     elif operator == "top":
         parts = args.split()
         if len(parts) != 2 or parts[0].lower() != "by":
             raise Refusal("KQL_TOP_UNPARSEABLE",
                           f"`top {args}` is not `top N by field`", "KQL")
-        _LAST_NODE = Arrange(id=node_id, input=source,
-                             order_by=((FieldRef(parts[1]), "desc"),),
-                             limit=int(parts[0]))
+        node = Arrange(id=node_id, input=source,
+                       order_by=((FieldRef(parts[1]), "desc"),),
+                       limit=int(parts[0]))
     else:
         raise Refusal("KQL_OPERATOR_UNSUPPORTED",
                       f"`{operator}` is not implemented", "KQL")
-    return node_id
-
-
-#: Set by `_lower_operator` and read by `_lower_pipeline`. A module-level slot
-#: rather than a tuple return, because the operator lowerer needs to report the
-#: node it built and several branches in `_lower_operator` would each need a
-#: local. It is assigned and read within one call, never across.
-_LAST_NODE: Any = None
+    return node_id, node
 
 
 def _assignments(args: str, diagnostics: list[Diagnostic]) -> list[tuple[str, Any]]:
@@ -763,8 +776,13 @@ def _literal(text: str) -> Any:
         return Decimal(text)
     span = re.fullmatch(r"(\d+)([smhd])", text, re.IGNORECASE)
     if span:
-        return int(span.group(1)) * {"s": 1, "m": 60, "h": 3600,
-                                      "d": 86400}[span.group(2).lower()]
+        # KEEP THE UNIT. An earlier version returned a bare int of seconds, so
+        # `LSASSTime + 10m` became `LSASSTime + 600` -- the same instant for
+        # evaluation, but a rule that renders as a comparison of a timestamp
+        # against the number six hundred, and that cannot be written back as
+        # `10m` because the unit is gone.
+        return Duration(Decimal(span.group(1)) * {
+            "s": 1, "m": 60, "h": 3600, "d": 86400}[span.group(2).lower()])
     return _NOT_LITERAL
 
 

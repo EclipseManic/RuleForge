@@ -138,6 +138,24 @@ def coalesce(*values: Any) -> Any:
     return UNDECIDED
 
 
+def _duration_seconds(value: Any) -> Decimal | None:
+    """A Duration's seconds, or None if this is not a Duration.
+
+    A DURATION IS A NUMBER OF SECONDS FOR COMPARISON AND ARITHMETIC. A KQL rule
+    saying `LoginTime <= LSASSTime + 10m` lowers to a comparison and an addition
+    whose operand is a span. Without this, both went UNDECIDED, the rule matched
+    nothing, and it looked perfectly well formed.
+
+    The import is INSIDE the function on purpose. `Duration` lives in `ir.py`,
+    which imports this module, so a module-level import would be circular. By the
+    time this is called `ir` is fully loaded. A module-level `from .ir import
+    Duration` here would break every import of this package.
+    """
+    from .ir import Duration
+
+    return value.seconds if isinstance(value, Duration) else None
+
+
 def as_number(value: Any) -> Decimal | None:
     """Decimal for numeric values, None when not numeric.
 
@@ -149,6 +167,9 @@ def as_number(value: Any) -> Decimal | None:
         # bool is a subclass of int. Treating True as 1 would let `port = true`
         # pass a numeric range check it has no business passing.
         return None
+    seconds = _duration_seconds(value)
+    if seconds is not None:
+        return seconds
     if isinstance(value, Decimal):
         return value
     if isinstance(value, int):
