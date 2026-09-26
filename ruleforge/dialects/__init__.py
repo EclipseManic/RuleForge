@@ -26,6 +26,10 @@ from .yaral import DIALECT as YARAL_DIALECT
 from .yaral import LANGUAGE as YARAL_LANGUAGE
 from .yaral import parse_yaral
 from .yaral_ir import lower as lower_yaral, render as render_yaral
+from .spl import DIALECT as SPL_DIALECT
+from .spl import LANGUAGE as SPL_LANGUAGE
+from .spl import parse_spl
+from .spl_ir import lower as lower_spl
 from .wazuh import DIALECT as WAZUH_DIALECT
 from .wazuh import LANGUAGE as WAZUH_LANGUAGE
 from .wazuh import parse_wazuh
@@ -41,6 +45,8 @@ __all__ = [
     "KQL_DIALECT", "KQL_LANGUAGE",
     "parse_wazuh", "lower_wazuh",
     "WAZUH_DIALECT", "WAZUH_LANGUAGE",
+    "parse_spl", "lower_spl",
+    "SPL_DIALECT", "SPL_LANGUAGE",
     "TARGETS",
 ]
 
