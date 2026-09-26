@@ -294,15 +294,21 @@ class ExecutionTests(unittest.TestCase):
     ACCESS_TIME = 5000
 
     def _rows(self, login_delta):
+        # The left branch filters on EventID, TargetImage AND GrantedAccess, so a
+        # sample missing any of them is UNDECIDABLE rather than matching -- which
+        # looked like a broken correlation when it was an incomplete fixture.
         return {
             "LSASSAccess_read": [
                 {"TimeGenerated": self.ACCESS_TIME, "EventID": 10,
-                 "Computer": "C1", "Account": "admin", "SourceIp": "10.0.0.1"},
+                 "TargetImage": r"C:\Windows\System32\lsass.exe",
+                 "GrantedAccess": "0x1fffff",
+                 "Computer": "C1", "Account": "admin", "SourceIp": "10.0.0.1",
+                 "SourceImage": r"C:\Windows\System32\procdump.exe"},
             ],
             "LateralMovement_read": [
                 {"TimeGenerated": self.ACCESS_TIME + login_delta, "EventID": 4624,
                  "Computer": "C1", "Account": "admin", "LogonType": 3,
-                 "AuthenticationPackageName": "NTLM"},
+                 "AuthenticationPackageName": "NTLM", "IpAddress": "10.0.0.9"},
             ],
         }
 

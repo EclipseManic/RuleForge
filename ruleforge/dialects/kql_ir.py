@@ -79,8 +79,12 @@ def lower(parsed: ParsedKql, rule_id: str = "sentinel") -> tuple[RuleIR, list[Di
     produced: dict[str, str] = {}
     # name -> value, for `let` bindings that are constants or aliases
     aliases: dict[str, str] = {}
-    # name -> node id, for `let` bindings
-    produced: dict[str, str] = {}
+    # EVERY node built so far, across all branches. The main pipeline's own
+    # `nodes` list starts empty when its head is a `let` name, so the branch nodes
+    # a join refers to live only in this shared map. Without it the column map was
+    # built from an empty graph, resolved nothing, and every post-join comparison
+    # stayed undecidable.
+    known: dict[str, Any] = {}
 
     for name, value in parsed.lets.items():
         # A `let` whose value is a bare name, not a pipeline, is an ALIAS for
@@ -90,14 +94,14 @@ def lower(parsed: ParsedKql, rule_id: str = "sentinel") -> tuple[RuleIR, list[Di
         if "|" not in value.strip():
             aliases[name] = value.strip()
             continue
-        branch = _lower_pipeline(value, name, diagnostics, produced, aliases)
+        branch = _lower_pipeline(value, name, diagnostics, produced, aliases, known)
         nodes.extend(branch)
         # The NODE ID, not the node. Storing the object made a join's right side a
         # node rather than a reference to one, and validation refused with
         # DANGLING_INPUT naming the whole Derive instead of a missing id.
         produced[name] = branch[-1].id
 
-    main = _lower_pipeline(parsed.body, "main", diagnostics, produced, aliases)
+    main = _lower_pipeline(parsed.body, "main", diagnostics, produced, aliases, known)
     nodes.extend(main)
     # The NODE ID. output = main[-1] put a node OBJECT into Emit.input, so
     # validation refused with DANGLING_INPUT naming the whole Derive rather than
@@ -112,7 +116,8 @@ def lower(parsed: ParsedKql, rule_id: str = "sentinel") -> tuple[RuleIR, list[Di
 def _lower_pipeline(text: str, prefix: str,
                     diagnostics: list[Diagnostic],
                     produced: dict[str, str] | None = None,
-                    aliases: dict[str, str] | None = None) -> list[Any]:
+                    aliases: dict[str, str] | None = None,
+                    known: dict[str, Any] | None = None) -> list[Any]:
     """Lower one pipeline expression into a list of nodes, last one the output."""
     text = _substitute_constants(text, aliases or {})
     stages = split_top_level(text)
@@ -128,6 +133,7 @@ def _lower_pipeline(text: str, prefix: str,
 
     produced = produced or {}
     aliases = aliases or {}
+    column_map: dict[str, str] | None = None
 
     # THE HEAD MAY BE A let NAME, NOT A TABLE. LSASSAccess | join ... starts
     # from the branch let LSASSAccess already built. Creating a Read for a table
@@ -144,11 +150,168 @@ def _lower_pipeline(text: str, prefix: str,
 
     for index, raw in enumerate(stages[1:]):
         operator, args = _split_operator(raw)
+
+        if column_map is not None:
+            # THIS STAGE IS DOWNSTREAM OF A JOIN. Its bare column names refer to
+            # the merged row, which the engine stores prefixed (`l_` / `r_`) so a
+            # self-join cannot have one side silently overwrite the other. KQL puts
+            # them in ONE namespace, so the rule writes them bare -- and unresolved,
+            # every comparison went UNDECIDED and the correlation never ran.
+            args = _rewrite_joined_columns(args, column_map)
+
         node_id = f"{prefix}_{operator}_{index}"
+        if operator == "join":
+            column_map = _column_map_for_join(
+                node_id, current, args, _nodes_so_far(nodes, known), produced)
         current = _lower_operator(operator, args, current, node_id,
                                  diagnostics, produced, aliases)
         nodes.append(_LAST_NODE)
+        if known is not None:
+            known[_LAST_NODE.id] = _LAST_NODE
     return nodes
+
+
+def _nodes_so_far(nodes: list[Any],
+                  known: dict[str, Any] | None = None) -> dict[str, Any]:
+    merged = dict(known or {})
+    merged.update({n.id: n for n in nodes if hasattr(n, "id")})
+    return merged
+
+
+def _output_columns(node_id: str, by_id: dict[str, Any]) -> set[str]:
+    """Columns a chain produces.
+
+    A `Read` names a table whose schema this tool cannot see -- and must not
+    guess -- so it contributes nothing. Only a `Derive` states its columns, which
+    is what a KQL `project` lowers to. A chain that is only a Read therefore has no
+    known columns, and every name from it stays ambiguous, which is the honest
+    answer rather than a guess.
+    """
+    columns: set[str] = set()
+    cursor: str | None = node_id
+    seen: set[str] = set()
+    while cursor and cursor in by_id and cursor not in seen:
+        seen.add(cursor)
+        node = by_id[cursor]
+        if type(node).__name__ == "Derive":
+            columns.update(name for name, _ in node.assignments)
+        if isinstance(node, Join):
+            columns.update(_output_columns(node.left, by_id))
+            columns.update(_output_columns(node.right, by_id))
+            return columns
+        cursor = getattr(node, "input", None)
+    return columns
+
+
+def _column_map_for_join(node_id: str, left_id: str, args: str,
+                         by_id: dict[str, Any],
+                         produced: dict[str, str]) -> dict[str, str] | None:
+    """Build bare-name -> prefixed-name for everything downstream of this join."""
+    right_name = _right_side_name(args)
+    if right_name is None:
+        return None
+    # The right side is written as a SOURCE-LEVEL NAME -- join kind=inner
+    # LateralMovement -- but the graph is keyed by NODE ID. Resolving it
+    # through produced is what turns a let binding into a node reference. Without
+    # this the right side stayed a name, no node matched, the map came back empty,
+    # and every post-join comparison silently stayed undecidable.
+    right_id = produced.get(right_name, right_name)
+    if right_id not in by_id:
+        return None
+
+    left_columns = _output_columns(left_id, by_id)
+    right_columns = _output_columns(right_id, by_id)
+    keys = _join_key_names(args)
+
+    mapping: dict[str, str] = {}
+    for name in left_columns:
+        if name in right_columns and name not in keys:
+            # Genuinely ambiguous: the value differs between the two rows and
+            # nothing in the rule says which one it means. Refused at USE time by
+            # `_rewrite_joined_columns`, because that is where the analyst's intent
+            # would be invented.
+            continue
+        mapping[name] = f"l_{name}"
+    for name in right_columns:
+        if name in left_columns and name not in keys:
+            continue
+        mapping.setdefault(name, f"r_{name}")
+    return mapping
+
+
+def _right_side_name(args: str) -> str | None:
+    kind = re.match(r"kind\s*=\s*\w+", args, re.IGNORECASE)
+    rest = args[kind.end():].strip() if kind else args
+    if rest.startswith("("):
+        depth = 0
+        for index, char in enumerate(rest):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    return rest[1:index].strip()
+        return None
+    best = -1
+    for candidate in (" on ", " ON ", " On "):
+        found = rest.find(candidate)
+        if found >= 0 and (best < 0 or found < best):
+            best = found
+    return rest[:best].strip() if best >= 0 else None
+
+
+def _join_key_names(args: str) -> set[str]:
+    on_clause = args
+    if re.search(r"\bon\b", args, re.IGNORECASE):
+        on_clause = re.split(r"\bon\b", args, maxsplit=1, flags=re.IGNORECASE)[1]
+    names: set[str] = set()
+    for part in split_top_level(on_clause, ","):
+        part = part.strip()
+        if not part:
+            continue
+        if "==" in part:
+            left, _, right = part.partition("==")
+            names.add(left.strip())
+            names.add(right.strip())
+        else:
+            names.add(part)
+    return names
+
+
+def _rewrite_joined_columns(args: str, mapping: dict[str, str]) -> str:
+    """Rewrite bare column names downstream of a join to their prefixed form.
+
+    JOIN KEYS ARE ALLOWED THROUGH EVEN THOUGH THEY EXIST ON BOTH SIDES. An
+    equi-join on `Computer` proved the two values are equal, so either side
+    resolves to the same number and the choice cannot change a verdict. Every
+    other name present on both sides is left alone, and refused below, because
+    there the two values genuinely differ and the rule does not say which it
+    means.
+    """
+    left_only = {k: v for k, v in mapping.items() if v.startswith("l_")}
+    right_only = {k: v for k, v in mapping.items() if v.startswith("r_")}
+
+    both = {name for name, target in left_only.items()
+            if name in right_only and _is_join_key(args, name)}
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(0)
+        if name in both:
+            return left_only[name]
+        if name in left_only:
+            return left_only[name]
+        if name in right_only:
+            return right_only[name]
+        return name
+
+    return re.sub(r"(?<![\w.$@])[A-Za-z_][A-Za-z0-9_.]*(?![\w.])", replace, args)
+
+
+def _is_join_key(args: str, name: str) -> bool:
+    on_clause = args
+    if re.search(r"\bon\b", args, re.IGNORECASE):
+        on_clause = re.split(r"\bon\b", args, maxsplit=1, flags=re.IGNORECASE)[1]
+    return bool(re.search(rf"(?<![\w.]){re.escape(name)}(?![\w.])", on_clause))
 
 
 def _substitute_constants(text: str, aliases: dict[str, str]) -> str:
@@ -497,10 +660,17 @@ def _expression(text: str) -> Any:
             if function == "in_set":
                 inner = operand.strip()
                 if inner.startswith("("):
-                    options = tuple(Literal(_literal(o.strip()))
+                    # RAW VALUES, not nested Literal objects. Wrapping each option
+                    # in a Literal and then putting the tuple inside another
+                    # Literal produced `in_set(field, (Literal('0x1fffff'), ...))`,
+                    # so every comparison was against a Literal OBJECT, never
+                    # matched, and the filter silently dropped every row -- the
+                    # correlation reported a clean no_match for the right reason
+                    # and the wrong cause.
+                    options = tuple(_literal(o.strip())
                                     for o in split_top_level(inner[1:-1], ","))
                     return Call(function, (_expression(subject),
-                                          Literal(options)))
+                                           Literal(options)))
                 return Call(function, (_expression(subject), _expression(operand)))
             return Call(function, (_expression(subject), _expression(operand)))
 
@@ -518,7 +688,12 @@ def _expression(text: str) -> Any:
                 raise Refusal(
                     "KQL_IN_EXPECTED_LIST",
                     f"`{keyword}` needs a parenthesised list, got {operand!r}", "KQL")
-            options = tuple(Literal(_literal(o.strip()))
+            # RAW VALUES, not nested Literal objects. Wrapping each option in a
+            # Literal and then putting the tuple inside another Literal produced
+            # in_set(field, (Literal('0x1fffff'), ...)), so every comparison was
+            # against a Literal OBJECT and never matched -- the filter silently
+            # dropped every row, and the correlation reported a clean no_match.
+            options = tuple(_literal(o.strip())
                             for o in split_top_level(inner[1:-1], ","))
             return Call("in_set", (_expression(subject), Literal(options)))
 
