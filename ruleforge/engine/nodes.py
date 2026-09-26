@@ -368,6 +368,17 @@ def _accumulate(function: str, values: list[Any]) -> Any:
     numbers = [as_number(v) for v in present]
     numeric = [n for n in numbers if n is not None]
 
+    if function == "set":
+        # DISTINCT VALUES, NOT A COUNT. KQL's `make_set(SourceIp)` produces a
+        # collection; `count_distinct` produces a number. Substituting one for the
+        # other would change the column's type and every downstream use of it, so
+        # `set` is its own aggregate and returns a sorted tuple.
+        #
+        # SORTED so the result is deterministic. Two runs over the same rows must
+        # produce the same collection, or a rule's output would depend on row
+        # order and a diff against a saved artifact would be noise.
+        distinct = {_groupable(v) for v in present}
+        return tuple(sorted(distinct, key=str))
     if function == "min":
         if len(numeric) == len(present):
             return min(numeric)

@@ -91,6 +91,11 @@ ARITH_OPS: Final = frozenset({"+", "-", "*", "/"})
 #: Aggregates that read a single field.
 SINGLE_FIELD_AGGREGATES: Final = frozenset({
     "min", "max", "avg", "sum", "first", "last", "stddev",
+    # `set` collects the DISTINCT values into a collection rather than counting
+    # them. Sentinel's `make_set(SourceIp)` is exactly this, and it appears in the
+    # user's rule as a projected column. Without it the column would be dropped,
+    # which is a silent loss of something the rule explicitly asked for.
+    "set",
 })
 
 #: Aggregates that need a value field AND a separate ordering field, because

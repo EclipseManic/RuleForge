@@ -15,18 +15,26 @@ from __future__ import annotations
 
 from .aql import DIALECT as AQL_DIALECT
 from .aql import LANGUAGE as AQL_LANGUAGE
+from .aql import Diagnostic
 from .aql import parse_aql
 from .aql_ir import cre_from_ir, lower as lower_aql, render as render_aql
+from .kql import DIALECT as KQL_DIALECT
+from .kql import LANGUAGE as KQL_LANGUAGE
+from .kql import parse_kql
+from .kql_ir import lower as lower_kql
 from .yaral import DIALECT as YARAL_DIALECT
 from .yaral import LANGUAGE as YARAL_LANGUAGE
 from .yaral import parse_yaral
 from .yaral_ir import lower as lower_yaral, render as render_yaral
 
 __all__ = [
-    "Diagnostic", "parse_aql", "lower_aql", "render_aql", "cre_from_ir",
+    "Diagnostic",
+    "parse_aql", "lower_aql", "render_aql", "cre_from_ir",
     "AQL_DIALECT", "AQL_LANGUAGE",
     "parse_yaral", "lower_yaral", "render_yaral",
     "YARAL_DIALECT", "YARAL_LANGUAGE",
+    "parse_kql", "lower_kql",
+    "KQL_DIALECT", "KQL_LANGUAGE",
     "TARGETS",
 ]
 
@@ -42,5 +50,3 @@ TARGETS: dict[str, str] = {
     "falcon": "CQL",
     "sigma": "Sigma YAML",
 }
-
-from .aql import Diagnostic  # noqa: E402,F401  (re-exported for the dialects)
