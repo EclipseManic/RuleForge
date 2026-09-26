@@ -28,6 +28,7 @@ from kernel.eval_nodes import (DEFERRED_NODES, INEXPRESSIBLE_EXPAND_MODES, Sampl
                                _aggregate_group, _check_frame, _resolve_time_field, _stamp,
                                _windows)
 from kernel.eval_relational import _declared_time_field, _exec_join
+from kernel.eval_stateful import _exec_pattern
 from kernel.eval_types import (ABSENT, MAX_CAVEATS, MAX_EXPAND_ROWS, MAX_INPUT_ROWS,
                                MAX_TRACE_SAMPLES, NODE_TYPES, Caveat, EvalCounts, EvalState,
                                EvaluationResult, NodeTrace, Row, canonical, columns_of,
@@ -199,6 +200,18 @@ def _exec_derive(node: Derive, rows: list[Row], ctx: EvalContext) -> list[Row]:
         out.append(Row(values=values, index=row.index, time=row.time,
                        time_source=row.time_source, sides=row.sides))
     return out
+
+
+def _pattern_time_field(node: Pattern, sample: Any) -> str | None:
+    """The declared clock a Pattern's span is measured in.
+
+    `Pattern` carries no `time_ref`, so the only non-guessed source is the caller's declared
+    time binding. A key the Pattern partitions by is a poor substitute - it identifies a
+    stream, not a clock - so it is not used as one.
+    """
+    declared = {field for field in sample.time_bindings.values() if field}
+    return sorted(declared)[0] if len(declared) == 1 else (None if not declared
+                                                           else sorted(declared)[0])
 
 
 def _exec_expand(node: Any, rows: list[Row], ctx: EvalContext,
@@ -643,6 +656,16 @@ def evaluate_ir(ir: RuleIR, sample: Sample) -> EvaluationResult:
                 elif isinstance(node, Expand):
                     produced = _exec_expand(node, values[node.input], ctx, caveats)
                     detail = {"mode": node.mode, "field": node.field.name}
+                elif isinstance(node, Pattern):
+                    # Pattern has NO `input` of its own - each Stage names the node it reads
+                    # from, so it is a MULTI-input node like Join and SetOp. Reading
+                    # `values[node.input]` would have been a KeyError waiting to happen.
+                    stage_inputs = {s.input: values[s.input] for s in node.stages}
+                    produced = _exec_pattern(node, stage_inputs, ctx, caveats,
+                                            _pattern_time_field(node, sample))
+                    detail = {"mode": node.mode, "stages": len(node.stages),
+                              "terminal": node.terminal,
+                              "key": [f.name for f in node.key]}
                 else:
                     produced, detail = _exec_scalar(node, values, node_by_id, ctx, caveats, sample)
                 values[node_id] = produced

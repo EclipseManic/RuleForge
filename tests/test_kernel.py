@@ -24,8 +24,8 @@ from models.rule_ir import (Aggregate, Arrange, BoolOp, Call, Comparison, Derive
 SRC = SourceSelector(name="events")
 
 
-def sample(rows, read_id="r"):
-    return Sample({read_id: rows})
+def sample(rows, read_id="r", time_bindings=None):
+    return Sample({read_id: rows}, time_bindings=time_bindings)
 
 
 def graph(*nodes, output="o", rule_id="t"):
@@ -410,22 +410,39 @@ class RefusalTests(unittest.TestCase):
     def _with(self, *nodes, output="o"):
         return evaluate_ir(graph(*nodes, output=output), sample([{"a": 1}], "r"))
 
-    def test_a_pattern_is_deferred_to_3c(self):
-        node = Pattern(id="p", stages=(Stage(id="s1", input="r"),), max_span=Duration(60))
-        result = self._with(read(), node, emit("p"))
-        self.assertEqual(result.reason.deferred_to, "3C")
-
-    def test_an_iterate_is_deferred_to_3c(self):
+    def test_an_iterate_is_refused_and_says_why(self):
+        """`Iterate.step` is a graph NODE, so a fixed point needs sub-graph execution the
+        single-input executor does not have. Reported rather than approximated."""
         from models.rule_ir import Iterate
-        node = Iterate(id="it", input="r", step=Literal(1), until=Literal(True),
-                       max_iterations=3)
+        node = Iterate(id="it", input="r", step=Derive(id="s", input="r",
+                                                      assignments=((FieldRef("x"),
+                                                                    Literal(1)),)),
+                       until=Literal(True), max_iterations=3)
         result = self._with(read(), node, emit("it"))
         self.assertEqual(result.reason.deferred_to, "3C")
 
     def test_a_deferred_rule_costs_no_row_walk(self):
-        node = Pattern(id="p", stages=(Stage(id="s1", input="r"),), max_span=Duration(60))
-        result = self._with(read(), node, emit("p"))
+        from models.rule_ir import Iterate
+        node = Iterate(id="it", input="r", step=Derive(id="s", input="r",
+                                                      assignments=((FieldRef("x"),
+                                                                    Literal(1)),)),
+                       until=Literal(True), max_iterations=3)
+        result = self._with(read(), node, emit("it"))
         self.assertEqual(result.counts.rows_in, 0)
+
+    def test_a_rule_package_is_refused_because_its_unit_schema_is_unknown(self):
+        """`RulePackage.units` is `tuple[dict[str, Any]]` and the only field the model reads
+        is `id`, so there is nothing linking a unit to a graph. Evaluating one would mean
+        inventing that schema."""
+        from models.rule_ir import RulePackage
+        pkg = RulePackage(rule_id="bundle", units=({"id": "a"}, {"id": "b"}),
+                          dependencies=(("a", "b"),))
+        plain = RuleIR(rule_id="p", nodes=(read(), emit("r")), output="r", package=pkg)
+        packaged = evaluate_ir(plain, sample([{"a": 1}], "r"))
+        unpackaged = evaluate_ir(graph(read(), emit("r")), sample([{"a": 1}], "r"))
+        self.assertIs(packaged.verdict, Verdict.NOT_EVALUATED)
+        self.assertIs(unpackaged.verdict, Verdict.MATCHED,
+                      "the same graph WITHOUT a package evaluates, so the package is the cause")
 
     def test_an_unresolved_source_is_refused(self):
         ir = graph(Read(id="r", selector=SourceSelector(name=None, confidence="unverified")),
@@ -1135,6 +1152,177 @@ class OrderingAndLabellingTests(unittest.TestCase):
         with self.assertRaises(AttributeError):
             ctx.unknown("nonexistent_bucket")
         self.assertFalse(hasattr(ctx.counts, "nonexistent_bucket"))
+
+
+class PatternTests(unittest.TestCase):
+    """Sequence matching. The `until` negative twin comes FIRST, deliberately.
+
+    `until` exists to produce silence. A pattern that reports a match when the stop condition
+    fired fires on exactly the behaviour it was written to exclude, and nothing in the result
+    would say so. It is the most expensive bug this module could have, so it is pinned before
+    any positive case.
+    """
+
+    def _pattern(self, stages, mode="ordered", rows=None, read_id="r", **kw):
+        node = Pattern(id="p", stages=tuple(stages), mode=mode,
+                       max_span=Duration(600), **kw)
+        return evaluate_ir(graph(Read(id=read_id, selector=SRC), node, emit("p")),
+                           sample(rows if rows is not None else [], read_id),
+                           time_bindings={read_id: "t"})
+
+    def _until_graph(self, rows):
+        """A, B, C each behind its own Filter.
+
+        A Stage carries no predicate of its own - it reads the node named by `stage.input` -
+        so the ONLY way to make stages distinguishable is to give each one a different
+        filtered input. With all stages on one input they are indistinguishable, every suffix
+        is also a candidate, and `until` becomes meaningless.
+        """
+        def only(event):
+            return Filter(id=f"f{event}", input="r",
+                          condition=Comparison("=", FieldExpr(FieldRef("e")),
+                                               Literal(event)))
+        stages = (Stage(id="sA", input="fA"), Stage(id="sB", input="fB"),
+                  Stage(id="sC", input="fC", quantifier="none"))
+        node = Pattern(id="p", stages=stages, mode="until", max_span=Duration(600),
+                       terminal="any")
+        return evaluate_ir(graph(Read(id="r", selector=SRC), only("A"), only("B"), only("C"),
+                                 node, emit("p")),
+                           sample(rows, "r", time_bindings={"r": "t"}))
+
+    def test_until_does_not_match_when_the_stop_condition_fires(self):
+        """THE negative twin. A then B then C - and C happened."""
+        result = self._until_graph([{"e": "A", "t": 0}, {"e": "B", "t": 1},
+                                    {"e": "C", "t": 2}])
+        self.assertIs(result.verdict, Verdict.NO_MATCH,
+                      "until fired, so this must NOT be a match")
+
+    def test_until_matches_when_the_stop_condition_never_fires(self):
+        result = self._until_graph([{"e": "A", "t": 0}, {"e": "B", "t": 1}])
+        self.assertIs(result.verdict, Verdict.MATCHED)
+
+    def test_until_with_no_stop_stage_is_refused(self):
+        node = Pattern(id="p", stages=(Stage(id="s1", input="r"),), mode="until",
+                       max_span=Duration(600))
+        result = evaluate_ir(graph(Read(id="r", selector=SRC), node, emit("p")),
+                             sample([{"e": "A", "t": 0}], "r", time_bindings={"r": "t"}))
+        self.assertEqual(result.reason.code, "PATTERN_UNTIL_NEEDS_A_STOP_STAGE")
+
+    def test_an_incompatible_stage_quantifier_is_refused(self):
+        """`all` in `missing` mode contradicts itself: the point is non-occurrence."""
+        node = Pattern(id="p", stages=(Stage(id="s1", input="r", quantifier="all"),),
+                       mode="missing", max_span=Duration(600))
+        result = evaluate_ir(graph(Read(id="r", selector=SRC), node, emit("p")),
+                             sample([{"a": 1}], "r", time_bindings={"r": "a"}))
+        self.assertEqual(result.reason.code, "INCOMPATIBLE_STAGE_QUANTIFIER")
+
+    def test_an_ordered_pattern_without_a_span_is_refused(self):
+        """Without a span, "ordered" has no time relationship at all."""
+        node = Pattern(id="p", stages=(Stage(id="s1", input="r"),), mode="ordered")
+        result = evaluate_ir(graph(Read(id="r", selector=SRC), node, emit("p")),
+                             sample([{"a": 1}], "r"))
+        self.assertEqual(result.reason.code, "PATTERN_SPAN_NOT_DECLARED")
+
+    def _two_stage_graph(self, mode="ordered", rows=None, **kw):
+        """A then B, each behind its own Filter.
+
+        A Stage carries no predicate of its own - it reads the node named by `stage.input` -
+        and may only consume rows from THAT node. With both stages on one input they would be
+        indistinguishable and the sequence would be meaningless.
+        """
+        def only(event):
+            return Filter(id=f"f{event}", input="r",
+                          condition=Comparison("=", FieldExpr(FieldRef("e")), Literal(event)))
+        stages = (Stage(id="sA", input="fA"), Stage(id="sB", input="fB"))
+        if mode == "until":
+            stages = stages + (Stage(id="sC", input="fC", quantifier="none"),)
+        node = Pattern(id="p", stages=stages, mode=mode, max_span=Duration(600),
+                       **({"terminal": "any"} | kw))
+        return evaluate_ir(graph(Read(id="r", selector=SRC), only("A"), only("B"), only("C"),
+                                 node, emit("p")),
+                           sample(rows if rows is not None else [], "r",
+                                   time_bindings={"r": "t"}))
+
+    def test_ordered_stages_need_a_time_relationship(self):
+        result = self._two_stage_graph(rows=[{"e": "A", "t": 0}, {"e": "B", "t": 1}])
+        self.assertIs(result.verdict, Verdict.MATCHED)
+
+    def test_a_stage_may_not_consume_another_stages_rows(self):
+        """The regression that made `until` fire on the behaviour it excludes.
+
+        Only A and B exist. There is no C row at all, so nothing may satisfy the stop stage,
+        and the match must survive. Before the fix the matcher ignored `stage.input` and drew
+        from a merged pool, so it could consume A's row as if it satisfied the C stage.
+        """
+        result = self._two_stage_graph(mode="until",
+                                       rows=[{"e": "A", "t": 0}, {"e": "B", "t": 1}])
+        self.assertIs(result.verdict, Verdict.MATCHED)
+
+    def test_the_terminal_policy_is_declared_as_an_assumption(self):
+        result = self._two_stage_graph(rows=[{"e": "A", "t": 0}, {"e": "B", "t": 1}],
+                                       terminal="any")
+        self.assertIn("PATTERN_TERMINAL_POLICY_ANY_ASSUMED", result.caveat_codes())
+
+    def test_the_max_span_actually_excludes_a_distant_match(self):
+        """Without this, the span check is untested: dropping it changed nothing.
+
+        A at t=0 and B at t=10000 are four hours apart, and the span is 600 seconds. The
+        matcher must refuse, rather than treating "ordered" as merely "both stages appeared".
+        """
+        result = self._two_stage_graph(rows=[{"e": "A", "t": 0}, {"e": "B", "t": 10_000}])
+        self.assertIs(result.verdict, Verdict.NO_MATCH,
+                      "a match four hours apart must not satisfy a 600s span")
+
+    def test_the_max_span_admits_a_near_match(self):
+        result = self._two_stage_graph(rows=[{"e": "A", "t": 0}, {"e": "B", "t": 300}])
+        self.assertIs(result.verdict, Verdict.MATCHED)
+
+    def test_a_span_that_cannot_be_enforced_is_refused_rather_than_ignored(self):
+        """`Row.time` is set only by an Aggregate frame, so a Pattern's stages have no clock.
+
+        With no declared binding the span comparison is inert and `ordered` degrades into
+        "both stages appeared somewhere" - the exact thing PATTERN_SPAN_NOT_DECLARED exists to
+        prevent. It must refuse, not quietly match.
+        """
+        node = Pattern(id="p", stages=(Stage(id="sA", input="fA"), Stage(id="sB", input="fB")),
+                       mode="ordered", max_span=Duration(600))
+
+        def only(event):
+            return Filter(id=f"f{event}", input="r",
+                          condition=Comparison("=", FieldExpr(FieldRef("e")), Literal(event)))
+        result = evaluate_ir(graph(Read(id="r", selector=SRC), only("A"), only("B"),
+                                   node, emit("p")),
+                             sample([{"e": "A"}, {"e": "B"}], "r"))
+        self.assertEqual(result.reason.code, "TIME_FIELD_UNRESOLVED")
+        self.assertIn("degrade into", result.reason.message)
+
+    def test_a_match_reaching_the_end_of_the_sample_says_so(self):
+        """A static sample cannot know the event that would have continued the sequence."""
+        result = self._two_stage_graph(rows=[{"e": "A", "t": 0}, {"e": "B", "t": 1}])
+        self.assertIn("SEQUENCE_MATCH_REACHES_END_OF_SAMPLE", result.caveat_codes())
+
+    def test_a_pattern_with_no_stages_is_refused(self):
+        """The model refuses to even CONSTRUCT one, which is stronger than a kernel refusal."""
+        from models.rule_ir import RuleIRValidationError
+        with self.assertRaises(RuleIRValidationError) as caught:
+            self._pattern((), rows=[{"a": 1}])
+        self.assertEqual(caught.exception.code, "PATTERN_REQUIRES_STAGES")
+
+    def test_a_runaway_search_refuses_rather_than_running_forever(self):
+        """The step budget is decremented BEFORE the work, so a combinatorially bad pattern
+        refuses rather than spending minutes and then answering confidently."""
+        import kernel.eval_stateful as stateful
+        stages = tuple(Stage(id=f"s{i}", input="r") for i in range(6))
+        node = Pattern(id="p", stages=stages, mode="ordered", max_span=Duration(10_000))
+        original = stateful.MAX_SEQUENCE_STEPS
+        stateful.MAX_SEQUENCE_STEPS = 50
+        try:
+            result = evaluate_ir(graph(Read(id="r", selector=SRC), node, emit("p")),
+                             sample([{"a": 1, "t": i} for i in range(300)], "r",
+                                    time_bindings={"r": "t"}))
+        finally:
+            stateful.MAX_SEQUENCE_STEPS = original
+        self.assertEqual(result.reason.code, "EVAL_SEQUENCE_SEARCH_EXCEEDED")
 
 
 class ShadowModeTests(unittest.TestCase):

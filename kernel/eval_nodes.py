@@ -35,10 +35,13 @@ from kernel.eval_expr import EvalContext, evaluate
 from kernel.eval_types import (ABSENT, Caveat, Row, canonical)
 from models.rule_ir import (AGGREGATE_FUNCTIONS, Aggregate, Frame)
 
-#: Constructs that exist in the IR but are NOT executed by 3A, mapped to the phase that owns
-#: them. Checked at pre-flight so a deferred rule never costs a row walk.
+#: Constructs the kernel does not execute. Checked at pre-flight so a deferred rule never
+#: costs a row walk.
+#:
+#: `Pattern` is NOT here: 3C implements it. `Iterate` stays deferred because its `step` is a
+#: graph NODE, so a fixed point needs a sub-graph execution model the single-input executor
+#: does not have — reported rather than approximated.
 DEFERRED_NODES: Mapping[str, str] = {
-    "Pattern": "3C",
     "Iterate": "3C",
 }
 
