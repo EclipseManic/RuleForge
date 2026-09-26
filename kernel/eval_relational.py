@@ -61,6 +61,11 @@ _SUPPORTED_KINDS = frozenset(_COHERENT_UNMATCHED)
 #: Row counts above which a join refuses rather than building an unbounded result.
 MAX_JOIN_ROWS = 500_000
 
+#: Pair-evaluation budget. A join is O(left x right); the input cap permits 50,000 x 50,000,
+#: which is hours of CPU. Counted BEFORE any merge allocation, because a join that matches
+#: nothing never reaches the output cap and so would otherwise be unbounded.
+MAX_JOIN_PAIRS = 2_000_000
+
 
 def _has_temporal_predicate(expr: Any, time_fields: frozenset[str], depth: int = 0) -> bool:
     """Does the predicate reference a field the caller has DECLARED to be a clock?
@@ -136,7 +141,14 @@ def _check_join(node: Join, caveats: list[Caveat], time_fields: frozenset[str]) 
             node.id)
 
     if node.match_window is not None:
-        caveats.append(Caveat("JOIN_TEMPORAL_BOUNDARY_INCLUSIVE", nodes=(node.id,)))
+        # `on` is AUTHORITATIVE. `match_window` is a declaration about intent, and it is
+        # recorded rather than enforced. An earlier version applied it as a pre-filter, which
+        # was wrong in BOTH directions: with no clock resolved it filtered nothing while
+        # still emitting a caveat claiming the boundary was applied, and with a clock resolved
+        # it discarded pairs that `on` accepted - turning a real match into NO_MATCH with no
+        # refusal. Silently narrowing or silently ignoring a declared bound are both worse
+        # than saying plainly which one happened.
+        caveats.append(Caveat("JOIN_TEMPORAL_WINDOW_DECLARED_NOT_ENFORCED", nodes=(node.id,)))
 
 
 def _side_scoped_fields(expr: Any, depth: int = 0) -> set[str]:
@@ -182,9 +194,11 @@ def _merge(left: Row, right: Row, node: Join, ctx: EvalContext,
             if node.collision == "error":
                 raise EvaluationRefusal(
                     "JOIN_FIELD_COLLISION",
-                    f"field {name!r} is present on both sides with DIFFERENT values "
-                    f"({values[name]!r} vs {value!r}) and the collision policy is 'error'; the "
-                    f"kernel will not pick a winner", node.id)
+                    f"field {name!r} is present on both sides with DIFFERENT values and the "
+                    f"collision policy is 'error'; the kernel will not pick a winner. The "
+                    f"conflicting values are deliberately NOT included: a refusal message "
+                    f"reaches logs and API responses, and sample events contain the very "
+                    f"fields being hunted for.", node.id)
             if node.collision == "keep_left":
                 continue
             if node.collision == "keep_right":
@@ -210,25 +224,44 @@ def _exec_join(node: Join, left: list[Row], right: list[Row], ctx: EvalContext,
     _check_join(node, caveats, time_fields)
 
     bound = node.match_window.seconds if node.match_window is not None else None
+    # Recorded so the trace can say whether a clock was available, NOT used to filter. `on`
+    # decides. See `_check_join` for why a pre-filter was removed.
+    clocks_available = any(r.time is not None for r in left + right)
+    if bound is not None and not clocks_available:
+        caveats.append(Caveat("JOIN_WINDOW_NOT_ENFORCED_NO_CLOCK", nodes=(node.id,)))
     side_scoped = _side_scoped_fields(node.on)
     if side_scoped:
         caveats.append(Caveat("JOIN_SIDE_SCOPED_FIELDS_NOT_MERGED",
                               count=len(side_scoped), nodes=(node.id,)))
+    matched_right: set[int] = set()
+    pairs = [0]
+    max_pairs = MAX_JOIN_PAIRS
     out: list[Row] = []
     matched_right: set[int] = set()
 
-    for lrow in left:
+    for ordinal, lrow in enumerate(left):
         hits: list[Row] = []
-        for rrow in right:
-            if bound is not None and not _within(lrow.time, rrow.time, bound):
-                continue
+        for r_ordinal, rrow in enumerate(right):
+            # Pair budget, counted BEFORE any merge allocation. A join is O(left x right), so
+            # a legal 50,000 x 50,000 sample is 2.5e9 predicate evaluations - hours of CPU.
+            # The earlier cap only bounded OUTPUT rows, which a join that matches nothing
+            # never reaches, so it bounded nothing at all.
+            pairs[0] += 1
+            if pairs[0] > max_pairs:
+                raise EvaluationRefusal(
+                    "EVAL_JOIN_WORK_EXCEEDED",
+                    f"the join would evaluate more than {max_pairs} row pairs; refusing "
+                    f"rather than spending minutes of CPU to produce a result the analyst "
+                    f"cannot act on", node.id)
             verdict = evaluate(node.on, _paired(lrow, rrow, node), ctx, None)
             if verdict is True:
-                hits.append(rrow)
-                matched_right.add(rrow.index)
-            # A UNKNOWN or FALSE match is not a match. For a join, UNKNOWN is not counted as
-            # unmatched either: the row is simply not a match, and a row whose predicate cannot
-            # be decided is left out rather than invented into a match.
+                hits.append((r_ordinal, rrow))
+            elif verdict is None:
+                # A join UNKNOWN is not a match and is not "unmatched" either. Counting it is
+                # what keeps a join's no-match distinguishable from "could not decide".
+                ctx.counts.rows_predicate_unknown += 1
+            else:
+                ctx.counts.rows_predicate_false += 1
 
         if not hits:
             if node.kind in ("left",):
@@ -247,7 +280,14 @@ def _exec_join(node: Join, left: list[Row], right: list[Row], ctx: EvalContext,
                 f"join {node.id!r} declares {node.cardinality!r} but one left row matched "
                 f"{len(hits)} right rows; keeping the first would be a guess and keeping all "
                 f"would contradict the declaration", node.id)
-        for rrow in hits:
+        for r_ordinal, rrow in hits:
+            # Keyed on the RIGHT-SIDE ORDINAL, not `Row.index`. `Row.index` is only unique
+            # within one Read, so a right input that is a SetOp (each side numbered from 0)
+            # or an Expand (one index per output row) or a Join (index copied from the left)
+            # made a matched sibling mark its unmatched sibling as matched - which silently
+            # dropped rows from a `kind="right"` join, the one whose only purpose is to keep
+            # them.
+            matched_right.add(r_ordinal)
             out.append(_merge(lrow, rrow, node, ctx, side_scoped))
             if len(out) > MAX_JOIN_ROWS:
                 raise EvaluationRefusal(
@@ -256,26 +296,14 @@ def _exec_join(node: Join, left: list[Row], right: list[Row], ctx: EvalContext,
                     f"building an unbounded result", node.id)
 
     if node.kind in ("right", "right_anti"):
-        for rrow in right:
-            if rrow.index not in matched_right:
+        for r_ordinal, rrow in enumerate(right):
+            if r_ordinal not in matched_right:
                 if node.kind == "right":
                     out.append(_unmatched_row(rrow, node, ctx))
                 else:
                     out.append(rrow)
 
     return out
-
-
-def _within(left_time: float | None, right_time: float | None, bound: float) -> bool:
-    """A cheap PRE-FILTER only. It never decides the join on its own.
-
-    Being inclusive here is deliberate and is declared as a caveat: `right.t <= left.t + W`
-    with equality is a different rule from a strict `<`, and the authoritative answer comes
-    from the `on` predicate, not from this bound.
-    """
-    if left_time is None or right_time is None:
-        return True
-    return abs(right_time - left_time) <= bound
 
 
 def _paired(lrow: Row, rrow: Row, node: Join) -> Row:

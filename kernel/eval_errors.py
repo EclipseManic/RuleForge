@@ -51,6 +51,7 @@ KERNEL_EVAL_CODES: frozenset[str] = frozenset({
     "MEASURE_FIELD_NOT_APPLICABLE",
     "MEASURE_FIELD_REQUIRED",
     "ARITH_STRING_CONCAT_UNSUPPORTED",
+    "UNKNOWN_ARITHMETIC_OPERATOR",
     "FUNCTION_DIALECT_UNDECLARED",
     "ARRANGE_NEGATIVE_OFFSET",
 
@@ -70,6 +71,8 @@ KERNEL_EVAL_CODES: frozenset[str] = frozenset({
     "EXPAND_MODE_INEXPRESSIBLE",
     "EXPAND_VALUE_NOT_A_SEQUENCE",
     "EVAL_OUTPUT_TOO_LARGE",
+    "EVAL_JOIN_WORK_EXCEEDED",
+    "EXPAND_OUTPUT_TOO_LARGE",
 
     # --- our model cannot represent it, or cannot be trusted here -----------
     "IR_UNSUPPORTED_CONSTRUCT",

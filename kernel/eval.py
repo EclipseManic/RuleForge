@@ -27,9 +27,10 @@ from kernel.eval_nodes import (DEFERRED_NODES, INEXPRESSIBLE_EXPAND_MODES, Sampl
                                _aggregate_group, _check_frame, _resolve_time_field, _stamp,
                                _windows)
 from kernel.eval_relational import _declared_time_field, _exec_join
-from kernel.eval_types import (ABSENT, MAX_CAVEATS, MAX_INPUT_ROWS, MAX_TRACE_SAMPLES, NODE_TYPES,
-                               Caveat, EvalCounts, EvalState, EvaluationResult, NodeTrace, Row,
-                               canonical, columns_of, primitive_of, row_key)
+from kernel.eval_types import (ABSENT, MAX_CAVEATS, MAX_EXPAND_ROWS, MAX_INPUT_ROWS,
+                               MAX_TRACE_SAMPLES, NODE_TYPES, Caveat, EvalCounts, EvalState,
+                               EvaluationResult, NodeTrace, Row, canonical, columns_of,
+                               primitive_of, row_key)
 from models.rule_ir import (Aggregate, Arrange, Derive, Emit, Expand, Filter, Join, Pattern, Read, RuleIR,
                             RuleIRValidationError, SetOp, SourceSelector, validate_ir)
 
@@ -61,7 +62,10 @@ def _preflight(ir: RuleIR, sample: Sample) -> EvaluationRefusal | None:
 
         if isinstance(node, Read):
             selector: SourceSelector = node.selector
-            if selector.name is None:
+            if not (selector.name or "").strip():
+                # A BLANK or whitespace-only name is as unusable as None: a renderer would have
+                # to invent a table. `FieldRef` already refuses a blank name, so accepting one
+                # here was an inconsistency rather than a deliberate choice.
                 return EvaluationRefusal(
                     "UNRESOLVED_SOURCE",
                     f"the source of {node.id!r} is unresolved; the kernel will not invent a "
@@ -192,7 +196,7 @@ def _exec_derive(node: Derive, rows: list[Row], ctx: EvalContext) -> list[Row]:
         for name in node.drop:
             values.pop(name, None)
         out.append(Row(values=values, index=row.index, time=row.time,
-                       time_source=row.time_source))
+                       time_source=row.time_source, sides=row.sides))
     return out
 
 
@@ -227,6 +231,14 @@ def _exec_expand(node: Any, rows: list[Row], ctx: EvalContext,
         items = list(value)
         if not items:
             continue
+        if len(out) + len(items) > MAX_EXPAND_ROWS:
+            # `MAX_INPUT_ROWS` is no defence here: a single sample row holding a million-element
+            # array is ONE input row, and every output row copies the whole values dict. One
+            # JSON array was enough to allocate 374 MB before this cap existed.
+            raise EvaluationRefusal(
+                "EXPAND_OUTPUT_TOO_LARGE",
+                f"expanding {node.field.name!r} would produce more than {MAX_EXPAND_ROWS} "
+                f"rows; refusing rather than exhausting memory on one sample row", node.id)
         for item in items:
             values = dict(row.values)
             if node.alias:
@@ -234,7 +246,7 @@ def _exec_expand(node: Any, rows: list[Row], ctx: EvalContext,
                 values.pop(node.field.name, None)
             values[target] = item
             out.append(Row(values=values, index=row.index, time=row.time,
-                           time_source=row.time_source))
+                           time_source=row.time_source, sides=row.sides))
     return out
 
 
@@ -287,7 +299,8 @@ def _exec_aggregate(node: Aggregate, rows: list[Row], ctx: EvalContext,
                 raw = members[0].get(field.name)
                 values[field.name] = None if raw is ABSENT else raw
             values.update(scope)
-            out.append(Row(values=values, index=members[0].index, time=members[0].time))
+            out.append(Row(values=values, index=rows[0].index, time=rows[0].time,
+                           sides=rows[0].sides))
             ctx.counts.groups += 1
     return out
 
@@ -402,7 +415,8 @@ def _exec_emit(node: Emit, rows: list[Row], ctx: EvalContext,
                     ctx.counts.emit_column_absent += 1
                 raw = row.get(column)
                 values[column] = None if raw is ABSENT else raw
-            out.append(Row(values=values, index=row.index, time=row.time))
+            out.append(Row(values=values, index=row.index, time=row.time,
+                           sides=row.sides))
         rows = out
     if node.dedupe_by:
         seen: set = set()
@@ -491,6 +505,15 @@ def evaluate_ir(ir: RuleIR, sample: Sample) -> EvaluationResult:
             code,
             f"the rule did not validate, so there is nothing to evaluate: {exc.message}",
             exc.path), counts)
+    except RecursionError:
+        # `validate_ir` recurses per node and per expression with no depth bound, so a legal
+        # but very large graph exhausts the stack DURING VALIDATION, before any of the
+        # evaluation-phase guards can help. Measured: a 1200-node chain in reverse tuple order,
+        # and a ~3000-deep expression. `evaluate_ir` promises to return a refusal, never raise.
+        return not_evaluated(EvaluationRefusal(
+            "IR_UNSUPPORTED_CONSTRUCT",
+            "the graph or an expression nests too deeply to validate or evaluate; the kernel "
+            "refused rather than exhausting the call stack", None), counts)
 
     if sum(len(v) for v in sample.rows_by_read.values()) > MAX_INPUT_ROWS:
         # Refuse, never truncate: dropping rows changes window contents, therefore changes the
@@ -609,6 +632,14 @@ def evaluate_ir(ir: RuleIR, sample: Sample) -> EvaluationResult:
     except EvaluationRefusal as exc:
         return not_evaluated(exc, counts, tuple(trace), tuple(caveats[:MAX_CAVEATS]),
                              tuple(unmodelled))
+    except RecursionError:
+        # `validate_ir` and the kernel's own walks recurse per node and per expression, so a
+        # legal but very large graph can exhaust the stack. That has to be a refusal, not a
+        # crash: `evaluate_ir` promises to RETURN a refusal and never raise.
+        return not_evaluated(EvaluationRefusal(
+            "IR_UNSUPPORTED_CONSTRUCT",
+            "the graph or an expression nests too deeply to evaluate; the kernel refused "
+            "rather than exhausting the call stack", None), counts)
 
 
 def _upstream_read(node: Any, node_by_id: dict[str, Any]) -> str:

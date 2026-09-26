@@ -44,13 +44,14 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from typing import Any
 
 from kernel.eval_errors import EvaluationRefusal
-from kernel.eval_types import ABSENT, MAX_EXPRESSION_DEPTH, UNKNOWN, Row, canonical
+from kernel.eval_types import (ABSENT, MAX_EXPRESSION_DEPTH, UNKNOWN, Row, eq_value)
 from models.rule_ir import (FUNCTION_CONTRACTS, Arith, BoolOp, Call, Comparison, EventExpr,
                             FieldExpr, InList, Literal, MeasureExpr, TimeExpr)
 
 #: Ops whose truth value is meaningful. `not` is unary, the rest are n-ary.
 _BOOL_OPS = frozenset({"and", "or", "not"})
 _COMPARISON_OPS = frozenset({"=", "!=", "<", "<=", ">", ">="})
+_ARITH_OPS = frozenset({"+", "-", "*", "/", "%"})
 
 
 @dataclass
@@ -196,16 +197,29 @@ def _evaluate(expr: Any, row: Row, ctx: EvalContext, scope: Any) -> Any:
                 "EVENT_SIDE_NOT_AVAILABLE",
                 f"an event-scoped reference to the {expr.side!r} side was used outside a "
                 f"two-input node, so there is no such side to read", _where(expr))
-        return row.side(expr.side).get(expr.ref.name, ABSENT)
+        side = row.side(expr.side)
+        if side is ABSENT:
+            # The side exists in the graph but not on THIS row - an outer join's unmatched
+            # side. That is absent data, so it evaluates to ABSENT and the surrounding
+            # comparison becomes UNKNOWN, not a value borrowed from the other side.
+            return ABSENT
+        return side.get(expr.ref.name, ABSENT)
 
     if isinstance(expr, InList):
         value = evaluate(expr.value, row, ctx, scope)
-        options = evaluate(expr.options, row, ctx, scope) if not isinstance(
-            expr.options, tuple) else expr.options
         if not _is_scalar(value):
             ctx.unknown("comparison_type_mismatch")
             return UNKNOWN
-        return any(canonical(value) == canonical(o) for o in options)
+        # `InList.options` holds UNEVALUATED expressions, not values. An earlier version
+        # compared the raw tuple, so `canonical(Literal('a'))` produced
+        # ('other', "Literal(value='a')") which can never equal ('str', 'a') - meaning EVERY
+        # membership test returned False. Every list-valued Sigma predicate arrives in this
+        # shape from the v1 adapter, so an entire common rule family silently matched nothing
+        # and was counted as rows_predicate_false: a definitive wrong negative.
+        options = tuple(evaluate(option, row, ctx, scope) for option in expr.options)
+        if any(isinstance(o, bool) for o in options) and isinstance(value, bool):
+            return any(o is value for o in options)
+        return any(eq_value(value, option) for option in options)
 
     if isinstance(expr, BoolOp):
         return _evaluate_bool(expr, row, ctx, scope)
@@ -273,9 +287,9 @@ def _evaluate_comparison(expr: Comparison, row: Row, ctx: EvalContext,
         return UNKNOWN
 
     if expr.op == "=":
-        return canonical(left) == canonical(right)
+        return eq_value(left, right)
     if expr.op == "!=":
-        return canonical(left) != canonical(right)
+        return not eq_value(left, right)
     try:
         if expr.op == "<":
             return left < right
@@ -290,6 +304,16 @@ def _evaluate_comparison(expr: Comparison, row: Row, ctx: EvalContext,
 
 
 def _evaluate_arith(expr: Arith, row: Row, ctx: EvalContext, scope: Any) -> Any:
+    if expr.op not in _ARITH_OPS:
+        # Validated, because the alternative is falling through every branch to modulo:
+        # `Arith("^", 7, 3) > 0` silently evaluated 7 % 3, and `Arith("^", 7, 0)` raised an
+        # UNCAUGHT ZeroDivisionError straight out of `evaluate_ir`, which promises to return a
+        # refusal rather than raise. An unvalidated operator is a silent wrong answer or a
+        # crash depending on the operands.
+        raise EvaluationRefusal(
+            "UNKNOWN_ARITHMETIC_OPERATOR",
+            f"unknown arithmetic operator {expr.op!r}; the model permits {sorted(_ARITH_OPS)}",
+            "Arith")
     left = evaluate(expr.left, row, ctx, scope)
     right = evaluate(expr.right, row, ctx, scope)
     if expr.op == "+" and (isinstance(left, str) or isinstance(right, str)):
@@ -400,7 +424,7 @@ def _apply_function(name: str, args: list[Any], ctx: EvalContext) -> Any:
         if not _is_scalar(value):
             ctx.unknown("function_unknown")
             return UNKNOWN
-        return any(canonical(value) == canonical(o) for o in options)
+        return any(eq_value(value, o) for o in options)
 
     # The remaining functions are string functions whose contract is "nulls propagate".
     if any(a is ABSENT or a is None for a in args):

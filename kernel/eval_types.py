@@ -58,6 +58,9 @@ MAX_EXPRESSION_DEPTH = 64
 MAX_INPUT_ROWS = 100_000
 MAX_TRACE_SAMPLES = 5
 MAX_CAVEATS = 64
+#: `Expand` output cap. Separate from MAX_INPUT_ROWS because one input row can hold an
+#: arbitrarily long list, and every output row copies the row's whole value mapping.
+MAX_EXPAND_ROWS = 200_000
 
 #: The third truth value. `None` means UNKNOWN, never "false".
 UNKNOWN = None
@@ -132,10 +135,18 @@ class Row:
         """The value, or ABSENT if the key is not present. Never returns None for absence."""
         return self.values.get(name, ABSENT)
 
-    def side(self, name: str) -> Mapping[str, Any]:
-        """One side's pre-merge values, or the row's own values when there is only one side."""
-        if self.sides is not None and name in self.sides:
-            return self.sides[name]
+    def side(self, name: str) -> Any:
+        """One side's pre-merge values, or ABSENT when that side does not exist on this row.
+
+        There is NO fallback to the merged view. An earlier version returned `self.values` when
+        the named side was missing, so a left-join row with no right counterpart reported the
+        LEFT row's value as the right side's - fabricating a value for a stream that was not in
+        the result at all. Under a name asserting which side it came from, that is precisely
+        the invention this whole module exists to prevent. The `EventExpr` evaluator turns this
+        ABSENT into a visible UNKNOWN rather than a number.
+        """
+        if self.sides is not None:
+            return self.sides.get(name, ABSENT)
         return self.values
 
     @property
@@ -170,6 +181,39 @@ def canonical(value: Any) -> tuple[str, Any]:
     if isinstance(value, Mapping):
         return ("map", frozenset((k, canonical(v)) for k, v in value.items()))
     return ("other", repr(value))
+
+
+def eq_value(left: Any, right: Any) -> bool:
+    """EQUALITY, as distinct from identity.
+
+    `canonical()` is row identity, and there the type tag is load-bearing: a set operation
+    must not union the integer 1 with the boolean True. Reusing it for `=` was wrong in the
+    other direction - a JSON float 1024.0 never equalled the integer literal 1024, so every
+    numeric comparison against a float field was a silent, definitive wrong negative counted
+    as `rows_predicate_false` rather than as an unknown. That is the worst direction for this
+    module to be wrong in.
+
+    So numbers compare NUMERICALLY here, `bool` stays distinct from numbers, and everything
+    else falls back to the type-tagged identity.
+    """
+    if left is ABSENT or right is ABSENT:
+        return False
+    if isinstance(left, bool) or isinstance(right, bool):
+        return canonical(left) == canonical(right)
+    if _is_number(left) and _is_number(right):
+        return left == right
+    if isinstance(left, str) and isinstance(right, str):
+        return left == right
+    if left is None or right is None:
+        return left is None and right is None
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        return len(left) == len(right) and all(
+            eq_value(a, b) for a, b in zip(left, right))
+    return canonical(left) == canonical(right)
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 def row_key(row: Row) -> tuple[tuple[str, tuple[str, Any]], ...]:
@@ -253,10 +297,15 @@ class EvaluationResult:
 
     def __post_init__(self) -> None:
         if self.state is EvalState.NOT_EVALUATED:
-            if self.rows or self.columns:
+            # `len()` and an explicit `tuple` check, never truthiness. A tuple SUBCLASS that
+            # overrides `__bool__` can defeat a truthiness test, which would let a not_evaluated
+            # result carry rows - the one thing this class exists to make impossible.
+            if len(self.rows) or len(self.columns):
                 raise ValueError(
                     "a not_evaluated result must carry no rows and no columns; otherwise a "
                     "consumer can render output for a rule we could not evaluate")
+            if not isinstance(self.rows, tuple) or not isinstance(self.columns, tuple):
+                raise ValueError("rows and columns must be plain tuples")
             if self.reason is None:
                 raise ValueError("a not_evaluated result must name its reason")
 
@@ -269,7 +318,7 @@ class EvaluationResult:
         """The only sanctioned verdict. Derived, never stored, never settable."""
         if self.state is EvalState.NOT_EVALUATED:
             return Verdict.NOT_EVALUATED
-        return Verdict.MATCHED if self.rows else Verdict.NO_MATCH
+        return Verdict.MATCHED if len(self.rows) else Verdict.NO_MATCH
 
     @property
     def verdict_label(self) -> str:

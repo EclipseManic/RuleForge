@@ -700,8 +700,8 @@ class JoinTests(unittest.TestCase):
             "r": [{"host": "a", "t": 5}, {"host": "a", "t": 9_000}]},
             time_bindings={"l": "t", "r": "t"}))
         self.assertEqual(result.state, EvalState.EVALUATED, result.reason)
-        self.assertIn("JOIN_TEMPORAL_BOUNDARY_INCLUSIVE", result.caveat_codes())
-        self.assertEqual(len(result.rows), 1, "only the 0/5 pair is within 600 seconds")
+        self.assertIn("JOIN_TEMPORAL_WINDOW_DECLARED_NOT_ENFORCED", result.caveat_codes())
+        self.assertEqual(len(result.rows), 1, "only the 0/5 pair satisfies `on`")
         self.assertIn("JOIN_SIDE_SCOPED_FIELDS_NOT_MERGED", result.caveat_codes())
 
     def test_a_merged_row_keeps_both_sides_addressable(self):
@@ -769,6 +769,249 @@ class ExpandTests(unittest.TestCase):
         result = evaluate([{"ips": ["1"]}], read(), node, emit("x"))
         self.assertEqual(dict(result.rows[0].values)["ip"], "1")
         self.assertNotIn("ips", result.rows[0].values)
+
+
+class ReviewRegressionTests(unittest.TestCase):
+    """Regressions for defects found by independent review of 3A/3B.
+
+    Each of these shipped in a green suite. That is the point: the suite was not evidence, so
+    the regression is pinned deliberately rather than assumed.
+    """
+
+    # --- C1/A4: InList could never return True, and identity was used as equality ----
+    def test_an_inlist_predicate_actually_matches(self):
+        """This is the single worst defect in the three commits.
+
+        `InList.options` holds unevaluated expressions. Comparing the raw tuple made
+        `canonical(Literal('a'))` -> ('other', "Literal(value='a')"), which can never equal
+        ('str','a'), so EVERY membership test returned False. The v1 adapter emits exactly this
+        shape for every list-valued Sigma predicate, so a whole common rule family silently
+        matched nothing and was counted as rows_predicate_false - a definitive wrong negative.
+        """
+        result = evaluate([{"u": "a"}, {"u": "b"}, {"u": "z"}], read(),
+                          Filter(id="f", input="r",
+                                 condition=InList(FieldExpr(FieldRef("u")),
+                                                  (Literal("a"), Literal("b")))),
+                          emit("f"))
+        self.assertEqual([dict(r.values)["u"] for r in result.rows], ["a", "b"])
+
+    def test_an_inlist_match_is_counted_as_true_not_false(self):
+        result = evaluate([{"u": "a"}, {"u": "z"}], read(),
+                          Filter(id="f", input="r",
+                                 condition=InList(FieldExpr(FieldRef("u")), (Literal("a"),))),
+                          emit("f"))
+        self.assertEqual(result.counts.rows_predicate_true, 1)
+        self.assertEqual(result.counts.rows_predicate_false, 1)
+
+    def test_a_json_float_equals_an_integer_literal(self):
+        """`canonical()` is identity, where 1 == True must not collapse. Reusing it for `=`
+        meant 1024.0 never equalled 1024 - a silent definitive wrong negative for every numeric
+        comparison against a float field."""
+        result = evaluate([{"b": 1024.0}], read(),
+                          Filter(id="f", input="r",
+                                 condition=Comparison("=", FieldExpr(FieldRef("b")),
+                                                      Literal(1024))),
+                          emit("f"))
+        self.assertIs(result.verdict, Verdict.MATCHED)
+
+    def test_a_boolean_is_still_distinct_from_a_number_in_equality(self):
+        result = evaluate([{"n": 1}], read(),
+                          Filter(id="f", input="r",
+                                 condition=Comparison("=", FieldExpr(FieldRef("n")),
+                                                      Literal(True))),
+                          emit("f"))
+        self.assertIs(result.verdict, Verdict.NO_MATCH, "1 must not equal True")
+
+    # --- C2/A1/A2: match_window was broken in both directions ---
+    def test_a_declared_window_is_not_silently_used_to_narrow_the_join(self):
+        """`on` is authoritative. The old pre-filter discarded pairs `on` accepted, turning a
+        real match into NO_MATCH with no refusal and no counter."""
+        def bounded(window):
+            node = Join(id="j", left="l", right="r",
+                        on=BoolOp("and", (
+                            Comparison("=", EventExpr("left", None, FieldRef("host")),
+                                       EventExpr("right", None, FieldRef("host"))),
+                            Comparison(">=", EventExpr("right", None, FieldRef("t")),
+                                       EventExpr("left", None, FieldRef("t"))),
+                            Comparison("<=", EventExpr("right", None, FieldRef("t")),
+                                       Arith("+", EventExpr("left", None, FieldRef("t")),
+                                             Literal(600))))),
+                        match_window=window)
+            return evaluate_ir(graph(read("l"), read("r"), node, emit("j")),
+                               Sample({"l": [{"host": "a", "t": 0}],
+                                       "r": [{"host": "a", "t": 300}]},
+                                      time_bindings={"l": "t", "r": "t"}))
+
+        without = bounded(None)
+        with_window = bounded(Duration(60))
+        self.assertEqual(without.verdict, Verdict.MATCHED)
+        self.assertEqual(with_window.verdict, Verdict.MATCHED,
+                         "a 60s window must not delete a pair that `on` accepts")
+
+    def test_a_window_that_cannot_be_enforced_says_so(self):
+        """A caveat that claims a boundary was applied when it was not is worse than none."""
+        node = Join(id="j", left="l", right="r",
+                    on=BoolOp("and", (
+                        Comparison("=", EventExpr("left", None, FieldRef("host")),
+                                   EventExpr("right", None, FieldRef("host"))),
+                        Comparison(">=", EventExpr("right", None, FieldRef("t")),
+                                   EventExpr("left", None, FieldRef("t"))))),
+                    match_window=Duration(60))
+        result = evaluate_ir(graph(read("l"), read("r"), node, emit("j")),
+                             Sample({"l": [{"host": "a", "t": 0}],
+                                     "r": [{"host": "a", "t": 36_000}]},
+                                    time_bindings={"l": "t", "r": "t"}))
+        codes = result.caveat_codes()
+        self.assertIn("JOIN_TEMPORAL_WINDOW_DECLARED_NOT_ENFORCED", codes)
+        self.assertIn("JOIN_WINDOW_NOT_ENFORCED_NO_CLOCK", codes)
+        self.assertNotIn("JOIN_TEMPORAL_BOUNDARY_INCLUSIVE", codes)
+
+    # --- C3: count() ignored where ---
+    def test_a_count_with_a_where_clause_honours_it(self):
+        """`Measure('Failed','count', where=ok==False)` counted EVERY row."""
+        rows = [{"u": "a", "ok": False}, {"u": "a", "ok": False}, {"u": "a", "ok": True},
+                {"u": "b", "ok": True}]
+        measure = Measure("Failed", "count",
+                          where=Comparison("=", FieldExpr(FieldRef("ok")), Literal(False)))
+        result = self._grouped_for(rows, (measure,))
+        got = {dict(r.values)["u"]: dict(r.values)["Failed"] for r in result.rows}
+        self.assertEqual(got, {"a": 2, "b": 0})
+
+    def _grouped_for(self, rows, measures):
+        agg = Aggregate(id="a", input="r", measures=measures, group_by=(FieldRef("u"),))
+        return evaluate(rows, read(), agg, emit("a"))
+
+    # --- H1: matched_right keyed on Row.index, which is only unique per Read ---
+    def test_a_right_anti_join_keeps_unmatched_rows_from_a_non_read_input(self):
+        """A SetOp right input numbers each side from 0, so a matched sibling marked its
+        unmatched sibling as matched - and `kind='right'`, whose only purpose is to KEEP those
+        rows, dropped them. Two matching left rows are needed to distinguish the correct
+        ordinal-keyed set from an index-keyed one."""
+        node = Join(id="j", left="l", right="u",
+                    on=Comparison("=", EventExpr("left", None, FieldRef("host")),
+                                  EventExpr("right", None, FieldRef("host"))),
+                    kind="right", unmatched="preserve_right", cardinality="many_to_many")
+        ir = graph(read("l"), read("r1"), read("r2"),
+                   SetOp(id="u", left="r1", right="r2", op="append"), node, emit("j"))
+        result = evaluate_ir(ir, Sample({
+            "l": [{"host": "a"}, {"host": "a"}],
+            "r1": [{"host": "a"}],
+            "r2": [{"host": "zz"}, {"host": "yy"}]}))
+        self.assertEqual(result.state, EvalState.EVALUATED, result.reason)
+        kept = {r.values.get("host") for r in result.rows}
+        self.assertEqual(kept, {"a", "zz", "yy"},
+                         "both unmatched right rows must survive a right outer join")
+        self.assertEqual(len(result.rows), 4, "two matches plus the two unmatched right rows")
+
+    # --- H2/A3: Row.side fabricated a value for a side that does not exist ---
+    def test_an_unmatched_row_has_no_value_for_the_side_that_never_matched(self):
+        result = evaluate_ir(
+            graph(read("l"), read("r"),
+                  Join(id="j", left="l", right="r",
+                       on=Comparison("=", EventExpr("left", None, FieldRef("host")),
+                                     EventExpr("right", None, FieldRef("host"))),
+                       kind="left", unmatched="preserve_left"),
+                  Derive(id="d", input="j",
+                         assignments=((FieldRef("right_host"),
+                                       EventExpr("right", None, FieldRef("host"))),)),
+                  emit("d")),
+            Sample({"l": [{"host": "LEFT-ONLY"}], "r": [{"host": "other"}]}))
+        self.assertEqual(result.state, EvalState.EVALUATED, result.reason)
+        self.assertEqual(dict(result.rows[0].values).get("right_host"), None,
+                         "the right side did not match, so its value is absent, not the left's")
+
+    def test_side_scoping_survives_more_than_one_node(self):
+        result = evaluate_ir(
+            graph(read("l"), read("r"),
+                  Join(id="j", left="l", right="r",
+                       on=Comparison("=", EventExpr("left", None, FieldRef("host")),
+                                     EventExpr("right", None, FieldRef("host")))),
+                  Derive(id="d1", input="j",
+                         assignments=((FieldRef("x"), Literal(1)),)),
+                  Derive(id="d2", input="d1",
+                         assignments=((FieldRef("h"), EventExpr("left", None,
+                                                               FieldRef("host"))),)),
+                  emit("d2")),
+            Sample({"l": [{"host": "a"}], "r": [{"host": "a"}]}))
+        self.assertEqual(result.state, EvalState.EVALUATED, result.reason)
+        self.assertEqual(dict(result.rows[0].values)["h"], "a")
+
+    # --- H4: Arith operator unvalidated ---
+    def test_an_unknown_arithmetic_operator_is_refused_not_evaluated_as_modulo(self):
+        """`Arith('^', 7, 3) > 0` silently evaluated 7 % 3 and MATCHED."""
+        result = evaluate([{"a": 7}], read(),
+                          Filter(id="f", input="r",
+                                 condition=Comparison(">", Arith("^", FieldExpr(FieldRef("a")),
+                                                                Literal(3)), Literal(0))),
+                          emit("f"))
+        self.assertEqual(result.reason.code, "UNKNOWN_ARITHMETIC_OPERATOR")
+
+    def test_an_unknown_operator_does_not_escape_as_a_zero_division(self):
+        result = evaluate([{"a": 7}], read(),
+                          Filter(id="f", input="r",
+                                 condition=Comparison(">", Arith("^", FieldExpr(FieldRef("a")),
+                                                                Literal(0)), Literal(0))),
+                          emit("f"))
+        self.assertIsNotNone(result.reason, "evaluate_ir must return a refusal, never raise")
+
+    # --- B2: Expand output was uncapped ---
+    def test_an_enormous_expand_is_refused_rather_than_exhausting_memory(self):
+        """One sample row holding a long array is ONE input row, so MAX_INPUT_ROWS gave no
+        protection at all. 374 MB was reachable from a single JSON array."""
+        node = Expand(id="x", input="r", field=FieldRef("ips"))
+        result = evaluate([{"ips": list(range(300_000))}], read(), node, emit("x"))
+        self.assertEqual(result.reason.code, "EXPAND_OUTPUT_TOO_LARGE")
+
+    # --- B1: join work was O(left x right) with no bound ---
+    def test_a_join_refuses_work_beyond_its_pair_budget(self):
+        node = Join(id="j", left="l", right="r",
+                    on=Comparison("=", EventExpr("left", None, FieldRef("k")),
+                                  EventExpr("right", None, FieldRef("k"))),
+                    cardinality="many_to_many")
+        rows = [{"k": i} for i in range(2000)]
+        result = evaluate_ir(graph(read("l"), read("r"), node, emit("j")),
+                             Sample({"l": rows, "r": rows}))
+        self.assertEqual(result.reason.code, "EVAL_JOIN_WORK_EXCEEDED")
+
+    # --- probe 6: a refusal message leaked sample VALUES ---
+    def test_no_refusal_message_contains_sample_content(self):
+        secret = "P@ssw0rd-Do-Not-Log"
+        node = Join(id="j", left="l", right="r",
+                    on=Comparison("=", EventExpr("left", None, FieldRef("host")),
+                                  EventExpr("right", None, FieldRef("host"))),
+                    collision="error")
+        result = evaluate_ir(graph(read("l"), read("r"), node, emit("j")),
+                             Sample({"l": [{"host": "a", "pw": secret}],
+                                     "r": [{"host": "a", "pw": "other"}]}))
+        self.assertEqual(result.reason.code, "JOIN_FIELD_COLLISION")
+        self.assertNotIn(secret, result.reason.message)
+        self.assertNotIn(secret, str(result.to_dict()))
+
+    # --- C3: a blank source name was accepted ---
+    def test_a_blank_source_name_is_refused_like_an_unresolved_one(self):
+        for name in ("   ", "\t\n"):
+            ir = graph(Read(id="r", selector=SourceSelector(name=name)), emit("r"))
+            result = evaluate_ir(ir, sample([{"a": 1}], "r"))
+            self.assertEqual(result.reason.code, "UNRESOLVED_SOURCE", repr(name))
+
+    # --- C1 (security): the invariant used truthiness ---
+    def test_the_not_evaluated_invariant_cannot_be_defeated_by_a_bool_override(self):
+        class LyingTuple(tuple):
+            def __bool__(self):
+                return False
+
+        with self.assertRaises(ValueError):
+            EvaluationResult(state=EvalState.NOT_EVALUATED, reason=object(),
+                             rows=LyingTuple((Row(values={"a": 1}, index=0),)))
+
+    # --- B3: RecursionError escaped evaluate_ir ---
+    def test_a_very_deep_expression_is_refused_not_crashed(self):
+        expr = Literal(True)
+        for _ in range(5000):
+            expr = BoolOp("not", (expr,))
+        result = evaluate([{"a": 1}], read(),
+                          Filter(id="f", input="r", condition=expr), emit("f"))
+        self.assertIs(result.verdict, Verdict.NOT_EVALUATED)
 
 
 class ShadowModeTests(unittest.TestCase):

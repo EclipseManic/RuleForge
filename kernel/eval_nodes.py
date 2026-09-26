@@ -246,6 +246,53 @@ _NEEDS_FIELD = frozenset({"count_distinct", "dcount", "min", "max", "sum", "avg"
 _ARG_EXTREME = frozenset({"arg_max", "arg_min"})
 
 
+def _collect_measure_values(rows: list[Row], measure: Any, ctx: EvalContext,
+                            require_field: bool) -> list[Any]:
+    """Rows admitted by `where`, mapped to the measure's field.
+
+    `where` is a Filter on the rows feeding THAT measure, so it obeys the same three-valued
+    rule: only True admits a row. The RAW value is tested rather than a booleanised helper,
+    because collapsing UNKNOWN to False here would silently turn "we cannot tell" into "it did
+    not match" and the unknown would never be counted.
+
+    With `require_field=False` (a fieldless `count()`) the sentinel is returned per admitted row
+    instead of a value, so `count()` counts ROWS and `count(field)` counts VALUES - the
+    distinction is the whole meaning of `count(f)`.
+    """
+    values: list[Any] = []
+    for row in rows:
+        if measure.where is not None:
+            verdict = evaluate(measure.where, row, ctx, None)
+            if verdict is None:
+                ctx.counts.measure_where_unknown += 1
+                continue
+            if verdict is not True:
+                continue
+        if not require_field:
+            values.append(_COUNT_SENTINEL)
+            continue
+        # `Measure.field` is a FieldRef, so the row lookup needs its NAME. Reading the
+        # FieldRef object itself as a key would silently yield ABSENT for every row, and
+        # every measure would collapse to zero.
+        value = row.get(measure.field.name)
+        if value is ABSENT or value is None:
+            continue
+        values.append(value)
+    return values
+
+
+class _CountSentinel:
+    """One admitted row of a fieldless count. Not a value; `count()` counts occurrences."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<row>"
+
+
+_COUNT_SENTINEL = _CountSentinel()
+
+
 def _aggregate_group(rows: list[Row], node: Aggregate, ctx: EvalContext,
                      scope: dict[str, Any]) -> None:
     for measure in node.measures:
@@ -264,30 +311,19 @@ def _aggregate_group(rows: list[Row], node: Aggregate, ctx: EvalContext,
                 f"measure {measure.name!r} uses {measure.function!r}, which requires a field",
                 measure.name)
         if measure.function == "count" and measure.field is None:
-            scope[measure.name] = len(rows)
+            # `count()` with no field counts ROWS - but it must still honour `where` and
+            # `distinct`. An earlier version short-circuited here and returned `len(rows)`
+            # unconditionally, so `Measure("Failed", "count", where=ok == False)` counted
+            # every row instead of the failing ones. That is the number an analyst tunes a
+            # threshold against, and it was silently wrong.
+            if measure.where is None and not measure.distinct:
+                scope[measure.name] = len(rows)
+                continue
+            scope[measure.name] = _reduce("count", _collect_measure_values(
+                rows, measure, ctx, require_field=False), measure.name, ctx)
             continue
 
-        values: list[Any] = []
-        for row in rows:
-            if measure.where is not None:
-                # A Measure's `where` is a Filter on the rows feeding THAT measure, so it obeys
-                # the same three-valued rule: only True admits a row. The RAW value is tested
-                # rather than a booleanised helper, because collapsing UNKNOWN to False here
-                # would silently turn "we cannot tell" into "it did not match" and the
-                # unknown would never be counted.
-                verdict = evaluate(measure.where, row, ctx, scope)
-                if verdict is None:
-                    ctx.counts.measure_where_unknown += 1
-                    continue
-                if verdict is not True:
-                    continue
-            # `Measure.field` is a FieldRef, so the row lookup needs its NAME. Reading the
-            # FieldRef object itself as a key would silently yield ABSENT for every row, and
-            # every measure would collapse to zero.
-            value = row.get(measure.field.name)
-            if value is ABSENT or value is None:
-                continue
-            values.append(value)
+        values = _collect_measure_values(rows, measure, ctx, require_field=True)
         if measure.distinct:
             seen: set = set()
             deduped = []
