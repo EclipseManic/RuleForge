@@ -23,12 +23,14 @@ from typing import Any
 
 from kernel.eval_errors import KERNEL_EVAL_CODES, EvaluationRefusal, not_evaluated
 from kernel.eval_expr import EvalContext, evaluate
-from kernel.eval_nodes import (DEFERRED_NODES, Sample, _aggregate_group, _check_frame,
-                               _resolve_time_field, _stamp, _windows)
+from kernel.eval_nodes import (DEFERRED_NODES, INEXPRESSIBLE_EXPAND_MODES, Sample,
+                               _aggregate_group, _check_frame, _resolve_time_field, _stamp,
+                               _windows)
+from kernel.eval_relational import _declared_time_field, _exec_join
 from kernel.eval_types import (ABSENT, MAX_CAVEATS, MAX_INPUT_ROWS, MAX_TRACE_SAMPLES, NODE_TYPES,
                                Caveat, EvalCounts, EvalState, EvaluationResult, NodeTrace, Row,
                                canonical, columns_of, primitive_of, row_key)
-from models.rule_ir import (Aggregate, Arrange, Derive, Emit, Filter, Pattern, Read, RuleIR,
+from models.rule_ir import (Aggregate, Arrange, Derive, Emit, Expand, Filter, Join, Pattern, Read, RuleIR,
                             RuleIRValidationError, SetOp, SourceSelector, validate_ir)
 
 _SET_OPS = frozenset({"union", "intersect", "except", "append", "except_both"})
@@ -191,6 +193,48 @@ def _exec_derive(node: Derive, rows: list[Row], ctx: EvalContext) -> list[Row]:
             values.pop(name, None)
         out.append(Row(values=values, index=row.index, time=row.time,
                        time_source=row.time_source))
+    return out
+
+
+def _exec_expand(node: Any, rows: list[Row], ctx: EvalContext,
+                 caveats: list[Caveat]) -> list[Row]:
+    """`unnest` only. `cross` and `generate` are refused as inexpressible, not approximated."""
+    if node.mode in INEXPRESSIBLE_EXPAND_MODES:
+        raise EvaluationRefusal(
+            "EXPAND_MODE_INEXPRESSIBLE",
+            f"Expand mode {node.mode!r} cannot be evaluated: "
+            f"{INEXPRESSIBLE_EXPAND_MODES[node.mode]}. The IR gap is the model's, not the "
+            f"kernel's, and approximating it would invent semantics.", node.id)
+    if node.mode != "unnest":
+        raise EvaluationRefusal("EXPAND_MODE_INEXPRESSIBLE",
+                                f"Expand mode {node.mode!r} is not implemented", node.id)
+
+    out: list[Row] = []
+    target = node.alias or node.field.name
+    for row in rows:
+        value = row.get(node.field.name)
+        if value is ABSENT or value is None:
+            # An absent or null list yields no rows, which is the same answer a SQL unnest
+            # gives. Counted, because "the field was not there" and "the list was empty" are
+            # different data problems.
+            ctx.counts.emit_column_absent += 1
+            continue
+        if isinstance(value, (str, bytes)) or not hasattr(value, "__iter__"):
+            raise EvaluationRefusal(
+                "EXPAND_VALUE_NOT_A_SEQUENCE",
+                f"Expand {node.id!r} expected {node.field.name!r} to hold a list but found a "
+                f"scalar; treating a scalar as a one-element list would invent a row", node.id)
+        items = list(value)
+        if not items:
+            continue
+        for item in items:
+            values = dict(row.values)
+            if node.alias:
+                # An alias renames: the original column goes away, as a SQL alias does.
+                values.pop(node.field.name, None)
+            values[target] = item
+            out.append(Row(values=values, index=row.index, time=row.time,
+                           time_source=row.time_source))
     return out
 
 
@@ -499,6 +543,19 @@ def evaluate_ir(ir: RuleIR, sample: Sample) -> EvaluationResult:
                     produced = _exec_setop(node, values[node.left], values[node.right],
                                            ctx, caveats)
                     detail = {"op": node.op, "all": node.all}
+                elif isinstance(node, Join):
+                    declared = set(sample.time_bindings.values())
+                    if node.match_window is not None:
+                        declared.add(_declared_time_field(node))
+                    produced = _exec_join(node, values[node.left], values[node.right],
+                                          ctx, caveats,
+                                          frozenset(f for f in declared if f))
+                    detail = {"kind": node.kind, "cardinality": node.cardinality,
+                              "collision": node.collision,
+                              "temporal": node.match_window is not None}
+                elif isinstance(node, Expand):
+                    produced = _exec_expand(node, values[node.input], ctx, caveats)
+                    detail = {"mode": node.mode, "field": node.field.name}
                 else:
                     produced, detail = _exec_scalar(node, values, node_by_id, ctx, caveats, sample)
                 values[node_id] = produced

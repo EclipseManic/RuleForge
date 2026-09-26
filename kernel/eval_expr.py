@@ -77,6 +77,20 @@ def _numeric(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _parse_clock(value: Any) -> Any:
+    """Epoch seconds from a raw value, or ABSENT. Never a bool, never a guess."""
+    if isinstance(value, bool) or value is None:
+        return ABSENT
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return ABSENT
+    return ABSENT
+
+
 # --------------------------------------------------------------------------
 # Kleene logic
 # --------------------------------------------------------------------------
@@ -147,14 +161,42 @@ def _evaluate(expr: Any, row: Row, ctx: EvalContext, scope: Any) -> Any:
         return value
 
     if isinstance(expr, TimeExpr):
-        return row.time if row.time is not None else ABSENT
+        # A time reference inside a join predicate must say WHICH side's clock it means.
+        # `FieldExpr` on the time field is the explicit form; a bare `TimeRef` is resolved
+        # against the sides FIRST, because the merged view always holds one side's value and
+        # would silently answer for both.
+        field = expr.time_ref.field_name
+        if field and row.sides is not None:
+            carriers = [name for name, side in row.sides.items() if field in side]
+            if len(carriers) == 1:
+                return _parse_clock(row.side(carriers[0])[field])
+            if len(carriers) > 1:
+                raise EvaluationRefusal(
+                    "TIME_SIDE_AMBIGUOUS",
+                    f"field {field!r} exists on both join sides, so a bare time reference does "
+                    f"not say which clock is meant; reference it through EventExpr instead",
+                    _where(expr))
+        value = row.get(field) if field else ABSENT
+        if value is ABSENT:
+            return ABSENT
+        return _parse_clock(value)
 
     if isinstance(expr, EventExpr):
-        # 3A is single-stream. An EventExpr names a side of a two-stream join, which is 3B.
-        raise EvaluationRefusal(
-            "EVAL_PHASE_NOT_IMPLEMENTED",
-            "EventExpr references a side of a multi-stream join, which phase 3A does not "
-            "execute", _where(expr), deferred_to="3B")
+        # Resolved against the NAMED side, never against the merged view. 3A refused these
+        # outright; 3B gives them meaning, and the meaning is exactly "this side's value", not
+        # "whichever side happened to have that field".
+        if expr.side not in ("left", "right"):
+            raise EvaluationRefusal(
+                "IR_UNSUPPORTED_CONSTRUCT",
+                f"EventExpr side {expr.side!r} names a pattern stage, which phase 3B does not "
+                f"execute; stage-scoped references belong to 3C", _where(expr),
+                deferred_to="3C")
+        if row.sides is None:
+            raise EvaluationRefusal(
+                "EVENT_SIDE_NOT_AVAILABLE",
+                f"an event-scoped reference to the {expr.side!r} side was used outside a "
+                f"two-input node, so there is no such side to read", _where(expr))
+        return row.side(expr.side).get(expr.ref.name, ABSENT)
 
     if isinstance(expr, InList):
         value = evaluate(expr.value, row, ctx, scope)

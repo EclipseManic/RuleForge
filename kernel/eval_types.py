@@ -109,18 +109,34 @@ class Row:
     is the row's position in the caller's supplied order and is the mandatory sort tie-break:
     a sort without a stable tie-break is not reproducible, and a non-reproducible evaluator is
     worse than no evaluator.
+
+    `sides` holds the pre-merge rows of a two-input node, keyed by side name ("left"/"right").
+    It exists so an `EventExpr` can say WHICH side it means. Without it, a joined row's `values`
+    is already a merge, and resolving `host` would be a guess between the two sources - the
+    same class of error as assuming a time field name. `None` for a single-source row.
     """
     values: Mapping[str, Any]
     index: int
     time: float | None = None
     time_source: str | None = None
+    sides: Mapping[str, Mapping[str, Any]] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "values", MappingProxyType(dict(self.values)))
+        if self.sides is not None:
+            object.__setattr__(self, "sides",
+                               MappingProxyType({k: MappingProxyType(dict(v))
+                                                 for k, v in self.sides.items()}))
 
     def get(self, name: str) -> Any:
         """The value, or ABSENT if the key is not present. Never returns None for absence."""
         return self.values.get(name, ABSENT)
+
+    def side(self, name: str) -> Mapping[str, Any]:
+        """One side's pre-merge values, or the row's own values when there is only one side."""
+        if self.sides is not None and name in self.sides:
+            return self.sides[name]
+        return self.values
 
     @property
     def columns(self) -> tuple[str, ...]:

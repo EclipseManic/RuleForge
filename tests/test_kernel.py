@@ -17,8 +17,8 @@ from kernel.eval_nodes import Sample
 from kernel.eval_types import (EvalState, EvaluationResult, Row, Verdict,
                                canonical, primitive_of, row_key)
 from models.rule_ir import (Aggregate, Arrange, BoolOp, Call, Comparison, Derive, Duration, Emit,
-                            FieldExpr, FieldRef, Filter, Frame, InList, Join, Literal, Measure,
-                            MeasureExpr, Pattern, Read, RuleIR, SetOp, SourceSelector, Stage,
+                            Arith, FieldExpr, EventExpr, Expand, FieldRef, Filter, Frame, InList, Join, Literal, Measure,
+                            MeasureExpr, Pattern, Read, RuleIR, SetOp, SourceSelector, Stage, TimeExpr,
                             TimeRef)
 
 SRC = SourceSelector(name="events")
@@ -410,23 +410,21 @@ class RefusalTests(unittest.TestCase):
     def _with(self, *nodes, output="o"):
         return evaluate_ir(graph(*nodes, output=output), sample([{"a": 1}], "r"))
 
-    def test_a_join_is_deferred_to_3b(self):
-        node = Join(id="j", left="r", right="r", on=Comparison("=", FieldExpr(FieldRef("a")),
-                                                               Literal(1)))
-        result = self._with(read(), node, emit("j"))
-        self.assertIs(result.verdict, Verdict.NOT_EVALUATED)
-        self.assertEqual(result.reason.code, "EVAL_PHASE_NOT_IMPLEMENTED")
-        self.assertEqual(result.reason.deferred_to, "3B")
-
     def test_a_pattern_is_deferred_to_3c(self):
         node = Pattern(id="p", stages=(Stage(id="s1", input="r"),), max_span=Duration(60))
         result = self._with(read(), node, emit("p"))
         self.assertEqual(result.reason.deferred_to, "3C")
 
+    def test_an_iterate_is_deferred_to_3c(self):
+        from models.rule_ir import Iterate
+        node = Iterate(id="it", input="r", step=Literal(1), until=Literal(True),
+                       max_iterations=3)
+        result = self._with(read(), node, emit("it"))
+        self.assertEqual(result.reason.deferred_to, "3C")
+
     def test_a_deferred_rule_costs_no_row_walk(self):
-        node = Join(id="j", left="r", right="r", on=Comparison("=", FieldExpr(FieldRef("a")),
-                                                               Literal(1)))
-        result = self._with(read(), node, emit("j"))
+        node = Pattern(id="p", stages=(Stage(id="s1", input="r"),), max_span=Duration(60))
+        result = self._with(read(), node, emit("p"))
         self.assertEqual(result.counts.rows_in, 0)
 
     def test_an_unresolved_source_is_refused(self):
@@ -575,6 +573,202 @@ class TraceTests(unittest.TestCase):
         result = evaluate([{"u": "a"}, {"u": "b"}], read(), emit("r"))
         emit_trace = [t for t in result.trace if t.node_id == "o"][0]
         self.assertTrue(all(isinstance(i, int) for i in emit_trace.samples))
+
+
+class JoinTests(unittest.TestCase):
+    """Two-input execution. Exact expected values, because a join is where a rule can
+    silently match the wrong events and still look plausible."""
+
+    LEFT = [{"host": "a", "t": 0}, {"host": "b", "t": 100}]
+    RIGHT = [{"host": "a", "ip": "10.0.0.1"}, {"host": "a", "ip": "10.0.0.2"}]
+
+    def _join(self, left_rows=None, right_rows=None, **kw):
+        node = Join(id="j", left="l", right="r",
+                    on=Comparison("=", EventExpr("left", None, FieldRef("host")),
+                                  EventExpr("right", None, FieldRef("host"))),
+                    **kw)
+        ir = graph(read("l"), read("r"), node, emit("j"))
+        return evaluate_ir(ir, Sample({"l": self.LEFT if left_rows is None else left_rows,
+                                       "r": self.RIGHT if right_rows is None else right_rows}))
+
+    def test_an_inner_join_keeps_only_matching_rows(self):
+        result = self._join()
+        self.assertEqual([dict(r.values) for r in result.rows],
+                         [{"host": "a", "t": 0, "ip": "10.0.0.1"},
+                          {"host": "a", "t": 0, "ip": "10.0.0.2"}])
+
+    def test_the_declared_one_to_many_cardinality_duplicates_the_left_row(self):
+        """Two right rows for one left row produce two output rows - the default, not a bug."""
+        result = self._join(cardinality="one_to_many")
+        self.assertEqual(len(result.rows), 2)
+
+    def test_a_one_to_one_declaration_that_matches_twice_is_refused(self):
+        """Keeping the first would be a guess; keeping both would contradict the declaration."""
+        result = self._join(cardinality="one_to_one")
+        self.assertIs(result.verdict, Verdict.NOT_EVALUATED)
+        self.assertEqual(result.reason.code, "JOIN_CARDINALITY_VIOLATION")
+
+    def test_a_left_join_preserves_an_unmatched_left_row(self):
+        result = self._join(kind="left", unmatched="preserve_left")
+        self.assertEqual(len(result.rows), 3, "two matches plus the unmatched host b")
+        self.assertEqual(dict(result.rows[-1].values), {"host": "b", "t": 100})
+
+    def test_a_left_anti_join_emits_only_the_rows_with_no_match(self):
+        result = self._join(kind="left_anti", unmatched="drop")
+        self.assertEqual([dict(r.values) for r in result.rows], [{"host": "b", "t": 100}])
+
+    def test_a_right_anti_join_emits_only_the_unmatched_right_rows(self):
+        result = self._join(right_rows=[{"host": "z", "ip": "1"}], kind="right_anti",
+                            unmatched="drop")
+        self.assertEqual([dict(r.values) for r in result.rows], [{"host": "z", "ip": "1"}])
+
+    def test_a_full_outer_join_is_refused_because_unmatched_cannot_express_both(self):
+        result = self._join(kind="full")
+        self.assertEqual(result.reason.code, "JOIN_KIND_INEXPRESSIBLE")
+        self.assertIn("preserve unmatched rows from BOTH sides", result.reason.message)
+
+    def test_a_contradictory_kind_and_unmatched_pairing_is_refused(self):
+        result = self._join(kind="left", unmatched="drop")
+        self.assertEqual(result.reason.code, "JOIN_KIND_UNMATCHED_CONTRADICTION")
+        self.assertIn("will not honour one field", result.reason.message)
+
+    def test_a_shared_name_with_equal_values_is_not_a_collision(self):
+        """The field a join is keyed on is on BOTH sides by definition.
+
+        Treating that as a collision would make the default `error` policy refuse essentially
+        every join, firing on the normal case rather than the exceptional one.
+        """
+        result = self._join(collision="error")
+        self.assertEqual(result.state, EvalState.EVALUATED, result.reason)
+
+    def test_a_shared_name_with_differing_values_is_a_collision(self):
+        result = self._join(left_rows=[{"host": "a", "v": 1}],
+                            right_rows=[{"host": "a", "v": 2}], collision="error")
+        self.assertEqual(result.reason.code, "JOIN_FIELD_COLLISION")
+        self.assertIn("DIFFERENT values", result.reason.message)
+
+    def test_keep_left_resolves_a_collision_by_keeping_the_left_value(self):
+        result = self._join(left_rows=[{"host": "a", "v": 1}],
+                            right_rows=[{"host": "a", "v": 2}], collision="keep_left")
+        self.assertEqual(dict(result.rows[0].values)["v"], 1)
+
+    def test_a_shared_name_not_referenced_by_the_predicate_is_merged_when_equal(self):
+        """The equal-values rule, isolated from the side-scoped rule.
+
+        `env` appears on both rows but is not referenced in `on`, so it is not side-scoped.
+        Equal values merge; differing values are a real conflict. Without this, the
+        equal-values branch is unreachable for any field the predicate does not mention.
+        """
+        equal = self._join(left_rows=[{"host": "a", "env": "prod"}],
+                           right_rows=[{"host": "a", "env": "prod"}], collision="error")
+        self.assertEqual(equal.state, EvalState.EVALUATED, equal.reason)
+        self.assertEqual(dict(equal.rows[0].values)["env"], "prod")
+
+        differing = self._join(left_rows=[{"host": "a", "env": "prod"}],
+                               right_rows=[{"host": "a", "env": "dev"}], collision="error")
+        self.assertEqual(differing.reason.code, "JOIN_FIELD_COLLISION")
+
+    def test_a_temporal_window_without_a_temporal_predicate_is_refused(self):
+        """Symmetric and asymmetric are different rules, so the kernel will not imply one."""
+        result = self._join(match_window=Duration(600))
+        self.assertEqual(result.reason.code, "JOIN_TEMPORAL_WINDOW_WITHOUT_PREDICATE")
+        self.assertIn("different rules", result.reason.message)
+
+    def test_a_temporal_window_with_a_temporal_predicate_is_accepted_and_declared(self):
+        """The explicit form: each side's clock named through EventExpr.
+
+        A BARE TimeRef is refused as ambiguous when both sides carry the field, because
+        left.t <= right.t + W is undecidable without knowing which clock is which.
+        """
+        def side_time(which):
+            return EventExpr(which, None, FieldRef("t"))
+
+        node = Join(id="j", left="l", right="r",
+                    on=BoolOp("and", (
+                        Comparison("=", EventExpr("left", None, FieldRef("host")),
+                                   EventExpr("right", None, FieldRef("host"))),
+                        # left.t <= right.t <= left.t + 600. Writing ONLY the upper bound
+                        # would also match a right event that happened long BEFORE the left
+                        # one, which is a different rule entirely.
+                        Comparison(">=", side_time("right"), side_time("left")),
+                        Comparison("<=", side_time("right"),
+                                   Arith("+", side_time("left"), Literal(600))))),
+                    match_window=Duration(600))
+        ir = graph(read("l"), read("r"), node, emit("j"))
+        result = evaluate_ir(ir, Sample({
+            "l": [{"host": "a", "t": 0}, {"host": "a", "t": 10_000}],
+            "r": [{"host": "a", "t": 5}, {"host": "a", "t": 9_000}]},
+            time_bindings={"l": "t", "r": "t"}))
+        self.assertEqual(result.state, EvalState.EVALUATED, result.reason)
+        self.assertIn("JOIN_TEMPORAL_BOUNDARY_INCLUSIVE", result.caveat_codes())
+        self.assertEqual(len(result.rows), 1, "only the 0/5 pair is within 600 seconds")
+        self.assertIn("JOIN_SIDE_SCOPED_FIELDS_NOT_MERGED", result.caveat_codes())
+
+    def test_a_merged_row_keeps_both_sides_addressable(self):
+        """EventExpr must resolve to a NAMED side, not to whichever side had the field."""
+        result = self._join(left_rows=[{"host": "a", "marker": "LEFT"}],
+                            right_rows=[{"host": "a", "marker": "RIGHT"}],
+                            collision="keep_left")
+        row = result.rows[0]
+        self.assertEqual(row.side("left")["marker"], "LEFT")
+        self.assertEqual(row.side("right")["marker"], "RIGHT")
+        self.assertEqual(row.values["marker"], "LEFT", "the merged view follows collision")
+
+    def test_a_bare_time_reference_ambiguous_across_sides_is_refused(self):
+        node = Join(id="j", left="l", right="r",
+                    on=Comparison("=", TimeExpr(TimeRef(field_name="t")),
+                                  TimeExpr(TimeRef(field_name="t"))))
+        ir = graph(read("l"), read("r"), node, emit("j"))
+        result = evaluate_ir(ir, Sample({"l": [{"t": 1}], "r": [{"t": 1}]}))
+        self.assertEqual(result.reason.code, "TIME_SIDE_AMBIGUOUS")
+
+    def test_an_event_scoped_reference_outside_a_two_input_node_is_refused(self):
+        """The kernel validator catches this first, and its code is the more specific one."""
+        node = Filter(id="f", input="r",
+                      condition=Comparison("=", EventExpr("left", None, FieldRef("host")),
+                                           Literal("a")))
+        result = evaluate([{"host": "a"}], read(), node, emit("f"))
+        self.assertIs(result.verdict, Verdict.NOT_EVALUATED)
+        self.assertEqual(result.reason.code, "EVENT_REF_OUT_OF_SCOPE")
+
+
+class ExpandTests(unittest.TestCase):
+    def _expand(self, rows, mode="unnest", field="ips"):
+        node = Expand(id="x", input="r", field=FieldRef(field), mode=mode)
+        return evaluate(rows, read(), node, emit("x"))
+
+    def test_unnest_produces_one_row_per_element(self):
+        result = self._expand([{"u": "a", "ips": ["1", "2", "3"]}])
+        self.assertEqual([r.values["ips"] for r in result.rows], ["1", "2", "3"])
+
+    def test_an_absent_list_produces_no_rows_and_is_counted(self):
+        result = self._expand([{"u": "a"}])
+        self.assertIs(result.verdict, Verdict.NO_MATCH)
+        self.assertEqual(result.counts.emit_column_absent, 1)
+
+    def test_an_empty_list_produces_no_rows(self):
+        result = self._expand([{"u": "a", "ips": []}])
+        self.assertIs(result.verdict, Verdict.NO_MATCH)
+
+    def test_a_scalar_where_a_list_was_expected_is_refused_not_wrapped(self):
+        """Treating a scalar as a one-element list would invent a row that never existed."""
+        result = self._expand([{"u": "a", "ips": "10.0.0.1"}])
+        self.assertEqual(result.reason.code, "EXPAND_VALUE_NOT_A_SEQUENCE")
+
+    def test_cross_is_refused_because_expand_has_no_second_operand(self):
+        result = self._expand([{"ips": ["1"]}], mode="cross")
+        self.assertEqual(result.reason.code, "EXPAND_MODE_INEXPRESSIBLE")
+        self.assertIn("no second operand", result.reason.message)
+
+    def test_generate_is_refused_because_expand_has_nothing_to_generate_from(self):
+        result = self._expand([{"ips": ["1"]}], mode="generate")
+        self.assertEqual(result.reason.code, "EXPAND_MODE_INEXPRESSIBLE")
+
+    def test_an_alias_redirects_the_expanded_column(self):
+        node = Expand(id="x", input="r", field=FieldRef("ips"), alias="ip")
+        result = evaluate([{"ips": ["1"]}], read(), node, emit("x"))
+        self.assertEqual(dict(result.rows[0].values)["ip"], "1")
+        self.assertNotIn("ips", result.rows[0].values)
 
 
 class ShadowModeTests(unittest.TestCase):

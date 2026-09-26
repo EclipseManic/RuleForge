@@ -38,10 +38,16 @@ from models.rule_ir import (AGGREGATE_FUNCTIONS, Aggregate, Frame)
 #: Constructs that exist in the IR but are NOT executed by 3A, mapped to the phase that owns
 #: them. Checked at pre-flight so a deferred rule never costs a row walk.
 DEFERRED_NODES: Mapping[str, str] = {
-    "Join": "3B",
-    "Expand": "3B",
     "Pattern": "3C",
     "Iterate": "3C",
+}
+
+#: Expand modes the model declares but cannot express. `Expand` carries a single `input` and no
+#: second operand, so `cross` has nothing to cross with and `generate` has nothing to generate
+#: from. Reported as an IR gap rather than approximated.
+INEXPRESSIBLE_EXPAND_MODES: Mapping[str, str] = {
+    "cross": "Expand declares one input and no second operand",
+    "generate": "Expand declares no parameters to generate from",
 }
 
 _FRAME_KINDS = frozenset({"tumbling", "sliding", "session", "per_event", "cumulative"})

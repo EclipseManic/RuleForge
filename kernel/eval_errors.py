@@ -57,6 +57,20 @@ KERNEL_EVAL_CODES: frozenset[str] = frozenset({
     # --- representable, but this phase does not execute it -------------------
     "EVAL_PHASE_NOT_IMPLEMENTED",
 
+    # --- two-input execution (3B) --------------------------------------------
+    "JOIN_KIND_INEXPRESSIBLE",
+    "UNKNOWN_JOIN_KIND",
+    "JOIN_KIND_UNMATCHED_CONTRADICTION",
+    "JOIN_TEMPORAL_WINDOW_WITHOUT_PREDICATE",
+    "JOIN_CARDINALITY_VIOLATION",
+    "JOIN_FIELD_COLLISION",
+    "EVENT_SIDE_NOT_AVAILABLE",
+    "EVENT_REF_OUT_OF_SCOPE",
+    "TIME_SIDE_AMBIGUOUS",
+    "EXPAND_MODE_INEXPRESSIBLE",
+    "EXPAND_VALUE_NOT_A_SEQUENCE",
+    "EVAL_OUTPUT_TOO_LARGE",
+
     # --- our model cannot represent it, or cannot be trusted here -----------
     "IR_UNSUPPORTED_CONSTRUCT",
     "IR_UNSUPPORTED_PARAMETERS",
