@@ -83,30 +83,22 @@ class Row:
     uncertain: dict[str, str] = dc_field(default_factory=dict)
 
     def get(self, name: str) -> Any:
-        """Read a TOP-LEVEL field. NOT a general field lookup.
+        """Read a field. Delegates to the ONE resolver, and so keeps its order.
 
-        This used to be called as though it were one, at seven sites that all
-        wanted a field by name -- including `time_field`, which is a DOTTED name
-        for every vendor that uses one. It only ever looks in the top level, so
-        `win.system.eventID` came back ABSENT on a nested row -- the exact shape
-        Wazuh's own decoder produces, and the exact divergence `resolve_field`
-        was corrected for. `eval_package` read its GROUP value through
-        `resolve_field` and its TIME through this, so one row was read two ways.
+        `resolve_field` tries the NESTED walk first and falls back to a literal
+        dotted key, because that is how the agents that produce these rows
+        deliver them. This used to check the literal key FIRST, so a row holding
+        both shapes -- `{"call.payload": "FLAT", "call": {"payload": "NESTED"}}` --
+        answered `FLAT` here and `NESTED` through `resolve_field`. One row, two
+        values, and this one sits on the correlation grouping and timeframe path.
 
-        Nested lookups go through `nodes.resolve_field`. The lazy import avoids a
-        cycle: `ir` is fully loaded by the time this is called.
+        So the order is the resolver's order, not a second opinion about it.
         """
-        if name in self.values:
-            return self.values[name]
-        if "." in name:
-            from .nodes import resolve_field
-            # SPLIT THE DOTTED NAME. Passing `FieldRef("a.b.c")` -- the whole
-            # string as `name` with no path -- did not work, because the resolver
-            # then looks up the literal key `"a.b.c"` and a nested row has no
-            # such key. The split is what makes the nested walk happen.
-            parts = name.split(".")
-            return resolve_field(self, FieldRef(parts[0], tuple(parts[1:])))
-        return ABSENT
+        if not isinstance(name, str) or not name:
+            return ABSENT
+        from .nodes import resolve_field
+        parts = name.split(".")
+        return resolve_field(self, FieldRef(parts[0], tuple(parts[1:])))
 
     def merged_with(self, other: "Row", left_prefix: str, right_prefix: str) -> "Row":
         """Combine two rows, prefixing so field names cannot collide.

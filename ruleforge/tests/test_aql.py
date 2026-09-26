@@ -8,14 +8,10 @@ tested nothing about the tool.
 
 from __future__ import annotations
 
-import pathlib
-import sys
 import unittest
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
-
-from ruleforge.dialects import cre_from_ir, lower_aql, parse_aql, render_aql  # noqa: E402
-from ruleforge.engine import Verdict, evaluate  # noqa: E402
+from ruleforge.dialects import cre_from_ir, lower_aql, parse_aql, render_aql  
+from ruleforge.engine import Verdict, evaluate  
 
 # Verbatim, including the operator-precedence problem.
 USER_QRADAR_RULE = """

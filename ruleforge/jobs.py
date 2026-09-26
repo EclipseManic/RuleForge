@@ -50,6 +50,7 @@ from .dialects import (
     render_yaral,
 )
 from .engine import evaluate
+from .engine.validate import validate_graph
 from .engine.values import Refusal
 
 #: Dialect key -> everything needed for that dialect. ONE TABLE, so the web layer
@@ -220,6 +221,20 @@ def author(dialect: str, text: str, rule_id: str = "rule",
             "code": refusal.code,
             "message": refusal.message,
             "stage": getattr(refusal, "stage", "") or "",
+        })
+
+    # VALIDATE BEFORE DESCRIBING. The `author` path used to skip this entirely,
+    # so `MAX_NODES` -- which lives only in `validate_graph` -- was never enforced
+    # here: a huge paste was lowered, walked, and serialised into the response
+    # before anything looked at its size. Validation is the cheap check that
+    # says no first.
+    try:
+        validate_graph(ir)
+    except Refusal as refusal:
+        return Outcome(ok=False, refusal={
+            "code": refusal.code,
+            "message": refusal.message,
+            "stage": "validation",
         })
 
     findings: list[Finding] = []
@@ -562,6 +577,26 @@ def debug_logs_to_rule(dialect: str, events: list[dict[str, Any]],
     return Outcome(ok=True, findings=findings, result={"fields": summary})
 
 
+#: How many events a behavioural pass will consider. An 8 MB request body is
+#: about 2.8 million minimal JSON objects, which parsed in 33 seconds and held
+#: 194 MB before a single row was evaluated -- and the analyst pasted a log
+#: sample, not a data export. Refusing by name beats accepting it and appearing
+#: to hang.
+MAX_EVENTS = 50_000
+
+
+def _cap_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if len(events) <= MAX_EVENTS:
+        return events
+    raise Refusal(
+        "TOO_MANY_EVENTS",
+        f"that is {len(events):,} events, over the {MAX_EVENTS:,} this will "
+        f"evaluate at once. It parsed in memory before any of it was checked, so "
+        f"a large paste costs you the wait and then the refusal. Sample the "
+        f"events that matter -- a few hundred is usually enough to see whether a "
+        f"rule fires.", "ruleforge")
+
+
 def load_events(raw: str) -> list[dict[str, Any]]:
     """Parse pasted events. JSON array, or one JSON object per line.
 
@@ -593,17 +628,17 @@ def load_events(raw: str) -> list[dict[str, Any]]:
                               f"an object. Each line must be one event.",
                               "ruleforge")
             rows.append(parsed)
-        return rows
+        return _cap_events(rows)
 
     if isinstance(data, dict):
-        return [data]
+        return _cap_events([data])
     if isinstance(data, list):
         for index, row in enumerate(data):
             if not isinstance(row, dict):
                 raise Refusal("EVENTS_NOT_AN_OBJECT",
                               f"entry {index} is a {type(row).__name__}, not an "
                               f"object", "ruleforge")
-        return data
+        return _cap_events(data)
     raise Refusal("EVENTS_NOT_EVENTS",
                   f"expected a JSON array or object, got {type(data).__name__}",
                   "ruleforge")

@@ -12,9 +12,7 @@ import sys
 import unittest
 from decimal import Decimal
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
-
-from ruleforge.engine import (  # noqa: E402
+from ruleforge.engine import (  
     ABSENT,
     UNDECIDED,
     Aggregate,
@@ -542,13 +540,37 @@ class SerialisationTests(unittest.TestCase):
 class StandaloneTests(unittest.TestCase):
     """This tool must not depend on the project it sits inside."""
 
-    def test_the_engine_imports_nothing_from_the_parent_project(self):
+    #: The ONLY absolute-import roots RuleForge is allowed. Anything else is the
+    #: parent project leaking in, or a dependency nobody declared.
+    #:
+    #: THIS IS AN ALLOWLIST, NOT A DENYLIST, AND THAT IS THE WHOLE POINT. The
+    #: earlier version banned twelve names -- and so missed `storage`,
+    #: `parsers`, `evaluator`, `safe_yaml` and every other real parent module,
+    #: while listing four that do not exist. It also scanned only `engine/`, which
+    #: is 22% of the package: `jobs.py`, `web.py` and all ten dialect modules were
+    #: exempt, so a new dialect could import the parent freely and stay green.
+    #:
+    #: An allowlist cannot be bypassed by a module nobody thought of.
+    ALLOWED_IMPORT_ROOTS = frozenset(sys.stdlib_module_names) | {"flask", "ruleforge"}
+
+    #: The ONLY two files permitted to touch `sys.path`, and both are guarded.
+    #:
+    #: `conftest.py` is the single sanctioned place: it adds the repo root ONLY if
+    #: `ruleforge` is not already importable, so running the suite normally adds
+    #: nothing. `mutation_check.py` does it under `if __name__ == "__main__"`, so
+    #: it works as `python ruleforge/mutation_check.py` without affecting an
+    #: import. Anything else doing this puts the parent tree on the path for the
+    #: whole session, which is the failure these tests exist to prevent.
+    PATH_MUTATION_EXEMPT = frozenset({"conftest.py", "mutation_check.py"})
+
+    def _package_files(self) -> list[pathlib.Path]:
+        return sorted(pathlib.Path(__file__).resolve().parent.parent
+                      .rglob("*.py"))
+
+    def test_nothing_imports_the_parent_project(self):
         import ast
-        engine_dir = pathlib.Path(__file__).resolve().parent.parent / "engine"
-        banned = {"rule_engine", "correlation", "pipeline", "detection_model",
-                  "app", "explainer", "validators", "sigma_compiler",
-                  "models", "kernel", "models.rule_ir", "kernel.eval"}
-        for path in engine_dir.rglob("*.py"):
+        checked = 0
+        for path in self._package_files():
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):
                 names: list[str] = []
@@ -557,12 +579,28 @@ class StandaloneTests(unittest.TestCase):
                 elif isinstance(node, ast.ImportFrom) and not node.level:
                     names = [node.module or ""]
                 for name in names:
+                    if not name:
+                        continue
                     root = name.split(".")[0]
-                    self.assertNotIn(
-                        root, banned,
-                        f"{path.name} imports {name}; RuleForge is standalone")
+                    checked += 1
+                    self.assertIn(
+                        root, self.ALLOWED_IMPORT_ROOTS,
+                        f"{path.relative_to(path.parents[1])} imports {name!r}. "
+                        f"RuleForge is standalone: the only permitted roots are "
+                        f"the standard library, flask, and itself. Anything else "
+                        f"is the parent project or an undeclared dependency.")
+        self.assertGreater(checked, 40, "the scan found suspiciously little")
 
-    def test_the_engine_never_widens_the_import_path(self):
+    def test_every_module_in_the_package_is_covered(self):
+        """A guard that quietly stops covering new code is worse than none."""
+        files = self._package_files()
+        self.assertGreater(len(files), 25,
+                           f"only found {len(files)} modules; expected the whole "
+                           f"package")
+        for path in files:
+            self.assertIn("ruleforge", str(path).replace("\\", "/"))
+
+    def test_nothing_widens_the_import_path(self):
         """Guard against a future 'just import the parent's helpers' shortcut.
 
         Matches `sys.path` specifically rather than any attribute ending in
@@ -570,8 +608,9 @@ class StandaloneTests(unittest.TestCase):
         and flagging it would make this test useless.
         """
         import ast
-        engine_dir = pathlib.Path(__file__).resolve().parent.parent / "engine"
-        for path in engine_dir.rglob("*.py"):
+        for path in self._package_files():
+            if path.name in self.PATH_MUTATION_EXEMPT:
+                continue
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Attribute):
@@ -583,6 +622,67 @@ class StandaloneTests(unittest.TestCase):
                     self.fail(f"{path.name} touches sys.path at line {node.lineno}; "
                               f"RuleForge is standalone and has no business widening "
                               f"the import path")
+
+    def test_the_two_exempt_files_are_actually_guarded(self):
+        """An exemption that grows is how a denylist becomes useless.
+
+        Both exempt files must keep their `sys.path` write INSIDE a guard -- an
+        import-time insert in `conftest.py` would put the parent tree on the path
+        for every test whether or not the suite was run from the repo root.
+        """
+        import ast
+        root = pathlib.Path(__file__).resolve().parent.parent
+        for name in sorted(self.PATH_MUTATION_EXEMPT):
+            path = root / name
+            if not path.exists():
+                path = root / "tests" / name
+            source = path.read_text(encoding="utf-8")
+            tree = ast.parse(source)
+            inserts = [n for n in ast.walk(tree)
+                       if isinstance(n, ast.Call)
+                       and isinstance(n.func, ast.Attribute)
+                       and n.func.attr == "insert"]
+            self.assertTrue(inserts, f"{name} no longer needs its exemption")
+            for node in inserts:
+                # A GUARD IS DETECTED BY LINE RANGE, not by parent links: `ast`
+                # nodes carry no `_parent`, so walking for one silently finds
+                # nothing and every insert looks unguarded.
+                line = node.lineno
+                guarded = False
+                for candidate in ast.walk(tree):
+                    if not isinstance(candidate, (ast.If, ast.Try)):
+                        continue
+                    start = getattr(candidate, "lineno", line)
+                    end = getattr(candidate, "end_lineno", start) or start
+                    if start <= line <= end:
+                        guarded = True
+                        break
+                self.assertTrue(
+                    guarded,
+                    f"{name} inserts into sys.path at line {line} with no guard; "
+                    f"an unconditional insert puts the parent project's modules "
+                    f"on the path for the whole session")
+
+    def test_the_tests_themselves_do_not_reach_into_the_parent(self):
+        """Six test files did `sys.path.insert(repo_root)`, which puts the parent
+        tree on the import path for the whole suite. That is how a standalone
+        tool stops being standalone without any import statement changing."""
+        import ast
+        for path in self._package_files():
+            if "tests" not in path.parts:
+                continue
+            if path.name in self.PATH_MUTATION_EXEMPT:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr in ("insert", "append")
+                        and isinstance(node.func.value, ast.Attribute)
+                        and node.func.value.attr == "path"):
+                    self.fail(f"{path.name} manipulates sys.path at line "
+                              f"{node.lineno}; the parent tree must never be "
+                              f"reachable from this suite")
 
 
 if __name__ == "__main__":

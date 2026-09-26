@@ -1,4 +1,4 @@
-﻿"""Tests for the defects the SECOND review round found, after the first fixes.
+"""Tests for the defects the SECOND review round found, after the first fixes.
 
 Both reviewers independently found the two worst of these. That is worth noting:
 376 green tests plus a clean ruff did not catch a rule that rendered with OR

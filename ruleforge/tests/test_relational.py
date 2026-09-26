@@ -9,13 +9,9 @@ silently.
 
 from __future__ import annotations
 
-import pathlib
-import sys
 import unittest
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
-
-from ruleforge.engine import (  # noqa: E402
+from ruleforge.engine import (  
     ABSENT,
     Aggregate,
     Comparison,
@@ -37,9 +33,9 @@ from ruleforge.engine import (  # noqa: E402
     Verdict,
     evaluate,
 )
-from ruleforge.engine.ir import Call  # noqa: E402
-from ruleforge.engine.run import EVALUATORS  # noqa: E402
-from ruleforge.engine.ir import NODE_TYPES  # noqa: E402
+from ruleforge.engine.ir import Call  
+from ruleforge.engine.run import EVALUATORS  
+from ruleforge.engine.ir import NODE_TYPES  
 
 SRC = SourceSelector(name="events")
 

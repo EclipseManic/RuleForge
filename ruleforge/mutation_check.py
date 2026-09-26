@@ -14,7 +14,12 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT))
+# Only when run AS A SCRIPT (`python ruleforge/mutation_check.py`). When imported
+# -- including by the test suite, which must never put the parent project's tree
+# on the path -- the package is already importable and this does nothing. The
+# unconditional version put the parent tree on sys.path for the whole session.
+if __name__ == "__main__" and str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 MUTATIONS = [
     ("M1  NOT UNDECIDED returns True", "engine/values.py",

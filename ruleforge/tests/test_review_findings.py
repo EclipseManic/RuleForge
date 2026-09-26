@@ -13,13 +13,9 @@ closes the largest part of that gap.
 
 from __future__ import annotations
 
-import pathlib
-import sys
 import unittest
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
-
-from ruleforge.engine import (  # noqa: E402
+from ruleforge.engine import (  
     Duration,
     Emit,
     FieldExpr,
@@ -35,7 +31,7 @@ from ruleforge.engine import (  # noqa: E402
     Verdict,
     evaluate,
 )
-from ruleforge.engine.ir import BoolOp, Comparison as Cmp, Not  # noqa: E402
+from ruleforge.engine.ir import BoolOp, Comparison as Cmp, Not  
 
 SRC = SourceSelector(name="events")
 
@@ -270,9 +266,24 @@ class RegexHonestyTests(unittest.TestCase):
 
     def test_a_lookaround_is_refused_rather_than_evaluated(self):
         from ruleforge.engine.regex import compile_pattern
+        # The CODE is asserted, not just that a Refusal happened. A lookaround
+        # was briefly being refused for catastrophic backtracking -- because the
+        # ReDoS check read the `?` of `(?=` as a quantifier -- and the test still
+        # passed, because it only checked that SOMETHING was refused. The
+        # mutation check is what noticed: with the real `(?` guard mutated away,
+        # the suite stayed green.
         for pattern in ("(?<=a)b", "(?=a)b", "(?!a)b", "(?P<n>a)", "(?m)a.b"):
-            with self.assertRaises(Refusal, msg=f"{pattern} was not refused"):
+            with self.assertRaises(Refusal, msg=f"{pattern} was not refused") as c:
                 compile_pattern("posix_extended", pattern)
+            self.assertEqual(c.exception.code, "REGEX_DIALECT_SPECIFIC",
+                             f"{pattern} was refused for the wrong reason")
+
+    def test_a_lookaround_is_not_mistaken_for_a_nested_quantifier(self):
+        """`(?` is a group modifier. A `?` there must not read as a quantifier."""
+        from ruleforge.engine.regex import _nested_quantifier
+        for pattern in ("(?i)abc", "(?=x)y", "(?<=a)b", "(?:x)y", "(?P<n>a)"):
+            self.assertIsNone(_nested_quantifier(pattern),
+                              f"{pattern} was read as a nested quantifier")
 
     def test_a_backslash_escape_is_refused_rather_than_evaluated(self):
         from ruleforge.engine.regex import compile_pattern

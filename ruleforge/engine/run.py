@@ -178,9 +178,28 @@ def evaluate(ir: RuleIR, rows: Any = None, *,
 
 
 def _as_time(row: dict[str, Any], time_field: str | None) -> Any:
+    """The row's timestamp, resolved the SAME WAY every other field is.
+
+    This was `row.get(time_field)` on a RAW dict, so it only ever found a
+    top-level key. A row whose timestamp is nested -- `{"ts": {"now": 5}}` with
+    `time_field="ts.now"` -- resolved to None, every window came out empty, and a
+    correlation returned zero rows and `not_evaluated` while looking like a rule
+    that simply found nothing. `Row.get` was corrected to walk nested paths; this
+    was the same bug one layer up, on a different type.
+    """
     if time_field is None:
         return None
-    return row.get(time_field)
+    if time_field in row:
+        return row[time_field]
+    if isinstance(time_field, str) and "." in time_field:
+        parts = time_field.split(".")
+        current: Any = row
+        for part in parts:
+            if not isinstance(current, dict) or part not in current:
+                return None
+            current = current[part]
+        return current
+    return None
 
 
 def _prepare(ir: RuleIR, ids: dict[str, Any], rows: Any,

@@ -8,16 +8,12 @@ comparison of two joined columns.
 
 from __future__ import annotations
 
-import pathlib
-import sys
 import unittest
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
+from ruleforge.dialects import lower_kql, parse_kql  
+from typing import Any  
 
-from ruleforge.dialects import lower_kql, parse_kql  # noqa: E402
-from typing import Any  # noqa: E402
-
-from ruleforge.engine import (  # noqa: E402
+from ruleforge.engine import (  
     Aggregate,
     Join,
     Refusal,
@@ -26,7 +22,7 @@ from ruleforge.engine import (  # noqa: E402
     evaluate,
     validate_graph,
 )
-from ruleforge.engine.ir import BoolOp  # noqa: E402
+from ruleforge.engine.ir import BoolOp  
 
 USER_SENTINEL_RULE = """
 let timeframe = 30m;

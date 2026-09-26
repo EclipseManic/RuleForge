@@ -8,22 +8,18 @@ every logon regardless of whether any credential access happened.
 
 from __future__ import annotations
 
-import pathlib
-import sys
 import unittest
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
-
-from ruleforge.dialects.yaral import parse_yaral  # noqa: E402
-from ruleforge.dialects.yaral_ir import lower, render  # noqa: E402
-from ruleforge.engine import (  # noqa: E402
+from ruleforge.dialects.yaral import parse_yaral  
+from ruleforge.dialects.yaral_ir import lower, render  
+from ruleforge.engine import (  
     Pattern,
     Refusal,
     Verdict,
     evaluate,
     validate_graph,
 )
-from ruleforge.engine.ir import Call  # noqa: E402
+from ruleforge.engine.ir import Call  
 
 USER_YARAL_RULE = """
 rule CredentialAccess_NTLM_LateralMovement {

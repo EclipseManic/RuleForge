@@ -676,6 +676,16 @@ class Derive:
     id: str
     input: str
     assignments: tuple[tuple[str, Any], ...]
+    #: Does this REPLACE the row or ADD to it? `project` replaces, `extend` adds.
+    #:
+    #: THIS IS DATA, NOT A NAME. Both renderers used to re-derive it by matching
+    #: the node id -- `id.rsplit("_", 2)[-2] == "project"` -- which is the exact
+    #: mistake the Join prefix fix was made to undo: a second source of truth
+    #: about what a node means, derived by string-matching an identifier that
+    #: another module happens to mint. `wazuh_render`'s copy only ever saw nodes
+    #: built by `kql_ir`, so one dialect's naming convention decided whether a
+    #: Wazuh artifact got a `<fields>` list.
+    projects: bool = False
 
     def __post_init__(self) -> None:
         if not self.assignments:

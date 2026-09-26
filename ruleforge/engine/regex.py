@@ -142,6 +142,107 @@ def _scan(pattern: str) -> str | None:
     return None
 
 
+def _nested_quantifier(pattern: str) -> str | None:
+    """The first quantified group that can blow up, or None.
+
+    TWO SHAPES, both refused:
+
+      1. A quantifier INSIDE a quantified group -- `([a-z]+)+`. Tracked with a
+         depth stack and a per-level "is this group already quantified" flag.
+
+      2. An ALTERNATION inside a quantified group -- `(a|aa)+$`. There is no
+         quantifier to find here, but the alternatives overlap in their prefix,
+         so a non-matching subject makes the engine try exponentially many
+         splits: 2^n. Detecting that precisely needs real analysis, so the rule
+         is the conservative one: a quantified group carries no top-level `|`.
+
+    Both are conservative. A quantified group that is a plain fixed string --
+    `(abc)+` -- is fine and still allowed, because that is what detection rules
+    overwhelmingly use. Being refused a pattern is a named error the analyst can
+    act on; hanging is not.
+    """
+    depth = 0
+    quantified: list[bool] = []
+    alternation: list[bool] = []
+    #: The group most recently closed, pending a quantifier that may follow it.
+    #: `(a|aa)+` quantifies the group from OUTSIDE, after the `)`, so the flags
+    #: have to survive the pop -- otherwise every `(...)+` looked unquantified and
+    #: the whole check was a no-op for that shape.
+    pending: tuple[bool, bool] | None = None
+    index = 0
+    length = len(pattern)
+
+    while index < length:
+        char = pattern[index]
+
+        if char == "\\":
+            index += 2
+            continue
+        if char == "[":
+            close = pattern.find("]", index + 1)
+            index = length if close < 0 else close + 1
+            continue
+        if char == "(":
+            quantified.append(False)
+            alternation.append(False)
+            pending = None
+            depth += 1
+            index += 1
+            # A `?` STRAIGHT AFTER `(` IS A GROUP MODIFIER, not a quantifier:
+            # `(?i)`, `(?=x)`, `(?<=a)`, `(?:x)` all start with one. Treating it
+            # as a quantifier made every lookaround look like a nested-quantifier
+            # pattern, so it was refused for catastrophic backtracking instead of
+            # for being PCRE-only -- and the mutation check caught that the
+            # `(?` refusal had become untested.
+            if index < length and pattern[index] == "?":
+                index += 1
+            continue
+        if char == ")":
+            depth = max(0, depth - 1)
+            inner_quantified = quantified.pop() if quantified else False
+            inner_alternation = alternation.pop() if alternation else False
+            if inner_quantified:
+                return f"the group ending at position {index}"
+            pending = (False, inner_alternation)
+            index += 1
+            continue
+        if char == "|":
+            if alternation:
+                alternation[-1] = True
+            index += 1
+            continue
+        if char in "*+?":
+            if depth and quantified and quantified[-1]:
+                return f"the quantifier at position {index}"
+            if depth and quantified:
+                quantified[-1] = True
+            elif pending is not None and depth == 0:
+                # A quantifier closing a group from outside: `(a|aa)+`.
+                if pending[1]:
+                    return (f"the group quantified at position {index}: its "
+                            f"alternatives overlap, so a non-matching subject "
+                            f"makes the engine try exponentially many splits")
+                pending = None
+            index += 1
+            continue
+        if char == "{" and index + 1 < length and pattern[index + 1].isdigit():
+            if depth and quantified and quantified[-1]:
+                return f"the interval at position {index}"
+            if depth and quantified:
+                quantified[-1] = True
+            elif pending is not None and depth == 0:
+                if pending[1]:
+                    return (f"the group quantified at position {index}: its "
+                            f"alternatives overlap")
+                pending = None
+            index += 1
+            continue
+        if not char.isspace():
+            pending = None
+        index += 1
+    return None
+
+
 def compile_pattern(dialect: str, pattern: str) -> Callable[..., bool]:
     """Compile `pattern` for `dialect`, or refuse with the reason.
 
@@ -182,6 +283,30 @@ def compile_pattern(dialect: str, pattern: str) -> Callable[..., bool]:
         raise Refusal(
             "REGEX_INVALID",
             f"the pattern does not compile: {exc}", "Call") from exc
+
+    nested = _nested_quantifier(pattern)
+    if nested is not None:
+        # A QUANTIFIER UNDER A QUANTIFIER. The allowlist permits `( ) * + ?`,
+        # which is exactly the shape catastrophic backtracking needs: `(a+)+$`
+        # against a non-matching subject of 28 characters takes 30 seconds, and
+        # it doubles with every character added. No subject-length cap helps --
+        # the attacker picks the pattern, not the data -- so the PATTERN is what
+        # has to be refused.
+        #
+        # This sat unfixed through two review rounds. It was called "latent"
+        # because the dialects that accept a user regex either declare a
+        # non-executable engine or lower the pattern to a string comparison. That
+        # is a mitigation by accident, not a control, and `compile_pattern` is
+        # public.
+        raise Refusal(
+            "REGEX_CATASTROPHIC_BACKTRACKING",
+            f"{nested} puts a quantifier inside a quantified group, which is the "
+            f"shape that makes matching time explode on a subject that does not "
+            f"match -- `(a+)+$` against 28 non-matching characters takes 30 "
+            f"seconds, and doubles with every character. Refused rather than "
+            f"given a time limit, because a limit would still let one row burn "
+            f"the budget. Rewrite it without nesting, or match a bounded length.",
+            "Call")
 
     def evaluate(value: str, case_insensitive: bool = False,
                  _c: re.Pattern[str] = compiled) -> bool:
