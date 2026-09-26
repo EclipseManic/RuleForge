@@ -83,8 +83,29 @@ class Row:
     uncertain: dict[str, str] = dc_field(default_factory=dict)
 
     def get(self, name: str) -> Any:
+        """Read a TOP-LEVEL field. NOT a general field lookup.
+
+        This used to be called as though it were one, at seven sites that all
+        wanted a field by name -- including `time_field`, which is a DOTTED name
+        for every vendor that uses one. It only ever looks in the top level, so
+        `win.system.eventID` came back ABSENT on a nested row -- the exact shape
+        Wazuh's own decoder produces, and the exact divergence `resolve_field`
+        was corrected for. `eval_package` read its GROUP value through
+        `resolve_field` and its TIME through this, so one row was read two ways.
+
+        Nested lookups go through `nodes.resolve_field`. The lazy import avoids a
+        cycle: `ir` is fully loaded by the time this is called.
+        """
         if name in self.values:
             return self.values[name]
+        if "." in name:
+            from .nodes import resolve_field
+            # SPLIT THE DOTTED NAME. Passing `FieldRef("a.b.c")` -- the whole
+            # string as `name` with no path -- did not work, because the resolver
+            # then looks up the literal key `"a.b.c"` and a nested row has no
+            # such key. The split is what makes the nested walk happen.
+            parts = name.split(".")
+            return resolve_field(self, FieldRef(parts[0], tuple(parts[1:])))
         return ABSENT
 
     def merged_with(self, other: "Row", left_prefix: str, right_prefix: str) -> "Row":
@@ -466,6 +487,18 @@ def _eval_call(expr: Call, row: Row, ctx: EvaluationContext,
         # exists to prevent, one level of nesting deeper.
         if any(is_undecided(option) for option in options):
             return UNDECIDED
+
+        # A NULL VALUE IS NOT A NON-MEMBER, IT IS AN ABSENT STATEMENT. Line 416
+        # refuses when an argument is ABSENT, but not when it is NULL, so
+        # `_scalar_eq(None, "a")` returned False and
+        # `NOT (src in ("a", "b"))` MATCHED every row whose `src` was null.
+        # `compare()` already gets this right for `=` -- a null field is
+        # UNDECIDED there, not unequal -- so `=` and `IN` disagreed about the
+        # same null field. NULL is now UNDECIDED here too, which is what makes
+        # the negation come out right.
+        if args[0] is None:
+            return UNDECIDED
+
         return any(_scalar_eq(args[0], option) for option in options)
     if name == "length":
         return len(args[0]) if isinstance(args[0], (str, list, tuple, dict)) \

@@ -247,6 +247,21 @@ def _validate_expressions(node: Any) -> None:
         if node.until is not None:
             _require_predicate(node.until, f"Pattern {node.id!r} until")
 
+    elif name == "Package":
+        # PACKAGE CONDITIONS ARE VALIDATED LIKE ANY OTHER PREDICATE. This branch
+        # did not exist, so a `Package` whose parent or child held a half-built
+        # expression produced a clean `no_match` with zero rows and no caveat --
+        # the exact shape of the `dict(row)` silent-zero defect, reached through
+        # a different door. `_require_predicate` also enforces
+        # `MAX_EXPRESSION_DEPTH`, so a 400-deep chain inside a child used to
+        # evaluate fine.
+        for condition in node.parent:
+            _require_predicate(condition, f"Package {node.id!r} parent")
+        for index, child in enumerate(node.children):
+            for condition in child:
+                _require_predicate(condition,
+                                   f"Package {node.id!r} child {index}")
+
     elif name == "SetOp":
         # keys and op are validated at construction; nothing graph-level to add.
         pass

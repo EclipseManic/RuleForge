@@ -359,6 +359,27 @@ def render(ir: RuleIR) -> str:
                         for ref, direction in node.order_by]
             if node.limit:
                 limit = f"\nLIMIT {node.limit}"
+        elif name in ("Join", "SetOp", "Pattern", "Package", "Expand"):
+            # NO SILENT `else`, AND THAT IS THE POINT. This loop used to fall
+            # through for every node type it did not name, so a graph containing
+            # a `Package` -- a parent/child correlation, whose ENTIRE detection
+            # lives in that node -- rendered as `SELECT * FROM events`. No
+            # refusal, no diagnostic, and the artifact still carried the
+            # "NOT a deployable QRadar rule" header, so it read as finished.
+            # `wazuh_render.py` calls that "the most dangerous output this tool
+            # can produce", and it was true here too.
+            #
+            # AQL has no parent/child correlation, no multi-event pattern and no
+            # unnest. Naming that is the correct output; emitting the rest of the
+            # query as though this node were not there is not.
+            raise Refusal(
+                "AQL_NODE_NOT_RENDERABLE",
+                f"this rule contains a {name} node. AQL has no equivalent -- a "
+                f"correlation, a sequence and an unnest are all things an AQL "
+                f"search cannot express -- so rendering the rest of the graph "
+                f"would hand you a query with the detection missing from it. "
+                f"The rule is fully understood; it simply has no AQL form.",
+                "AQL")
 
     if not select_items:
         select_items = group_by or ["*"]

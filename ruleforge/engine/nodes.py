@@ -458,13 +458,21 @@ def eval_aggregate(node: Aggregate, rows: list[Row],
                 f"silently omits rows understates the total it appears to report.",
                 untimed))
         members = _windows(frame, times, usable)
+        # THE WINDOW INDICES ARE INTO `usable`, NOT INTO `rows`. They used to be
+        # applied to `rows`, so any row that lacked a timestamp shifted every
+        # later index by one and the measures were read from the WRONG ROWS --
+        # `max` could be taken from a row that had been excluded from the window
+        # and reported as being in it. `_windows` partitions the list it is
+        # handed, so it must be read back from that same list.
+        source = usable
     else:
         members = [list(range(len(rows)))]
+        source = rows
 
     out: list[Row] = []
     for group in members:
         ctx.budget.spend(max(1, len(group)), "aggregation")
-        bucket = [rows[i] for i in group]
+        bucket = [source[i] for i in group]
 
         keyed: dict[tuple[Any, ...], list[Row]] = {}
         for row in bucket:
@@ -1050,9 +1058,23 @@ def _eval_package_parent_frequency(node: Package, rows: list[Row],
             # TRAILING WINDOW. Advance the left edge past anything older than the
             # timeframe, so the count is "occurrences within the last N seconds",
             # which is what the rule says.
-            while left < index and moments[left] is not None and \
-                    moment - moments[left] > span:
-                left += 1
+            #
+            # A `None` MOMENT MUST NOT STALL THE POINTER. The loop below stops as
+            # soon as it meets an unusable time, so a single untimed event
+            # anywhere in the group froze `left` there for the rest of the scan
+            # and `window_size` went on counting rows from OUTSIDE the window.
+            # A 3-in-100-seconds detector then reported three false alerts
+            # because one row had no timestamp. So unusable moments are skipped
+            # over rather than treated as a wall, and the count is taken from the
+            # USABLE events only -- an event whose time we cannot read cannot be
+            # inside a window measured in seconds, and counting it either way
+            # would be a guess.
+            while left < index:
+                edge = moments[left]
+                if edge is None or moment - edge > span:
+                    left += 1
+                    continue
+                break
             window_size = index - left + 1
             if window_size >= node.frequency:
                 out.append(_package_row(

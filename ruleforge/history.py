@@ -31,7 +31,7 @@ import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 #: Serialising history is guarded in-process. Two tabs open at once would
 #: otherwise interleave read-modify-write and lose an entry.
@@ -110,12 +110,26 @@ class Appended:
     dropped: int = 0
 
 
+#: The job kinds History accepts. DECLARED ONCE, HERE, and the web layer reads it
+#: rather than inventing its own list. The two used to be declared separately and
+#: disagreed: history accepted `("author","tune","debug","understand")` while the
+#: routes were `author|understand|tune|debug_rule_to_logs|debug_logs_to_rule`, so
+#: `POST /api/debug_rule_to_logs {"save": true}` failed with
+#: `'debug_rule_to_logs' is not one of the four jobs` -- and the user was shown a
+#: size-limit-sounding message for what was a name mismatch. NEITHER debug job
+#: could ever be saved.
+JOBS: Final = frozenset({"author", "tune", "debug", "understand"})
+
+
 def append(path: Path, kind: str, dialect: str, rule_id: str, title: str,
            summary: str, payload: dict[str, Any]) -> Appended:
     """Add one entry. Never modifies or removes an existing one, except to
     enforce `MAX_ENTRIES`, and that reports how many it had to drop."""
-    if kind not in ("author", "tune", "debug", "understand"):
-        raise Refused(f"{kind!r} is not one of the four jobs")
+    if kind not in JOBS:
+        raise Refused(
+            f"{kind!r} is not one of {', '.join(sorted(JOBS))}. A route whose "
+            f"name is not in this set cannot be saved, which is a wiring mistake "
+            f"rather than anything the analyst did.")
 
     entry = HistoryEntry(kind=kind, dialect=dialect, rule_id=rule_id,
                          title=title, summary=summary, payload=payload,

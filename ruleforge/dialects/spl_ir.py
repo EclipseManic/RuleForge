@@ -102,10 +102,16 @@ def lower(text: str, rule_id: str = "spl",
     # the intersection. A guard then REFUSED the combination outright, which
     # fixed the union by rejecting the single most common opening line in SPL.
     # Both were wrong; the intersection is what the author wrote.
+    # EVERY HEAD TERM IS LOWERED, NOT JUST THE SELECTORS. Only `index` and
+    # `sourcetype` were read, so `index=windows EventCode=4625 | stats count by
+    # host` quietly lost the `EventCode` filter: the analyst got a count over
+    # ALL Security events instead of failed logons, `ok: true`, and no findings.
+    # A search that was nothing but `EventCode=4625` rendered as an EMPTY query,
+    # still `ok: true`. That is the most ordinary SPL there is, and losing its
+    # filter inverts the rule's meaning while looking like success.
     index_conditions = [
         _term_condition(term) for term in walk_terms(search.terms)
-        if term.field in ("index", "sourcetype") and term.op == "="
-        and not term.negate
+        if term.op is not None and not term.negate
     ]
 
     nodes: list[Any] = [
@@ -210,8 +216,11 @@ def _term_condition(term: Any) -> Any:
 
     if term.op is None:
         # A bare field name in a search means "this field exists and is
-        # non-empty". It is NOT a comparison to True.
-        return Call(function="is_not_null", args=(_field(term.field),))
+        # non-empty". It is NOT a comparison to True. It is also a PRESENCE OP
+        # on a Comparison, not a Call -- building `Call("is_not_null", ...)` was
+        # refused with UNKNOWN_FUNCTION, so the same bare term was dropped on the
+        # head line and raised on the `| search` line.
+        return Comparison("is_not_null", _field(term.field), Literal(value=True))
 
     if term.op == "=":
         node: Any = Comparison("=", _field(term.field), Literal(term.value))

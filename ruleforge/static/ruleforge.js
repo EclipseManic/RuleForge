@@ -183,12 +183,36 @@ async function call(job, body, panel) {
   clear(findings);
   findings.appendChild(el("p", "note", "Working…"));
 
-  const response = await fetch(`/api/${job}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const data = await response.json();
+  let data;
+  try {
+    const response = await fetch(`/api/${job}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    /* A 500 HAS TO BECOME A MESSAGE. Without the `ok` check, `response.json()`
+     * throws inside the promise, the rejection is never caught, and the panel
+     * sits on "Working…" FOREVER -- which is what a real bug did: `tune` 500'd on
+     * the ordinary case of a rule whose fields the sample lacks, and the analyst
+     * was left staring at a spinner. */
+    if (!response.ok) {
+      renderFindings(findings, [], {
+        code: `HTTP_${response.status}`,
+        message: "The server failed to answer. This is a bug in RuleForge, not " +
+                 "something wrong with your rule. The detail is in the " +
+                 "terminal running it.",
+      });
+      return;
+    }
+    data = await response.json();
+  } catch (error) {
+    renderFindings(findings, [], {
+      code: "REQUEST_FAILED",
+      message: `Could not reach RuleForge: ${error}. Is the server still ` +
+               `running?`,
+    });
+    return;
+  }
 
   renderFindings(findings, data.findings, data.refusal);
   if (rendered) {

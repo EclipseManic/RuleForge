@@ -27,3 +27,9 @@ Thumbs.db
 # Local environment overrides
 .env
 .env.*
+
+# RuleForge history: pasted detection rules and EVENT SAMPLES, which contain
+# hostnames, usernames, source IPs and destination IPs. Filesystem permissions
+# are 0600 and the server never transmits them, but git add -A from a repo
+# with a remote would publish them. This is the one file RuleForge writes.
+ruleforge/data/

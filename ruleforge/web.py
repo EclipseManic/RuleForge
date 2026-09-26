@@ -113,10 +113,25 @@ def create_app() -> Flask:
 
         saved = None
         dropped = 0
+        # A ROUTE IS NOT A HISTORY KIND. `debug_rule_to_logs` and
+        # `debug_logs_to_rule` are two routes under the one `debug` job, and
+        # passing the route name straight to `history.append` meant neither could
+        # ever be saved. The mapping is explicit and lives here, next to the
+        # routes, so the two vocabularies cannot drift apart again.
+        history_kind = {"debug_rule_to_logs": "debug",
+                        "debug_logs_to_rule": "debug"}.get(job, job)
+
         if payload.get("save") and outcome.ok:
+            if history_kind not in history.JOBS:
+                return jsonify({"ok": False, "refusal": {
+                    "code": "HISTORY_UNKNOWN_JOB",
+                    "message": f"{job!r} has no history kind. This is a wiring "
+                               f"bug in the app, not something you did.",
+                }, "findings": []}), 200
             try:
                 result = history.append(
-                    HISTORY_PATH, kind=job, dialect=dialect, rule_id=rule_id,
+                    HISTORY_PATH, kind=history_kind, dialect=dialect,
+                    rule_id=rule_id,
                     title=outcome.graph.get("title") or rule_id,
                     summary=_one_line(outcome), payload={
                         "rule": text,

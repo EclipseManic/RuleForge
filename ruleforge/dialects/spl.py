@@ -515,22 +515,44 @@ def _split_measures(text: str, command: str) -> tuple[tuple[SplMeasure, ...], st
     index = 0
     length = len(text)
 
-    # A BARE `count`/`c` HAS NO PARENTHESES. Splunk writes `stats count` to count
-    # events, and an earlier version only recognised `name(`, so the single most
-    # common aggregate in SPL was dropped from the rule entirely -- leaving a
-    # `stats count` that computed nothing and still looked well formed.
-    bare = re.match(r"\s*(count|c)\b\s*(AS\s+([A-Za-z_][A-Za-z0-9_]*))?",
-                    text, re.IGNORECASE)
-    if bare and command in ("stats", "tstats", "eventstats", "streamstats"):
-        name = bare.group(1).lower()
-        _check_function(name, command)
-        measures.append(SplMeasure(function=name, field=None, alias=bare.group(3)))
-        index = bare.end()
+    # A BARE `count`/`c` HAS NO PARENTHESES, and it can appear ANYWHERE among the
+    # measures -- not only at the front. `stats values(user) as u count as c by
+    # host` used to keep only `u`, because the scan looked for `name(` and gave
+    # up at the bare `count`. Losing a threshold makes the rule match MORE than
+    # the analyst wrote, so the loop now handles a bare count wherever it appears
+    # and refuses anything else it cannot read.
 
     while index < length:
+        rest = text[index:]
+        if not rest.strip():
+            break
+        if re.match(r"\s*(by|where|from)\b", rest, re.IGNORECASE):
+            break
+
+        bare_first = re.match(r"\s*(count|c)\b(?!\s*\()", rest, re.IGNORECASE)
+        if bare_first:
+            name = bare_first.group(1).lower()
+            after = rest[bare_first.end():]
+            alias_match = re.match(r"\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)", after,
+                                   re.IGNORECASE)
+            _check_function(name, command)
+            measures.append(SplMeasure(
+                function=name, field=None,
+                alias=alias_match.group(1) if alias_match else None))
+            index += bare_first.end() + (alias_match.end() if alias_match else 0)
+            continue
+
         match = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(").search(text, index)
         if not match:
-            break
+            leftover = text[index:].strip()
+            if not leftover or re.match(r"(by|where|from)\b", leftover,
+                                        re.IGNORECASE):
+                break
+            raise SplParseError(
+                "SPL_STATS_MEASURE_UNPARSED",
+                f"could not read {leftover!r} as a measure. Dropping it would "
+                f"remove a threshold from the rule and make it match more than "
+                f"you wrote, so it is named instead.", DIALECT)
         name = match.group(1).lower()
         open_at = match.end() - 1
         close_at = _matching_paren(text, open_at)

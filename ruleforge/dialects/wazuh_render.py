@@ -33,6 +33,24 @@ from ..engine.ir import (
 from ..engine.values import Refusal
 from .wazuh import DIALECT
 
+
+def _attr(value: str) -> str:
+    """Escape a value for a DOUBLE-QUOTED XML attribute.
+
+    `xml.sax.saxutils.escape` handles only `&`, `<` and `>`. It does NOT escape
+    `"`, and every attribute in a Wazuh rule is double-quoted. So a field name
+    carrying `&quot;` re-parsed as a REAL quote and a REAL attribute: pasting
+    `name="win.eventdata.newProcessName&quot; negate=&quot;yes"` produced
+    `<field name="win.eventdata.newProcessName" negate="yes">`, which INVERTS the
+    match -- the rule then alerted on every process that is not the target, with
+    no diagnostic anywhere.
+
+    Whole-tag injection is still blocked, because `<` and `>` are escaped. The
+    impact was bounded to attribute injection, but inverting a detection test is
+    about the worst thing this tool could do.
+    """
+    return escape(value, {'"': "&quot;", "'": "&apos;"})
+
 #: IR comparison operator -> the regex Wazuh would need. Wazuh has no `>=` on a
 #: field; it has `pcre2`/`os_regex`. Rendering a comparison as a regex is only
 #: honest for equality against a literal, so anything else is refused rather
@@ -55,8 +73,6 @@ def render(ir: RuleIR) -> str:
         return _render_correlation(ir, package, rule_id, level)
     if filters:
         return _render_plain(ir, filters, derive, aggregate, rule_id, level)
-    if aggregate is not None:
-        return _render_plain(ir, [], derive, aggregate, rule_id, level)
 
     raise Refusal("WAZUH_RENDER_NOTHING_TO_RENDER",
                   "this rule has no condition, no correlation and no aggregate, "
@@ -68,6 +84,25 @@ def _render_plain(ir: RuleIR, filters: list[Filter], derive: Derive | None,
                   level: str) -> str:
     body: list[str] = []
     terms: list[str] = []
+
+    # A THRESHOLD IS NOT A FIELD TEST. `aggregate` was accepted and IGNORED, so a
+    # KQL rule like `| summarize c=count() by host | where c > 5` rendered as a
+    # Wazuh rule testing the literal string `gt5` against a column named `c` --
+    # a column that is not an event field, because `c` only exists as the OUTPUT
+    # of the aggregate that was dropped. The rule could never fire and contained
+    # no detection. Wazuh counts with `frequency` on a correlation, not with a
+    # threshold on a computed column, so there is no honest rendering here.
+    if aggregate is not None:
+        raise Refusal(
+            "WAZUH_RENDER_AGGREGATE_NOT_A_RULE",
+            f"this rule aggregates and then tests the aggregate's output "
+            f"({', '.join(m.name for m in aggregate.measures)}). A Wazuh rule "
+            f"tests EVENT fields, not computed columns -- there is no such thing "
+            f"as a threshold on a column that only exists because the rule "
+            f"computed it. Wazuh expresses 'N times' with `frequency` and "
+            f"`timeframe` on a correlation, which is a different rule shape. "
+            f"Emitting the threshold as a field test would produce a rule that "
+            f"can never match.", DIALECT)
 
     for node in filters:
         for condition in _flatten(node.condition):
@@ -140,7 +175,7 @@ def _render_correlation(ir: RuleIR, package: Package, rule_id: str,
 
 def _wrap(rule_id: str, level: str, body: list[str],
           attributes: str = "") -> str:
-    head = f'  <rule id="{escape(rule_id)}" level="{escape(level)}"{attributes}>'
+    head = f'  <rule id="{_attr(rule_id)}" level="{_attr(level)}"{attributes}>'
     if not body:
         return f"{head}\n  </rule>\n"
     return "\n".join([head, *body, "  </rule>", ""])
@@ -190,7 +225,7 @@ def _field_elements(expression: Any, name: str) -> list[str]:
         negate = ' negate="yes"'
         expression = expression.operand
 
-    safe = escape(name)
+    safe = _attr(name)
 
     if isinstance(expression, Call):
         if expression.function == "matches_regex":

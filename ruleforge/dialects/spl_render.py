@@ -19,6 +19,7 @@ else is emitted as a `where`, because a selector cannot express that.
 """
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 from typing import Any
 
@@ -86,12 +87,19 @@ def render(ir: RuleIR) -> str:
             continue
 
         if kind == "Filter":
-            selector_terms = _as_selector(node.condition)
+            # SPLIT THE HEAD FILTER. The lowerer now puts EVERY head term in one
+            # Filter, because reading only the selectors silently dropped the
+            # rest -- `index=windows EventCode=4625` lost its EventCode filter and
+            # reported ok:true. But a selector and a filter are not the same
+            # thing: a selector restricts what is SEARCHED so the planner can use
+            # the index, and a filter scans and discards. So selector terms go to
+            # the head and everything else stays a `search`, and both survive.
+            selector_terms, rest = _split_selector(node.condition)
             if selector_terms and not selector_emitted:
                 head.extend(selector_terms)
                 selector_emitted = True
-                continue
-            stages.append(f"| search {render_expr(node.condition)}")
+            if rest is not None:
+                stages.append(f"| search {render_expr(rest)}")
             continue
 
         if kind == "Aggregate":
@@ -127,32 +135,76 @@ def render(ir: RuleIR) -> str:
             f"would produce a search that looks complete and matches a different "
             f"set of events.", DIALECT)
 
-    return (" ".join(head) + " " if head else "") + "".join(stages)
+    return (" ".join(head) + " " if head else "") + " ".join(stages)
+
+
+#: A selector value safe to emit bare. Anything with whitespace, a quote, a pipe
+#: or a brace changes the meaning of the search if it is not quoted.
+_BARE_SAFE = re.compile(r"^[A-Za-z0-9_.:@\-*]+$")
+
+
+def _selector_value(value: Any) -> str:
+    text = str(value)
+    if text and _BARE_SAFE.match(text):
+        return text
+    return render_literal(value)
+
+
+def _split_selector(condition: Any) -> tuple[list[str], Any]:
+    """Split a head filter into (selector terms, everything else).
+
+    A term is a SELECTOR only if it is an un-negated equality on a known selector
+    field with a literal value. `index=main EventCode=4628` is therefore half
+    selector and half filter: `index=main` restricts what is searched, and
+    `EventCode=4628` does not. Emitting both at the head would be wrong, and
+    dropping the second would lose the analyst's filter -- which is what used to
+    happen.
+
+    Returns `(terms, rest)` where `rest` is `None` when every term was a selector.
+    """
+    terms = _flatten_and(condition)
+    if not terms:
+        return [], None
+
+    selectors: list[str] = []
+    others: list[Any] = []
+
+    for term in terms:
+        if (isinstance(term, Comparison) and term.op == "="
+                and isinstance(term.left, FieldExpr)
+                and term.left.ref.full in _SELECTOR_FIELDS
+                and isinstance(term.right, Literal)):
+            # THE VALUE IS QUOTED ONLY WHEN IT MUST BE. Always quoting is safe
+            # but rewrites the analyst's bytes for no reason, and the diff against
+            # the search they pasted stops matching. Always NOT quoting is the
+            # injection: a value of `a | stats count by host` becomes an extra
+            # pipeline stage. So a simple token is left bare and anything with a
+            # space, quote, pipe or brace is quoted.
+            selectors.append(
+                f"{term.left.ref.full}="
+                f"{_selector_value(term.right.value)}")
+        else:
+            others.append(term)
+
+    if not selectors:
+        return [], condition
+    if not others:
+        return selectors, None
+    rest = (others[0] if len(others) == 1
+            else BoolOp("and", tuple(others)))
+    return selectors, rest
 
 
 def _as_selector(condition: Any) -> list[str] | None:
     """The head-of-search terms this filter represents, or None.
 
-    ONLY equality on a known selector field counts, and ONLY when EVERY term
-    qualifies. A filter that also tests something else cannot be a selector,
-    because a selector cannot express it -- and moving it to the head would
-    quietly change what the search looks at.
+    Kept as a whole-or-nothing helper for callers that need to know whether the
+    ENTIRE filter is a selector. `_split_selector` is what the renderer uses.
     """
-    terms = _flatten_and(condition)
-    if not terms:
+    selectors, rest = _split_selector(condition)
+    if rest is not None:
         return None
-    out: list[str] = []
-    for term in terms:
-        if not isinstance(term, Comparison) or term.op != "=":
-            return None
-        if not isinstance(term.left, FieldExpr):
-            return None
-        if term.left.ref.full not in _SELECTOR_FIELDS:
-            return None
-        if not isinstance(term.right, Literal):
-            return None
-        out.append(f"{term.left.ref.full}={term.right.value}")
-    return out
+    return selectors or None
 
 
 def _flatten_and(expression: Any) -> list[Any]:

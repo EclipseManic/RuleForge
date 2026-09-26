@@ -443,10 +443,15 @@ def _behavioural(ir, events: list[dict[str, Any]]) -> list[Finding]:
 
 
 def _verdict_summary(result) -> dict[str, Any]:
+    # `reason` is a Refusal, which has `.code` and `.message` -- NOT `.detail`.
+    # Reading `.detail` raised AttributeError, and since it is the NORMAL case
+    # for this tool (any rule whose fields the sample lacks), the whole `tune`
+    # job returned HTTP 500 exactly when the invariant mattered most. The
+    # `.caveats` entries below are a different dataclass and DO have `.detail`.
     return {
         "verdict": result.verdict.value,
         "reason": result.reason.code if result.reason else None,
-        "reason_detail": result.reason.detail if result.reason else "",
+        "reason_detail": result.reason.message if result.reason else "",
         "rows": len(result.rows),
         "caveats": [{"code": c.code, "detail": c.detail, "count": c.count}
                     for c in result.caveats],
