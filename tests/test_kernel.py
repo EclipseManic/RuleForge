@@ -290,6 +290,53 @@ class WindowTests(unittest.TestCase):
             Frame(kind="tumbling", size=Duration(10), anchor=FieldRef("t"))
         self.assertEqual(caught.exception.code, "FRAME_ANCHOR_NOT_APPLICABLE")
 
+    def test_a_sliding_frame_with_a_step_is_refused_as_not_yet_implemented(self):
+        """The model can now BUILD a sliding frame. The kernel cannot yet EXECUTE one.
+
+        This distinction is the whole point of the test. With no refusal here, a 600s window
+        on a 60s step was quietly computed as TUMBLING: two buckets where the grid needs ~20,
+        verdict `matched`, and a caveat reading TUMBLING_BUCKETS_FULLY_FORMED - so `step` was
+        read and discarded while the output positively asserted a different operator than the
+        one the rule declared. Confident wrong counts, with a caveat that corroborated them.
+        """
+        frame = Frame(kind="sliding", size=Duration(600), step=Duration(60),
+                      time_ref=TimeRef(field_name="t"))
+        agg = Aggregate(id="a", input="r", measures=(Measure("n", "count"),), frame=frame)
+        result = evaluate([{"t": 0}, {"t": 300}, {"t": 1200}], read(), agg, emit("a"))
+        self.assertIs(result.verdict, Verdict.NOT_EVALUATED)
+        self.assertEqual(result.reason.code, "FRAME_SLIDING_NOT_IMPLEMENTED")
+        self.assertEqual(result.rows, ())
+        self.assertNotIn("TUMBLING_BUCKETS_FULLY_FORMED",
+                         [c.code for c in result.caveats])
+
+    def test_an_explicitly_anchored_frame_is_refused_as_not_yet_implemented(self):
+        """Same failure mode, different parameter: the anchor was read and ignored."""
+        frame = Frame(kind="tumbling", size=Duration(600), alignment="explicit",
+                      anchor=FieldRef("t"), time_ref=TimeRef(field_name="t"))
+        agg = Aggregate(id="a", input="r", measures=(Measure("n", "count"),), frame=frame)
+        result = evaluate([{"t": 0}, {"t": 300}, {"t": 1200}], read(), agg, emit("a"))
+        self.assertIs(result.verdict, Verdict.NOT_EVALUATED)
+        self.assertEqual(result.reason.code, "FRAME_EXPLICIT_ANCHOR_NOT_IMPLEMENTED")
+        self.assertNotIn("TUMBLING_BUCKETS_FULLY_FORMED",
+                         [c.code for c in result.caveats])
+
+    def test_a_declared_regex_dialect_is_refused_because_the_engine_is_wrong_for_it(self):
+        """`Call.dialect` makes the call well-formed; Python's `re` still cannot honour it.
+
+        "xyz" matches "^x" in every one of these dialects, so evaluating with `re` and
+        reporting no_match would be a demonstrably false negative - and `re` is not PCRE
+        either, so a MATCH it did report would be just as unjustifiable.
+        """
+        condition = Comparison("=", FieldExpr(FieldRef("a")),
+                               Call("matches_regex",
+                                    (FieldExpr(FieldRef("a")), Literal("^x")),
+                                    dialect="pcre"))
+        result = evaluate([{"a": "xyz"}], read(),
+                          Filter(id="f", input="r", condition=condition), emit("f"))
+        self.assertIs(result.verdict, Verdict.NOT_EVALUATED)
+        self.assertEqual(result.reason.code, "FUNCTION_REGEX_DIALECT_NOT_IMPLEMENTED")
+        self.assertEqual(result.rows, ())
+
     def test_an_unresolvable_time_field_is_never_guessed(self):
         frame = Frame(kind="tumbling", size=Duration(10))
         agg = Aggregate(id="a", input="r", measures=(Measure("n", "count"),), frame=frame)

@@ -43,8 +43,15 @@ KERNEL_EVAL_CODES: frozenset[str] = frozenset({
     "TIME_UNRESOLVED_ON_ALL_ROWS",
 
     # --- a slot exists but its semantics are undecidable --------------------
-    "FRAME_ALIGNMENT_UNANCHORED",
-    "FRAME_SLIDING_STEP_UNDECLARED",
+    # The three *_NOT_IMPLEMENTED codes below are a different failure from the rest of this
+    # block, and are grouped separately for that reason. Everything else here is "the IR cannot
+    # say what this means". These three are "the IR says exactly what it means and THIS KERNEL
+    # cannot execute it" - the model is fine, the input is fine, the gap is ours. Collapsing
+    # the two would let a reader conclude the IR was at fault, which is the opposite of true
+    # and the kind of misattribution this project exists to avoid.
+    "FRAME_SLIDING_NOT_IMPLEMENTED",
+    "FRAME_EXPLICIT_ANCHOR_NOT_IMPLEMENTED",
+    "FUNCTION_REGEX_DIALECT_NOT_IMPLEMENTED",
     "FRAME_OFFSET_NOT_APPLICABLE",
     "FRAME_SIZE_NOT_APPLICABLE",
     "MEASURE_ARG_EXTREME_UNDER_SPECIFIED",
@@ -52,7 +59,6 @@ KERNEL_EVAL_CODES: frozenset[str] = frozenset({
     "MEASURE_FIELD_REQUIRED",
     "ARITH_STRING_CONCAT_UNSUPPORTED",
     "UNKNOWN_ARITHMETIC_OPERATOR",
-    "FUNCTION_DIALECT_UNDECLARED",
     "ARRANGE_NEGATIVE_OFFSET",
 
     # --- stateful execution (3C) ---------------------------------------------

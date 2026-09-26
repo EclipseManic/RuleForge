@@ -365,11 +365,29 @@ def _evaluate_call(expr: Call, row: Row, ctx: EvalContext, scope: Any) -> Any:
             f"{allowed}", "Call")
 
     # The `must_be_declared` check is GONE. `Call.dialect` now exists and the model refuses a
-    # dialect-sensitive call that omits it, so the branch that used to sit here was
-    # unconditionally true for a different reason and could never be reached with a
-    # well-formed Call. EVALUATING each named dialect is the next increment; until then a
-    # declared-dialect matches_regex reaches `_apply_function` and is refused there, which is
-    # stated rather than pretended.
+    # dialect-sensitive call that omits it, so the branch that used to sit here could never be
+    # reached with a well-formed Call.
+    #
+    # What replaced it is an EXPLICIT refusal below rather than the generic `function_unknown`
+    # fallthrough. That distinction matters: the fallthrough returns UNKNOWN, which a Filter
+    # turns into `no_match` plus a NO_EVIDENCE_ROWS_WERE_ALL_UNDECIDABLE caveat. That is honest
+    # for "this row is undecidable", but it is a weak, indirect way to say "this kernel has not
+    # implemented regex dialects", and an earlier draft of this comment claimed the fallthrough
+    # refused. It does not. Claiming a guard exists is worse than not having it.
+    if expr.function == "matches_regex":
+        # The model now REQUIRES a dialect and refuses unrecognised ones, so this call is
+        # well-formed. The kernel still implements none of them, and the honest reason is the
+        # KERNEL's: PCRE, POSIX extended and POSIX basic genuinely disagree on real analyst
+        # input (`\d` vs `[[:digit:]]`, `\b`, inline flags, lazy/greedy differences), and
+        # Python's `re` is neither PCRE nor POSIX BRE. Evaluating with `re` and calling the
+        # result `pcre` would make a cross-target reference semantics that is quietly wrong
+        # for the dialect it claims - worse than not answering.
+        raise EvaluationRefusal(
+            "FUNCTION_REGEX_DIALECT_NOT_IMPLEMENTED",
+            f"this kernel does not implement regex matching for dialect {expr.dialect!r}. "
+            f"Python's `re` engine is neither PCRE nor POSIX basic, so evaluating with it would "
+            f"disagree with the declared dialect on real patterns; the kernel refuses rather "
+            f"than report a match it cannot justify", "Call")
     args = [evaluate(a, row, ctx, scope) for a in expr.args]
     return _apply_function(expr.function, args, ctx)
 

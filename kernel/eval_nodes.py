@@ -156,11 +156,32 @@ def _check_frame(frame: Frame) -> list[Caveat]:
     if frame.kind not in _FRAME_KINDS:
         raise EvaluationRefusal("IR_UNSUPPORTED_PARAMETERS",
                                 f"unknown frame kind {frame.kind!r}", "frame")
-    # `sliding` and `alignment="explicit"` are no longer refused HERE. The model now carries
-    # `Frame.step` and `Frame.anchor` and refuses at construction when either is missing, which
-    # is strictly better: a sliding frame without an advance rate cannot be built, rather than
-    # being built and then rejected. The branches that used to live here could never fire, and
-    # a guard that cannot fire is read as protection while checking nothing.
+    # `sliding` and `alignment="explicit"` are now EXPRESSIBLE - the model carries `Frame.step`
+    # and `Frame.anchor` and refuses at construction when either is missing. Expressible is not
+    # the same as implemented, and the gap between the two is where this kernel nearly lied.
+    #
+    # With the old refusals deleted, a sliding frame with a 60s step over a 600s window was
+    # quietly computed as TUMBLING: two buckets instead of ~20 windows, verdict `matched`, and
+    # a caveat reading TUMBLING_BUCKETS_FULLY_FORMED - so `step` was read and discarded while
+    # the output positively asserted a different operator than the one requested. That is the
+    # "declared-but-ignored parameter" hazard the model validation warns about, except here the
+    # parameter went missing in the KERNEL and the caveat covered for it. Refusing is correct
+    # and the reason is the KERNEL's, not the model's and not a vendor's.
+    if frame.kind == "sliding":
+        raise EvaluationRefusal(
+            "FRAME_SLIDING_NOT_IMPLEMENTED",
+            f"this kernel implements tumbling, per_event, cumulative and session frames, but "
+            f"NOT sliding ones: a {frame.size.seconds}s window on a "
+            f"{frame.step.seconds}s grid emits one row per grid position per event, which is a "
+            f"different algorithm from the one here. Falling back to tumbling would return "
+            f"confident wrong counts, so the kernel refuses", "frame")
+    if frame.alignment == "explicit":
+        raise EvaluationRefusal(
+            "FRAME_EXPLICIT_ANCHOR_NOT_IMPLEMENTED",
+            f"this kernel aligns frames to the epoch, not to a declared anchor field "
+            f"({frame.anchor.name!r}); epoch-aligned buckets silently ignore the anchor and "
+            f"return confident wrong counts, so the kernel refuses rather than mis-bucket",
+            "frame")
     if frame.kind in ("per_event", "cumulative", "session"):
         if frame.offset_seconds:
             raise EvaluationRefusal(
