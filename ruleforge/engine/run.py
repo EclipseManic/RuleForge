@@ -29,6 +29,7 @@ from .nodes import (
     eval_derive,
     eval_emit,
     eval_expand,
+    eval_package,
     eval_filter,
     eval_join,
     eval_pattern,
@@ -53,6 +54,7 @@ EVALUATORS: Final[dict[str, Callable[..., list[Row]]]] = {
     "Arrange": eval_arrange,
     "Expand": eval_expand,
     "Pattern": eval_pattern,
+    "Package": eval_package,
     "Join": eval_join,
     "SetOp": eval_setop,
     "Emit": eval_emit,
@@ -232,7 +234,8 @@ def _run_node(evaluator: Callable[..., list[Row]], node: Any,
               results: dict[str, list[Row]],
               per_read: dict[str, list[Row]],
               ctx: EvaluationContext, kind: str) -> list[Row]:
-    if kind in ("Filter", "Derive", "Aggregate", "Arrange", "Expand", "Pattern"):
+    if kind in ("Filter", "Derive", "Aggregate", "Arrange", "Expand", "Pattern",
+                "Package"):
         return evaluator(node, results[node.input], ctx)
     if kind in ("Join", "SetOp"):
         return evaluator(node, results[node.left], results[node.right], ctx)
@@ -248,7 +251,8 @@ def _run_node(evaluator: Callable[..., list[Row]], node: Any,
 def _row_count(node: Any, results: dict[str, list[Row]],
                per_read: dict[str, list[Row]]) -> int:
     kind = type(node).__name__
-    if kind in ("Filter", "Derive", "Aggregate", "Arrange", "Expand", "Pattern"):
+    if kind in ("Filter", "Derive", "Aggregate", "Arrange", "Expand", "Pattern",
+                "Package"):
         return len(results.get(node.input, ()))
     if kind in ("Join", "SetOp"):
         return len(results.get(node.left, ()))

@@ -39,6 +39,7 @@ from .ir import (
     Join,
     Measure,
     Pattern,
+    Package,
     SetOp,
 )
 from .values import (
@@ -851,6 +852,120 @@ def _pattern_time_field(node: Pattern, group: list[Row]) -> str | None:
     change.
     """
     return node.time_field
+
+
+# Package
+# ---------------------------------------------------------------------------
+
+
+def eval_package(node: Package, rows: list[Row],
+                 ctx: EvaluationContext) -> list[Row]:
+    """Parent/child correlation: fire the parent, then count children in the window.
+
+    THE PARENT STANDS ALONE. Wazuh's parent rule is a complete rule that alerts
+    on its own; the child is a reaction. This returns the parent rows, annotated
+    with which child fired, rather than requiring a child to be present -- a
+    childless parent is a real alert, and dropping it would hide detections the
+    deployed rule would have produced.
+
+    THE COUNT IS OVER THE SHARED FIELDS, INSIDE THE TIMEFRAME. Not "N children
+    ever", and not "N children in any order": Wazuh groups the parent and child
+    events on `same_*` and counts within `timeframe`, so a child that occurred
+    ten minutes later is not a child of this parent.
+
+    AN UNDECIDABLE PARENT IS NOT A PARENT. If the parent's own conditions cannot
+    be decided for a row, that row is neither fired nor counted against a child;
+    claiming the parent fired would inflate every downstream count.
+    """
+    out: list[Row] = []
+    if not rows:
+        return out
+
+    for parent_row in rows:
+        ctx.budget.spend(1, "package parent")
+        if node.parent and not _stage_matches(node.parent, parent_row, ctx):
+            continue
+
+        parent_time = as_number(parent_row.get(node.time_field or ""))
+        if parent_time is None:
+            ctx.add(Caveat(
+                "PACKAGE_UNDECIDABLE_TIME",
+                "the parent event has no usable timestamp on the declared time "
+                "field, so the timeframe cannot be established and this parent "
+                "was not decided",
+                1))
+            continue
+
+        if not node.children:
+            out.append(dict(parent_row))
+            continue
+
+        window_end = parent_time + node.timeframe.seconds
+        group_value = _package_group_value(parent_row, node.same_fields)
+
+        if group_value is None:
+            ctx.add(Caveat(
+                "PACKAGE_UNDECIDABLE_GROUP",
+                "a field named in same_* is absent from the parent event, so "
+                "there is no grouping key. Widening this to 'anywhere in the "
+                "log' would count unrelated events, so the parent is reported "
+                "without a child verdict rather than with a wrong one.",
+                1))
+            out.append(dict(parent_row))
+            continue
+
+        fired: list[str] = []
+        counted = 0
+        for child_index, child_condition in enumerate(node.children):
+            child_rows: list[Row] = []
+            for candidate in rows:
+                moment = as_number(candidate.get(node.time_field or ""))
+                if moment is None:
+                    continue
+                # THE WINDOW IS A REAL BOUND AND IT IS ANCHORED ON THE PARENT.
+                # Counting children anywhere in the log, or counting them in
+                # either direction, both make the frequency mean something other
+                # than what the rule says.
+                if moment <= parent_time or moment > window_end:
+                    continue
+                if _package_group_value(candidate, node.same_fields) != group_value:
+                    continue
+                if _stage_matches(child_condition, candidate, ctx):
+                    child_rows.append(candidate)
+
+            ctx.budget.spend(len(child_rows), "package child matching")
+            if len(child_rows) >= node.frequency:
+                counted += 1
+                fired.append(f"child_{child_index}")
+
+            annotated = dict(parent_row)
+            annotated["__package_children_matched__"] = counted
+            annotated["__package_children_required__"] = len(node.children)
+            annotated["__package_children_fired__"] = ",".join(fired)
+            out.append(annotated)
+
+    if len(out) > node.max_matches:
+        ctx.add(Caveat(
+            "PACKAGE_MATCH_LIMIT",
+            f"stopped at {node.max_matches} parent events; more may exist", 0))
+        out = out[:node.max_matches]
+    return out
+
+
+def _package_group_value(row: Row, fields: tuple[FieldRef, ...]) -> Any:
+    """The shared-field value, or UNDECIDED if any declared field is unusable.
+
+    A partial key is not a key. If `same_srcip` is absent, grouping the parent
+    with children that merely share a username would correlate two hosts'
+    activity into one story.
+    """
+    values: list[Any] = []
+    for spec in fields:
+        value = resolve_field(row, spec)
+        if is_undecided(value):
+            return None  # a partial key is not a key
+        values.append(value)
+    return tuple(values)
 
 
 def _row_time(row: Row, node: Pattern) -> Decimal | None:

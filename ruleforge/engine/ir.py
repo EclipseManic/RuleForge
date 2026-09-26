@@ -176,7 +176,7 @@ REGEX_FLAGS: Final = frozenset({"nocase"})
 #: fail for a type that was never supposed to be executed on its own.
 NODE_TYPES: Final = frozenset({
     "Read", "Filter", "Derive", "Aggregate", "Arrange",
-    "SetOp", "Join", "Expand", "Pattern", "Emit",
+    "SetOp", "Join", "Expand", "Pattern", "Package", "Emit",
 })
 
 #: Structural bounds. Enforced during validation, and each has a test that
@@ -859,6 +859,91 @@ class Pattern:
 
 
 @dataclass(frozen=True, slots=True)
+class Package:
+    """A parent trigger with children that react to it, per `if_matched_sid`.
+
+    THIS IS NOT A `Pattern`, and the difference is the whole reason it exists.
+
+    A `Pattern` says "these events happened in this order within this window",
+    and every stage is required. Wazuh's parent/child says something weaker and
+    different: the PARENT is a complete rule in its own right that fires on its
+    own, and a child is a *reaction* to it that is matched by a declared
+    frequency over a timeframe. A child with `frequency: 1` is not "the parent
+    happened once" -- it is "the parent's trigger, observed once", and Wazuh
+    counts occurrences of the shared field within the timeframe. Treating that
+    as a two-stage pattern would invent a sequence the rule never asserted, and
+    would silently drop the parent's standalone behaviour, which is what a user
+    watching the parent rule in the dashboard is actually seeing.
+
+    WHY THE SHARED FIELDS ARE MANDATORY
+    Wazuh's parent/child correlation works by grouping the parent and child
+    events on the fields listed in `same_*` and then counting within
+    `timeframe`. With no shared field there is no grouping key, so there is
+    nothing to count over -- the correlation degenerates to "anywhere in the
+    log", which is the shape that produces the enormous false-positive counts
+    people recognise and rightly distrust. A rule that claims `if_matched_sid`
+    with no `same_*` is refused rather than quietly widened.
+    """
+
+    id: str
+    input: str
+    #: The parent's own condition. It fires independently of any child.
+    parent: tuple[Any, ...] = ()
+    #: Child conditions, each a conjunction evaluated against child events.
+    children: tuple[tuple[Any, ...], ...] = ()
+    #: How many child occurrences satisfy a child. Wazuh's `frequency`.
+    frequency: int = 1
+    #: The window the frequency is counted over. Wazuh's `timeframe`.
+    timeframe: Duration = Duration(0)
+    #: Fields the parent and child must agree on. Wazuh's `same_srcip` and
+    #: friends. MANDATORY: without one there is no grouping key.
+    same_fields: tuple[FieldRef, ...] = ()
+    #: Which field orders the window. Never inferred, for the same reason
+    #: `Pattern.time_field` is not: ordering by a guessed column changes which
+    #: events are "then".
+    time_field: str | None = None
+    #: Set when a child used `if_matched_group`, which is a *group* trigger
+    #: rather than a single event. The two are not interchangeable.
+    child_uses_group: bool = False
+    max_matches: int = 100
+
+    def __post_init__(self) -> None:
+        if not self.parent and not self.children:
+            raise Refusal(
+                "PACKAGE_EMPTY",
+                "a package needs a parent or at least one child; with neither it "
+                "can never match", "Package")
+        if self.frequency <= 0:
+            raise Refusal("PACKAGE_FREQUENCY_INVALID",
+                          "frequency must be positive", "Package")
+        if not self.same_fields:
+            raise Refusal(
+                "PACKAGE_REQUIRES_SHARED_FIELD",
+                "parent/child correlation groups events on the declared same_* "
+                "fields and counts them within the timeframe. With no shared "
+                "field there is no grouping key, so the rule would mean 'anywhere "
+                "in the log' -- which is not what the author wrote and is the "
+                "shape that produces the false-positive floods this correlation "
+                "style is distrusted for. Declare which field ties them "
+                "together.", "Package")
+        if self.timeframe <= Duration(0):
+            raise Refusal(
+                "PACKAGE_REQUIRES_TIMEFRAME",
+                "a frequency is counted within a timeframe; with a zero "
+                "timeframe the count has no window to be counted over", "Package")
+        if self.time_field is None:
+            raise Refusal(
+                "PACKAGE_REQUIRES_TIME_FIELD",
+                "a package must say which field orders its window. Choosing one "
+                "by looking for a column that looks like a timestamp would let a "
+                "rule order by something unrelated and change the count.", "Package")
+        for index, child in enumerate(self.children):
+            if not child:
+                raise Refusal("PACKAGE_EMPTY_CHILD",
+                              f"child {index} has no conditions", "Package")
+
+
+@dataclass(frozen=True, slots=True)
 class Emit:
     id: str
     input: str
@@ -988,5 +1073,6 @@ def _node_from_dict(payload: dict[str, Any]) -> Any:
 
 
 NODE_CLASSES: Final = (
-    Read, Filter, Derive, Aggregate, Arrange, SetOp, Join, Expand, Pattern, Emit,
+    Read, Filter, Derive, Aggregate, Arrange, SetOp, Join, Expand, Pattern, Package,
+    Emit,
 )
