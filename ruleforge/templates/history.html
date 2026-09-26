@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>History</h1>
+
+{% if problem %}
+<div class="refusal">
+  <strong>The history file could not be read.</strong>
+  <p>{{ problem }}</p>
+  <p class="note">It has not been overwritten. Nothing is lost until you change it.</p>
+</div>
+{% elif not entries %}
+<p class="note">Nothing saved yet. Tick <em>Save to History</em> in the workshop.</p>
+{% else %}
+<p class="note">Append-only. There is no edit and no delete, here or through any route.</p>
+<table>
+  <thead><tr><th>When</th><th>Job</th><th>Syntax</th><th>Rule</th><th>Summary</th></tr></thead>
+  <tbody>
+    {% for e in entries %}
+    <tr>
+      <td class="when">{{ e.created_at }}</td>
+      <td>{{ e.kind }}</td>
+      <td><code>{{ e.dialect }}</code></td>
+      <td>{{ e.rule_id }}</td>
+      <td>{{ e.summary }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

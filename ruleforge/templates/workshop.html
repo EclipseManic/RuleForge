@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Workshop</h1>
+
+<div class="tabs" role="tablist">
+  <button class="tab active" data-tab="author" role="tab">Author</button>
+  <button class="tab" data-tab="tune" role="tab">Tune</button>
+  <button class="tab" data-tab="debug" role="tab">Debug</button>
+  <button class="tab" data-tab="understand" role="tab">Understand</button>
+</div>
+
+<section class="tabpanel" data-panel="author">
+  <div class="row">
+    <div class="col">
+      <label for="a-dialect">Syntax</label>
+      <select id="a-dialect">
+        {% for d in dialects %}<option value="{{ d.key }}">{{ d.label }}</option>{% endfor %}
+      </select>
+
+      <label for="a-rule">Your rule</label>
+      <textarea id="a-rule" rows="18" spellcheck="false"
+        placeholder="Paste the rule exactly as you wrote it. Whitespace and field names are preserved."></textarea>
+
+      <label for="a-id">Rule id</label>
+      <input id="a-id" value="rule" spellcheck="false">
+
+      <label class="check"><input type="checkbox" id="a-save"> Save to History</label>
+      <button class="go" data-job="author">Understand and re-render</button>
+    </div>
+    <div class="col out">
+      <h3>Result</h3>
+      <div class="findings"></div>
+      <h4>Written back</h4>
+      <pre class="rendered"></pre>
+      <h4>Graph</h4>
+      <div class="graph"></div>
+    </div>
+  </div>
+</section>
+
+<section class="tabpanel hidden" data-panel="tune">
+  <div class="row">
+    <div class="col">
+      <label for="t-dialect">Syntax</label>
+      <select id="t-dialect">
+        {% for d in dialects %}<option value="{{ d.key }}">{{ d.label }}</option>{% endfor %}
+      </select>
+
+      <label for="t-rule">Your rule</label>
+      <textarea id="t-rule" rows="12" spellcheck="false"></textarea>
+
+      <label for="t-events">Sample events <span class="hint">optional</span></label>
+      <textarea id="t-events" rows="10" spellcheck="false"
+        placeholder='A JSON array, or one JSON object per line.&#10;Without events you get the structural half only.'></textarea>
+
+      <button class="go" data-job="tune">Review</button>
+    </div>
+    <div class="col out">
+      <h3>Findings</h3>
+      <div class="findings"></div>
+      <h4>Measured</h4>
+      <div class="graph"></div>
+    </div>
+  </div>
+</section>
+
+<section class="tabpanel hidden" data-panel="debug">
+  <p class="note">
+    Two directions. Neither connects to your SIEM, and neither is a verification.
+  </p>
+  <div class="row">
+    <div class="col">
+      <h3>Rule &rarr; logs</h3>
+      <label for="d-dialect">Syntax</label>
+      <select id="d-dialect">
+        {% for d in dialects %}<option value="{{ d.key }}">{{ d.label }}</option>{% endfor %}
+      </select>
+      <label for="d-rule">Your rule</label>
+      <textarea id="d-rule" rows="10" spellcheck="false"></textarea>
+      <button class="go" data-job="debug_rule_to_logs">Find the events</button>
+    </div>
+    <div class="col">
+      <h3>Logs &rarr; rule</h3>
+      <label for="d-events">Sample events</label>
+      <textarea id="d-events" rows="14" spellcheck="false"
+        placeholder='A JSON array, or one JSON object per line.'></textarea>
+      <button class="go" data-job="debug_logs_to_rule">Induce a candidate</button>
+    </div>
+  </div>
+  <div class="out wide">
+    <h3>Result</h3>
+    <div class="findings"></div>
+    <h4>Written back</h4>
+    <pre class="rendered"></pre>
+    <h4>Fields in the sample</h4>
+    <div class="graph"></div>
+  </div>
+</section>
+
+<section class="tabpanel hidden" data-panel="understand">
+  <div class="row">
+    <div class="col">
+      <label for="u-dialect">Syntax</label>
+      <select id="u-dialect">
+        {% for d in dialects %}<option value="{{ d.key }}">{{ d.label }}</option>{% endfor %}
+      </select>
+      <label for="u-rule">Your rule</label>
+      <textarea id="u-rule" rows="18" spellcheck="false"></textarea>
+      <button class="go" data-job="understand">Explain</button>
+    </div>
+    <div class="col out">
+      <h3>Explanation</h3>
+      <div class="findings"></div>
+      <h4>Graph</h4>
+      <div class="graph"></div>
+    </div>
+  </div>
+</section>
+
+<script src="{{ url_for('static', filename='ruleforge.js') }}"></script>
+{% endblock %}

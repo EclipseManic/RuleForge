@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>A detection rule workbench</h1>
+
+<p class="lede">
+  Paste a rule in the syntax your SIEM actually uses. RuleForge reads it into one
+  shared form, shows you what it understood, and writes it back. Where it cannot
+  represent something, it says so by name rather than dropping it.
+</p>
+
+<section class="cards">
+  <article>
+    <h2>Author</h2>
+    <p>Paste a native rule. Get the graph it became, the parts RuleForge could
+      not read, and the rule written back in its own syntax.</p>
+  </article>
+  <article>
+    <h2>Tune</h2>
+    <p>Structural review always. Add sample events and the behavioural half
+      appears &mdash; measured against those events and nothing else.</p>
+  </article>
+  <article>
+    <h2>Debug</h2>
+    <p>Rule to logs: the search that returns the triggering events. Logs to rule:
+      a <em>candidate</em> rule, with what a sample cannot tell you stated plainly.</p>
+  </article>
+  <article>
+    <h2>Understand</h2>
+    <p>What the rule does, step by step, what each stage costs, and every
+      refusal built into it.</p>
+  </article>
+</section>
+
+<section>
+  <h2>Syntaxes handled</h2>
+  <table>
+    <thead><tr><th>Dialect</th><th>Target</th><th>Status</th></tr></thead>
+    <tbody>
+      {% for d in dialects %}
+      <tr>
+        <td>{{ d.label }}</td>
+        <td><code>{{ d.key }}</code></td>
+        <td>parse, understand, render{% if d.key == 'splunk' %}, evaluate{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="note">
+    Also targeted, not yet implemented:
+    {% for key, label in targets.items() %}{% if key not in dialects|map(attribute='key')|list %}<code>{{ key }}</code> ({{ label }}){% if not loop.last %}, {% endif %}{% endif %}{% endfor %}.
+  </p>
+</section>
+
+<section class="honest">
+  <h2>What this will not do</h2>
+  <ul>
+    <li>It will not guess a field mapping. Your field names pass through exactly.</li>
+    <li>It will not estimate a match rate from reading a rule. That needs events.</li>
+    <li>It will not connect to your SIEM. Nothing here is verified against your data.</li>
+    <li>It will not pick which difference in a log sample you meant.</li>
+  </ul>
+</section>
+{% endblock %}
