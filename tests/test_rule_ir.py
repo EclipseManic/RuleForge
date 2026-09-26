@@ -421,5 +421,128 @@ class ShadowModeTests(unittest.TestCase):
                         "the v1 serialisation must still exist unchanged")
 
 
-if __name__ == "__main__":
-    unittest.main()
+class LayerAgreementTests(unittest.TestCase):
+    """The layers must not be able to disagree about the model they share.
+
+    Three copies of one fact existed: `validate_ir` identified nodes by
+    `node.__class__.__name__`, while `rule_capabilities` and `kernel/eval_types` each declared
+    their own `NODE_TYPES`. They DID disagree — the validator accepted a class-name lookalike
+    that both other layers refused, so one graph produced two different answers, and the
+    disagreement fell in the direction that decides deployability. The same shape produced a
+    21-entry comparison allowlist for a 6-operator model.
+    """
+
+    def test_node_identity_is_defined_once(self):
+        from models import rule_capabilities, rule_ir
+        from kernel import eval_types
+        self.assertIs(rule_capabilities.NODE_TYPES, rule_ir.NODE_TYPES)
+        self.assertIs(eval_types.NODE_TYPES, rule_ir.NODE_TYPES)
+        self.assertIs(rule_capabilities.primitive_of, rule_ir.primitive_of)
+        self.assertIs(eval_types.primitive_of, rule_ir.primitive_of)
+
+    def test_node_types_covers_exactly_the_declared_primitives(self):
+        from models.rule_ir import NODE_TYPES, PRIMITIVE_NAMES
+        self.assertEqual(set(NODE_TYPES), set(PRIMITIVE_NAMES))
+
+    def test_validate_ir_refuses_a_class_name_lookalike(self):
+        """The disagreement itself, pinned.
+
+        `validate_ir` used to compute `isinstance(node, tuple(PRIMITIVE_NAMES and ()))`, which
+        is `isinstance(node, ())` - always False - so the type test never ran and the class
+        name decided.
+        """
+        from models.rule_ir import (Emit, Read, RuleIR, RuleIRValidationError,
+                                    validate_ir)
+
+        class Read:                                    # noqa: A001 - deliberately a lookalike
+            __name__ = "Read"
+
+            def __init__(self):
+                self.id = "r"
+
+        with self.assertRaises(RuleIRValidationError) as caught:
+            validate_ir(RuleIR(rule_id="spoof",
+                               nodes=(Read(), Emit(id="o", input="r")), output="o"))
+        self.assertEqual(caught.exception.code, "INVALID_NODE_TYPE")
+
+    def test_a_real_graph_still_validates(self):
+        from models.rule_ir import (Emit, Filter, FieldExpr, FieldRef, Literal, Read, RuleIR,
+                                    SourceSelector, validate_ir)
+        ir = RuleIR(rule_id="ok",
+                    nodes=(Read(id="r", selector=SourceSelector(name="events")),
+                           Filter(id="f", input="r",
+                                  condition=__import__("models.rule_ir", fromlist=[
+                                      "Comparison"]).Comparison(
+                                      "=", FieldExpr(FieldRef("a")), Literal(1))),
+                           Emit(id="o", input="f")),
+                    output="o")
+        validate_ir(ir)
+
+
+class StructuralBoundTests(unittest.TestCase):
+    """`validate_ir` bounds its own recursion rather than crashing and letting callers patch it.
+
+    A `try/except RecursionError` in one caller is a symptom fix that leaves every other
+    caller unprotected: the v1 adapter and the capability layer both call `validate_ir` and
+    neither had a guard.
+    """
+
+    def _chain(self, depth):
+        from models.rule_ir import (Derive, Emit, FieldRef, Literal, Read, RuleIR,
+                                    SourceSelector)
+        nodes = [Read(id="n0", selector=SourceSelector(name="events"))]
+        for i in range(1, depth):
+            nodes.append(Derive(id=f"n{i}", input=f"n{i - 1}",
+                                assignments=((FieldRef("x"), Literal(1)),)))
+        nodes.append(Emit(id="o", input=f"n{depth - 1}"))
+        return RuleIR(rule_id="deep", nodes=tuple(nodes), output="o")
+
+    def test_a_deep_expression_is_refused_with_a_code_not_a_crash(self):
+        from models.rule_ir import (BoolOp, Filter, Literal, Read, RuleIR, RuleIRValidationError,
+                                    SourceSelector, validate_ir)
+        expr = Literal(True)
+        for _ in range(3000):
+            expr = BoolOp("not", (expr,))
+        ir = RuleIR(rule_id="deep", nodes=(Read(id="r", selector=SourceSelector(name="e")),
+                                           Filter(id="f", input="r", condition=expr),
+                                           Emit(id="o", input="f")), output="o")
+        with self.assertRaises(RuleIRValidationError) as caught:
+            validate_ir(ir)
+        self.assertEqual(caught.exception.code, "EXPRESSION_TOO_DEEP")
+
+    def test_a_graph_too_large_to_walk_is_refused_with_a_code(self):
+        from models.rule_ir import MAX_GRAPH_NODES, RuleIRValidationError, validate_ir
+        with self.assertRaises(RuleIRValidationError) as caught:
+            validate_ir(self._chain(MAX_GRAPH_NODES + 50))
+        self.assertEqual(caught.exception.code, "GRAPH_TOO_LARGE")
+
+    def test_the_graph_walk_is_bounded_indirectly_by_the_node_bound(self):
+        """A depth counter in `_graph_cycle` was tried and REMOVED: it could not be shown to
+        fire, so it was decorative. What actually keeps the walk finite is MAX_GRAPH_NODES,
+        and that is what this pins - an indirect bound, recorded as such rather than dressed
+        up as a direct one."""
+        from models.rule_ir import MAX_GRAPH_NODES, RuleIRValidationError, validate_ir
+        self.assertGreater(MAX_GRAPH_NODES, 0)
+        with self.assertRaises(RuleIRValidationError) as caught:
+            validate_ir(self._chain(MAX_GRAPH_NODES + 1))
+        self.assertEqual(caught.exception.code, "GRAPH_TOO_LARGE")
+
+    def test_a_graph_within_the_bound_still_validates(self):
+        from models.rule_ir import validate_ir
+        validate_ir(self._chain(20))
+
+    def test_the_evaluate_boundary_still_returns_a_refusal_not_a_crash(self):
+        """The kernel's outer guard stays as a backstop, but the validator now refuses first."""
+        from kernel.eval import evaluate_ir
+        from kernel.eval_nodes import Sample
+        from models.rule_ir import (BoolOp, Emit, Filter, Literal, Read, RuleIR,
+                                    SourceSelector)
+        expr = Literal(True)
+        for _ in range(3000):
+            expr = BoolOp("not", (expr,))
+        ir = RuleIR(rule_id="deep", nodes=(Read(id="r", selector=SourceSelector(name="e")),
+                                           Filter(id="f", input="r", condition=expr),
+                                           Emit(id="o", input="f")), output="o")
+        result = evaluate_ir(ir, Sample({"r": [{"a": 1}]}))
+        self.assertEqual(result.state.value, "not_evaluated")
+        self.assertIsNotNone(result.reason)

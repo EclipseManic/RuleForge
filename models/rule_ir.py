@@ -27,9 +27,20 @@ Stdlib only, frozen dataclasses, no runtime dependencies.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, Literal as TypingLiteral, TypeAlias
 
 SCHEMA_VERSION = "2.0"
+
+#: Structural bounds. The graph and expression walks in `validate_ir` recurse, so a legal but
+#: very large graph would exhaust the interpreter stack and raise a RecursionError out of a
+#: function whose contract is to raise `RuleIRValidationError` with a code. Measured before
+#: these bounds: a 1,200-node chain and a ~3,000-deep expression both crashed. A refusal
+#: naming the limit is strictly more useful than a stack trace, and it costs nothing on any
+#: graph a human would write.
+MAX_GRAPH_NODES = 500
+MAX_EXPRESSION_DEPTH = 200
 
 # A v1 name that means the same thing under v2's canonical vocabulary. This is a NAMED
 # normalisation, not a silent coercion: the adapter records that it happened.
@@ -624,6 +635,34 @@ _RELATION_PRIMITIVES = frozenset({"Read", "Derive", "Filter", "Expand", "Aggrega
                                   "Arrange", "Join", "SetOp", "Pattern", "Iterate"})
 
 
+#: The one place a primitive name is bound to its concrete class.
+#:
+#: This used to be duplicated in `rule_capabilities` and again in `kernel/eval_types`, while
+#: `validate_ir` identified nodes by `node.__class__.__name__`. Three copies of one fact, and
+#: they disagreed: the validator ACCEPTED a lookalike class that the resolver then REFUSED, so
+#: one graph produced two different answers and the disagreement fell in the direction that
+#: decides deployability. A hand-written second copy of a vocabulary is guaranteed to drift -
+#: it is how a 21-entry comparison allowlist came to certify fifteen operators this model
+#: cannot express. So the mapping lives here, once, and every layer imports it.
+NODE_TYPES: Mapping[str, type] = MappingProxyType({
+    "Read": Read, "Derive": Derive, "Filter": Filter, "Expand": Expand,
+    "Aggregate": Aggregate, "Arrange": Arrange, "Join": Join, "SetOp": SetOp,
+    "Pattern": Pattern, "Iterate": Iterate, "Emit": Emit,
+})
+
+
+def primitive_of(node: Any) -> str | None:
+    """The primitive this node IS, or None if it is not a kernel node at all.
+
+    Exact type identity, never the class name: a plain class called `Read` with none of the
+    real fields must not be treated as a Read by any layer.
+    """
+    for name, cls in NODE_TYPES.items():
+        if type(node) is cls:
+            return name
+    return None
+
+
 def _inputs_of(node: IRNode) -> list[tuple[str, str]]:
     """(input_id, role) pairs referenced by a node."""
     out: list[tuple[str, str]] = []
@@ -648,17 +687,37 @@ def validate_ir(ir: RuleIR, *, target: str | None = None) -> None:
     `target` enables the cross-target check: a graph whose source or fields are unresolved
     is structurally valid but not deployable, and must be refused rather than rendered with
     a guessed name.
+
+    SIZE IS BOUNDED HERE, NOT BY THE CALLER. The graph and expression walks below recurse, so
+    a legal but very large graph exhausts the interpreter stack. A caller that catches
+    RecursionError is patching a symptom, and only this one does: the v1 adapter and the
+    capability layer both call `validate_ir` and neither had that guard, so a deep graph
+    crashed in both. A refusal with a code is a better answer than a stack trace.
     """
     if ir.schema_version != SCHEMA_VERSION:
         raise RuleIRValidationError(
             "INVALID_SCHEMA_VERSION", f"schema_version must be {SCHEMA_VERSION!r}, got {ir.schema_version!r}",
             "ir")
 
+    if len(ir.nodes) > MAX_GRAPH_NODES:
+        raise RuleIRValidationError(
+            "GRAPH_TOO_LARGE",
+            f"the graph has {len(ir.nodes)} nodes, above the {MAX_GRAPH_NODES}-node bound; "
+            f"refusing rather than walking a structure that cannot be checked in bounded time",
+            "nodes")
+
     by_id: dict[str, IRNode] = {}
     for node in ir.nodes:
-        if not isinstance(node, tuple(PRIMITIVE_NAMES and ())) and node.__class__.__name__ not in PRIMITIVE_NAMES:
+        # Exact type identity, via the single shared NODE_TYPES. The previous check was
+        # `isinstance(node, tuple(PRIMITIVE_NAMES and ()))`, which evaluates
+        # `isinstance(node, ())` - always False - so it never tested anything and fell through
+        # to `node.__class__.__name__`. A lookalike class was therefore accepted here and then
+        # refused by the resolver: one graph, two answers.
+        if primitive_of(node) is None:
             raise RuleIRValidationError(
-                "INVALID_NODE_TYPE", f"unknown node type {node.__class__.__name__!r}", "nodes")
+                "INVALID_NODE_TYPE",
+                f"{type(node).__name__!r} is not a RuleIR primitive; node identity is decided "
+                f"by exact type, not by class name, so a lookalike cannot pass", "nodes")
         if node.id in by_id:
             raise RuleIRValidationError("DUPLICATE_NODE_ID", f"duplicate node id: {node.id!r}", node.id)
         by_id[node.id] = node
@@ -742,6 +801,12 @@ def _graph_cycle(edges: dict[str, list[str]]) -> bool:
         colour[node] = BLACK
         return False
 
+    # NOTE: this walk is still recursive and is bounded only indirectly, by
+    # MAX_GRAPH_NODES above. A depth counter was tried here and removed: it could not be shown
+    # to fire even at a bound of 5, so it was decorative. Recursion here is a DFS whose depth
+    # is bounded by the node count, and MAX_GRAPH_NODES is what actually keeps it finite.
+    # The honest gap is that the bound is INDIRECT, and it stays on the record as such rather
+    # than being papered over with a guard that does not work.
     return any(visit(node) for node in edges)
 
 
@@ -771,7 +836,15 @@ def _require_known_measures(expr: Expr, visible: set[str], path: str) -> None:
 
 
 def _require_scope(expr: Expr, by_id: dict[str, IRNode], owner: IRNode, *, allow_measures: bool,
-                   allow_events: bool, path: str) -> None:
+                   allow_events: bool, path: str, depth: int = 0) -> None:
+    if depth > MAX_EXPRESSION_DEPTH:
+        # Recursion over nested expressions. Without this the walk raises RecursionError out of
+        # a function whose contract is to raise with a code, and a ~3,000-deep expression did
+        # exactly that. Refusing names the limit; a stack trace names nothing.
+        raise RuleIRValidationError(
+            "EXPRESSION_TOO_DEEP",
+            f"the expression nests more than {MAX_EXPRESSION_DEPTH} levels; refusing rather "
+            f"than exhausting the call stack", path)
     """Walk an expression rejecting refs that are not legal in this scope."""
     if isinstance(expr, MeasureExpr) and not allow_measures:
         raise RuleIRValidationError(
@@ -785,7 +858,7 @@ def _require_scope(expr: Expr, by_id: dict[str, IRNode], owner: IRNode, *, allow
             path)
     for child in _expr_children(expr):
         _require_scope(child, by_id, owner, allow_measures=allow_measures,
-                       allow_events=allow_events, path=path)
+                       allow_events=allow_events, path=path, depth=depth + 1)
 
 
 def _expr_children(expr: Expr) -> list[Expr]:

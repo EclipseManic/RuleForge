@@ -45,8 +45,7 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any
 
-from models.rule_ir import (Aggregate, Arrange, Derive, Emit, Expand, Filter, Iterate, Join,
-                            Pattern, Read, SetOp)
+from models.rule_ir import (NODE_TYPES as _NODE_TYPES, primitive_of as _primitive_of)
 
 #: Bound on a single expression walk. The kernel validator in models/rule_ir.py has the same
 #: gap and is reachable from here; this at least bounds the kernel's own recursion.
@@ -370,19 +369,9 @@ def columns_of(rows: Sequence[Row]) -> tuple[str, ...]:
     return tuple(sorted(names))
 
 
-#: The primitive name for each concrete node class, so identity is decided by `type(node) is
-#: cls` rather than by `__class__.__name__`. A lookalike class named `Read` with none of the
-#: real fields must not be treated as a Read.
-NODE_TYPES: Mapping[str, type] = MappingProxyType({
-    "Read": Read, "Derive": Derive, "Filter": Filter, "Expand": Expand,
-    "Aggregate": Aggregate, "Arrange": Arrange, "Join": Join, "SetOp": SetOp,
-    "Pattern": Pattern, "Iterate": Iterate, "Emit": Emit,
-})
-
-
-def primitive_of(node: Any) -> str | None:
-    """The kernel primitive this node IS, or None if it is not a kernel node at all."""
-    for name, cls in NODE_TYPES.items():
-        if type(node) is cls:
-            return name
-    return None
+#: Primitive identity comes from the model - see `models/rule_ir.NODE_TYPES`. The kernel used
+#: to declare its own copy. Three copies of one fact is how they come to disagree, and they
+#: did: `validate_ir` accepted a class-name lookalike that both of the others refused, so one
+#: graph produced two answers in the direction that decides deployability.
+NODE_TYPES = _NODE_TYPES
+primitive_of = _primitive_of

@@ -57,10 +57,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, get_args, get_origin, get_type_hints
 
-from models.rule_ir import (FUNCTION_CONTRACTS, Aggregate, Arrange, BoolOp, Call, Comparison,
-                            Derive, Emit, Expand, FieldRef, Filter, Iterate, Join, Pattern,
-                            PRIMITIVE_NAMES, Read, RuleIR, RuleIRValidationError, SetOp,
-                            SourceSelector, validate_ir)
+from models.rule_ir import (FUNCTION_CONTRACTS, NODE_TYPES as _NODE_TYPES, PRIMITIVE_NAMES,
+                            BoolOp, Call, Comparison, FieldRef, Read, RuleIR,
+                            RuleIRValidationError, SetOp, SourceSelector,
+                            primitive_of as _primitive_of, validate_ir)
 
 #: Support levels. `partial` is defined and is NOT allowed to yield a downloadable artifact.
 NATIVE = "native"
@@ -71,22 +71,14 @@ SUPPORT_LEVELS = frozenset({NATIVE, EQUIVALENT, REFUSED})
 _VERSION_RE = re.compile(r"\d+(?:\.\d+)*")
 
 
-#: The real node classes, so primitive identity is decided by `isinstance` and not by
-#: `node.__class__.__name__`. Name-based identity is spoofable: a plain class called `Read`
-#: with no fields would otherwise reach the emitter gate and be resolved as native.
-NODE_TYPES: dict[str, type] = {
-    "Read": Read, "Derive": Derive, "Filter": Filter, "Expand": Expand, "Aggregate": Aggregate,
-    "Arrange": Arrange, "Join": Join, "SetOp": SetOp, "Pattern": Pattern, "Iterate": Iterate,
-    "Emit": Emit,
-}
-
-
-def primitive_of(node: Any) -> str | None:
-    """The kernel primitive this node IS, or None if it is not a kernel node at all."""
-    for name, cls in NODE_TYPES.items():
-        if type(node) is cls:
-            return name
-    return None
+#: Primitive identity comes from the model itself - see `models/rule_ir.NODE_TYPES`. This
+#: module used to declare its own copy while `validate_ir` used a third opinion (the class
+#: name), so a lookalike node was ACCEPTED by the validator and REFUSED here: one graph, two
+#: answers, and the disagreement fell in the direction that decides deployability. A
+#: hand-written second copy of a vocabulary is guaranteed to drift - it is how a 21-entry
+#: comparison allowlist came to certify fifteen operators this model cannot express.
+NODE_TYPES = _NODE_TYPES
+primitive_of = _primitive_of
 
 
 # --------------------------------------------------------------------------
