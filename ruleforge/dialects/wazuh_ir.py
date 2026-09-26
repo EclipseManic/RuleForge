@@ -313,5 +313,16 @@ def _lower_correlation(rules: dict[str, WazuhRule], child: WazuhRule,
         Emit(id="out", input="correlate"),
     ]
 
+    metadata = rule_metadata(child)
+    # The parent id is what makes a correlation writable at all. Wazuh's
+    # `if_matched_sid` is a POINTER, so a renderer given only this rule has no way
+    # to produce a correlation that behaves like the original -- it would have to
+    # emit a child with no parent, which fires on everything. Recording the id
+    # here is what lets the renderer say so by name instead of guessing.
+    metadata["wazuh_parent"] = parent_id
+    if same:
+        metadata["wazuh_same"] = ",".join(same)
+    metadata["wazuh_count_subject"] = count_subject
+
     return RuleIR(rule_id=child.rule_id, nodes=tuple(nodes), output="out",
-                  title=child.description, metadata=rule_metadata(child))
+                  title=child.description, metadata=metadata)

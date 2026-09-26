@@ -30,10 +30,13 @@ from .spl import DIALECT as SPL_DIALECT
 from .spl import LANGUAGE as SPL_LANGUAGE
 from .spl import parse_spl
 from .spl_ir import lower as lower_spl
+from .spl_render import render as render_spl
 from .wazuh import DIALECT as WAZUH_DIALECT
 from .wazuh import LANGUAGE as WAZUH_LANGUAGE
 from .wazuh import parse_wazuh
 from .wazuh_ir import lower as lower_wazuh
+from .wazuh_render import render as render_wazuh
+from .kql_render import render as render_kql
 
 __all__ = [
     "Diagnostic",
@@ -41,11 +44,11 @@ __all__ = [
     "AQL_DIALECT", "AQL_LANGUAGE",
     "parse_yaral", "lower_yaral", "render_yaral",
     "YARAL_DIALECT", "YARAL_LANGUAGE",
-    "parse_kql", "lower_kql",
+    "parse_kql", "lower_kql", "render_kql",
     "KQL_DIALECT", "KQL_LANGUAGE",
-    "parse_wazuh", "lower_wazuh",
+    "parse_wazuh", "lower_wazuh", "render_wazuh",
     "WAZUH_DIALECT", "WAZUH_LANGUAGE",
-    "parse_spl", "lower_spl",
+    "parse_spl", "lower_spl", "render_spl",
     "SPL_DIALECT", "SPL_LANGUAGE",
     "TARGETS",
 ]
