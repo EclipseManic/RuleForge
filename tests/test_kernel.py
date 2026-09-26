@@ -1014,6 +1014,129 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertIs(result.verdict, Verdict.NOT_EVALUATED)
 
 
+class OrderingAndLabellingTests(unittest.TestCase):
+    """Fixes for the open items left after the review pass.
+
+    These are the same defect class as the reviewed ones - a confident answer that is quietly
+    wrong - and they were left open deliberately rather than half-fixed.
+    """
+
+    def test_multiple_order_keys_sort_lexicographically(self):
+        """The last declared key used to win outright.
+
+        `order_by=((a asc),(b asc))` over (2,1),(1,2),(1,1) returned [(1,1),(2,1),(1,2)]
+        instead of [(1,1),(1,2),(2,1)] - wrong rows for exactly the top-N-per-group shape
+        Arrange exists to express, with no refusal and no caveat.
+        """
+        rows = [{"a": 2, "b": 1}, {"a": 1, "b": 2}, {"a": 1, "b": 1}]
+        result = evaluate(rows, read(),
+                          Arrange(id="s", input="r",
+                                  order_by=((FieldExpr(FieldRef("a")), True),
+                                             (FieldExpr(FieldRef("b")), True))),
+                          emit("s"))
+        self.assertEqual([(r.values["a"], r.values["b"]) for r in result.rows],
+                         [(1, 1), (1, 2), (2, 1)])
+
+    def test_mixed_direction_keys_each_honour_their_own_direction(self):
+        rows = [{"a": 1, "b": 1}, {"a": 1, "b": 2}, {"a": 2, "b": 1}]
+        result = evaluate(rows, read(),
+                          Arrange(id="s", input="r",
+                                  order_by=((FieldExpr(FieldRef("a")), True),
+                                             (FieldExpr(FieldRef("b")), False))),
+                          emit("s"))
+        self.assertEqual([(r.values["a"], r.values["b"]) for r in result.rows],
+                         [(1, 2), (1, 1), (2, 1)])
+
+    def test_top_n_per_group_uses_all_keys_before_the_limit(self):
+        """The shape the node is justified by: order by a, then b, then limit."""
+        rows = [{"u": "a", "n": 1, "t": 9}, {"u": "a", "n": 2, "t": 8},
+                {"u": "a", "n": 3, "t": 7}, {"u": "b", "n": 1, "t": 6}]
+        result = evaluate(rows, read(),
+                          Arrange(id="s", input="r",
+                                  order_by=((FieldExpr(FieldRef("u")), True),
+                                             (FieldExpr(FieldRef("n")), False)),
+                                  limit=2),
+                          emit("s"))
+        self.assertEqual([(r.values["u"], r.values["n"]) for r in result.rows],
+                         [("a", 3), ("a", 2)])
+
+    def test_an_unknown_key_still_sorts_last_with_several_keys(self):
+        rows = [{"a": 1, "b": 1}, {"a": 1}, {"a": 0, "b": 9}]
+        result = evaluate(rows, read(),
+                          Arrange(id="s", input="r",
+                                  order_by=((FieldExpr(FieldRef("a")), True),
+                                             (FieldExpr(FieldRef("b")), True))),
+                          emit("s"))
+        self.assertEqual(result.rows[-1].values.get("b"), None,
+                         "the row missing the second key must sort last")
+
+    def test_emit_order_by_is_applied_rather_than_silently_dropped(self):
+        """The model declares Emit.order_by and an earlier version ignored it entirely, so a
+        declared alert ordering vanished with no refusal and no caveat - the same 'silently
+        drop a declared parameter' pattern 3A refuses for Frame.offset_seconds."""
+        result = evaluate([{"n": 3}, {"n": 1}, {"n": 2}], read(),
+                          Emit(id="o", input="r",
+                               order_by=((FieldExpr(FieldRef("n")), True),)), output="o")
+        self.assertEqual([r.values["n"] for r in result.rows], [1, 2, 3])
+        self.assertIn("EMIT_ORDER_BY_APPLIED", result.caveat_codes())
+
+    def test_an_all_undecidable_filter_does_not_assert_a_negative_it_does_not_have(self):
+        """Every row lacked the field, so the kernel holds zero evidence either way, yet the
+        verdict label was about to say 'Matched nothing in the sample'."""
+        result = evaluate([{"other": 1}, {"other": 2}], read(),
+                          Filter(id="f", input="r",
+                                 condition=Comparison("=", FieldExpr(FieldRef("event_category")),
+                                                      Literal("authentication"))),
+                          emit("f"))
+        self.assertIs(result.verdict, Verdict.NO_MATCH)
+        self.assertEqual(result.counts.rows_predicate_unknown, 2)
+        self.assertIn("NO_EVIDENCE_ROWS_WERE_ALL_UNDECIDABLE", result.caveat_codes())
+
+    def test_a_filter_that_decisively_rejects_everything_gets_no_such_caveat(self):
+        """The caveat must not fire when rows were genuinely FALSE - that would dilute it."""
+        result = evaluate([{"c": "a"}, {"c": "b"}], read(),
+                          Filter(id="f", input="r",
+                                 condition=Comparison("=", FieldExpr(FieldRef("c")),
+                                                      Literal("z"))),
+                          emit("f"))
+        self.assertIs(result.verdict, Verdict.NO_MATCH)
+        self.assertNotIn("NO_EVIDENCE_ROWS_WERE_ALL_UNDECIDABLE", result.caveat_codes())
+
+    def test_a_refused_node_marks_everything_after_it_as_skipped(self):
+        """`skipped_from` used to be assigned and then returned past, so no result could ever
+        contain a `skipped` entry and the module docstring's claim was false."""
+        from models.rule_ir import Join
+        result = evaluate_ir(
+            graph(read(),
+                  Join(id="j", left="r", right="r", kind="full",
+                       on=Comparison("=", FieldExpr(FieldRef("a")), Literal(1))),
+                  Derive(id="d", input="j",
+                         assignments=((FieldRef("x"), Literal(1)),)),
+                  emit("d")),
+            sample([{"a": 1}], "r"))
+        self.assertIs(result.verdict, Verdict.NOT_EVALUATED)
+        statuses = {t.node_id: t.status for t in result.trace}
+        self.assertEqual(statuses.get("j"), "refused")
+        self.assertEqual(statuses.get("d"), "skipped")
+        self.assertEqual(statuses.get("o"), "skipped")
+
+    def test_a_non_mapping_sample_row_is_a_named_refusal_not_a_crash(self):
+        """EVAL_INPUT_INVALID was registered and never raised, so a string row escaped as an
+        uncaught TypeError from inside a row builder."""
+        for bad in ("notadict", None, 42, ["a"]):
+            result = evaluate_ir(graph(read(), emit("r")), Sample({"r": [bad]}))
+            self.assertEqual(result.reason.code, "EVAL_INPUT_INVALID", repr(bad))
+            self.assertIs(result.verdict, Verdict.NOT_EVALUATED)
+
+    def test_an_unknown_counter_name_is_an_obvious_mistake_not_a_new_attribute(self):
+        from kernel.eval_expr import EvalContext
+        from kernel.eval_types import EvalCounts
+        ctx = EvalContext(counts=EvalCounts(), unmodelled=[])
+        with self.assertRaises(AttributeError):
+            ctx.unknown("nonexistent_bucket")
+        self.assertFalse(hasattr(ctx.counts, "nonexistent_bucket"))
+
+
 class ShadowModeTests(unittest.TestCase):
     def test_nothing_in_the_application_imports_the_kernel(self):
         for module in ("app.py", "rule_engine.py", "compiler/pipeline.py",

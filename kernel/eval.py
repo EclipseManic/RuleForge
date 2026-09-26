@@ -19,6 +19,7 @@ of a coincidentally-empty result looking identical to a genuine no-match.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from kernel.eval_errors import KERNEL_EVAL_CODES, EvaluationRefusal, not_evaluated
@@ -305,6 +306,74 @@ def _exec_aggregate(node: Aggregate, rows: list[Row], ctx: EvalContext,
     return out
 
 
+class _SortKey:
+    """One sort position, carrying its own direction and its own unknown-ness.
+
+    A single sort over a composite key, not a re-sort per key. The earlier version sorted once
+    per declared key, so the LAST key won outright: `order_by=((a asc),(b asc))` returned
+    [(1,1),(2,1),(1,2)] instead of [(1,1),(1,2),(2,1)] - wrong rows for exactly the
+    top-N-per-group shape Arrange exists to express, with no refusal and no caveat.
+
+    An unknown key sorts after every known one, in BOTH directions. Nulls-first was rejected:
+    it silently promotes unmeasurable rows to the top of a `limit N`, which is the most
+    damaging ordering error and the hardest to notice.
+    """
+
+    __slots__ = ("unknown", "value", "ascending")
+
+    def __init__(self, unknown: bool, value: Any, ascending: bool) -> None:
+        self.unknown = unknown
+        self.value = value
+        self.ascending = ascending
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _SortKey) and self._parts() == other._parts()
+
+    def __lt__(self, other: "_SortKey") -> bool:
+        if self.unknown != other.unknown:
+            return not self.unknown
+        if self.ascending:
+            return _safe_less(self.value, other.value)
+        return _safe_less(other.value, self.value)
+
+    def _parts(self) -> tuple:
+        return (self.unknown, repr(self.value), self.ascending)
+
+
+def _safe_less(left: Any, right: Any) -> bool:
+    """A total order, so a heterogeneous key set cannot raise mid-sort.
+
+    `canonical` type-tags values, so equal tags compare cleanly. Different tags can still yield
+    incomparable payloads (a frozenset against a str), and a sort that raises is a crash where
+    an order was wanted.
+    """
+    try:
+        return bool(left < right)
+    except TypeError:
+        return repr(left) < repr(right)
+
+
+def _order_rows(order_by: Any, rows: list[Row], ctx: EvalContext, caveats: list[Caveat],
+                node_id: str, prefix: str) -> tuple[list[Row], int]:
+    """Lexicographic multi-key ordering. Shared by Arrange and Emit so they cannot disagree."""
+    unknown_keys = 0
+
+    def composite(row: Row) -> tuple:
+        nonlocal unknown_keys
+        parts = []
+        for expr, ascending in order_by:
+            value = evaluate(expr, row, ctx, None)
+            if value is ABSENT or value is None:
+                unknown_keys += 1
+                parts.append(_SortKey(True, None, ascending))
+            else:
+                parts.append(_SortKey(False, canonical(value), ascending))
+        return tuple(parts)
+
+    keyed = [(composite(row), row) for row in rows]
+    return [row for _key, row in sorted(keyed, key=lambda t: t[0])], unknown_keys
+
+
 def _exec_arrange(node: Arrange, rows: list[Row], ctx: EvalContext,
                   caveats: list[Caveat]) -> list[Row]:
     """Sort -> distinct_on -> offset -> limit, in that fixed order.
@@ -314,27 +383,9 @@ def _exec_arrange(node: Arrange, rows: list[Row], ctx: EvalContext,
     """
     if not node.order_by:
         caveats.append(Caveat("ARRANGE_WITHOUT_ORDER_IS_INPUT_ORDER", nodes=(node.id,)))
-
-    unknown_keys = 0
-
-    def key_of(row: Row, expr: Any) -> tuple[int, Any]:
-        """(is_unknown, value). An unknown key sorts after every known one."""
-        nonlocal unknown_keys
-        value = evaluate(expr, row, ctx, None)
-        if value is ABSENT or value is None:
-            unknown_keys += 1
-            return (1, ())
-        return (0, canonical(value))
-
-    for key_expr, ascending in node.order_by:
-        keyed = [(key_of(row, key_expr), row) for row in rows]
-        known = sorted([t for t in keyed if t[0][0] == 0],
-                       key=lambda t: t[0][1], reverse=not ascending)
-        unknown = [t[1] for t in keyed if t[0][0] == 1]
-        # Unknown keys go LAST in both directions. Nulls-first was rejected: it silently
-        # promotes unmeasurable rows to the top of a `limit N`, which is the most damaging
-        # possible ordering error and the hardest to notice.
-        rows = [row for _key, row in known] + unknown
+    else:
+        rows, unknown_keys = _order_rows(node.order_by, rows, ctx, caveats, node.id, "ARRANGE")
+        ctx.counts.rows_with_unknown_order_key += unknown_keys
 
     if node.distinct_on:
         caveats.append(Caveat("DISTINCT_ON_APPLIED_AFTER_ORDER", nodes=(node.id,)))
@@ -354,7 +405,6 @@ def _exec_arrange(node: Arrange, rows: list[Row], ctx: EvalContext,
         rows = rows[offset:]
     if node.limit is not None:
         rows = rows[:node.limit]
-    ctx.counts.rows_with_unknown_order_key += unknown_keys
     return rows
 
 
@@ -403,6 +453,15 @@ def _dedupe(rows: list[Row], ctx: EvalContext) -> list[Row]:
 
 def _exec_emit(node: Emit, rows: list[Row], ctx: EvalContext,
                caveats: list[Caveat]) -> list[Row]:
+    if node.order_by:
+        # The model declares this and an earlier version ignored it, so a declared alert
+        # ordering vanished with no refusal and no caveat. That is the same "silently drop a
+        # declared parameter" pattern 3A refuses for `Frame.offset_seconds` via
+        # FRAME_OFFSET_NOT_APPLICABLE, so it is applied here rather than ignored. Emit is the
+        # natural place for a declared output ordering.
+        rows, unknown_keys = _order_rows(node.order_by, rows, ctx, caveats, node.id, "EMIT")
+        ctx.counts.rows_with_unknown_order_key += unknown_keys
+        caveats.append(Caveat("EMIT_ORDER_BY_APPLIED", nodes=(node.id,)))
     if node.columns:
         present = {c for c in node.columns}
         out = []
@@ -523,6 +582,18 @@ def evaluate_ir(ir: RuleIR, sample: Sample) -> EvaluationResult:
             f"the sample exceeds {MAX_INPUT_ROWS} rows; refusing rather than truncating, "
             f"because dropping rows would silently change the verdict"), counts)
 
+    for read_id, rows in sample.rows_by_read.items():
+        for index, entry in enumerate(rows):
+            # The input contract is now actually enforced. `EVAL_INPUT_INVALID` was registered
+            # and never raised, so `Sample({"r": ["notadict"]})` escaped as an uncaught
+            # TypeError from deep inside a row builder rather than as a named refusal.
+            if not isinstance(entry, Mapping):
+                return not_evaluated(EvaluationRefusal(
+                    "EVAL_INPUT_INVALID",
+                    f"sample row {index} for Read {read_id!r} is a "
+                    f"{type(entry).__name__}, not a mapping of field names to values", read_id),
+                    counts)
+
     refusal = _preflight(ir, sample)
     if refusal is not None:
         return not_evaluated(refusal, counts, unmodelled=tuple(unmodelled))
@@ -541,17 +612,10 @@ def evaluate_ir(ir: RuleIR, sample: Sample) -> EvaluationResult:
 
         node_by_id = {n.id: n for n in ir.nodes}
         order = _order(ir)
-        skipped_from: str | None = None
 
         for node in order:
             primitive = _primitive_of(node)
             node_id = node.id
-
-            if skipped_from is not None:
-                # A downstream node of a refused node is `skipped`, never `evaluated` with
-                # zero rows. That distinction is what makes a missing node observable.
-                trace.append(NodeTrace(node_id, primitive, "skipped"))
-                continue
 
             try:
                 if isinstance(node, Read):
@@ -583,11 +647,16 @@ def evaluate_ir(ir: RuleIR, sample: Sample) -> EvaluationResult:
                     produced, detail = _exec_scalar(node, values, node_by_id, ctx, caveats, sample)
                 values[node_id] = produced
             except EvaluationRefusal as exc:
-                if exc.deferred_to:
-                    # Already caught at pre-flight; a repeat here would be a pre-flight gap.
-                    skipped_from = node_id
                 trace.append(NodeTrace(node_id, primitive, "refused",
                                        refusal_code=exc.code))
+                # Everything still to run is `skipped`, never `evaluated` with zero rows. This
+                # used to be unreachable: the flag was set and the function returned
+                # immediately, so no result could ever contain a `skipped` entry and the
+                # module docstring's claim about it was false. It matters because it is what
+                # makes "a required node is missing" visible in the trace rather than
+                # indistinguishable from a node that ran and matched nothing.
+                for later in order[order.index(node) + 1:]:
+                    trace.append(NodeTrace(later.id, _primitive_of(later), "skipped"))
                 return not_evaluated(
                     EvaluationRefusal(exc.code, exc.message, exc.path or node_id,
                                       exc.deferred_to),
@@ -669,7 +738,16 @@ def _exec_scalar(node: Any, values: dict[str, list[Row]], node_by_id: dict[str, 
         return _exec_derive(node, source, ctx), {"assignments": len(node.assignments),
                                                 "drop": len(node.drop)}
     if isinstance(node, Filter):
-        return _exec_filter(node, source, ctx), {}
+        produced = _exec_filter(node, source, ctx)
+        if not produced and ctx.counts.rows_predicate_unknown and source:
+            # Every row was dropped for absence of evidence, and the verdict label is about to
+            # say "Matched nothing in the sample". With zero rows carrying any evidence either
+            # way, that label asserts a negative the kernel does not have. The Filter
+            # behaviour itself is right - the disagreement is the label, so the label is
+            # qualified.
+            caveats.append(Caveat("NO_EVIDENCE_ROWS_WERE_ALL_UNDECIDABLE",
+                                  count=ctx.counts.rows_predicate_unknown, nodes=(node.id,)))
+        return produced, {}
 
     if isinstance(node, Aggregate):
         if node.frame is not None:

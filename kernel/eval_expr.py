@@ -62,8 +62,16 @@ class EvalContext:
     depth: int = 0
 
     def unknown(self, bucket: str) -> None:
-        """Record an UNKNOWN. An uncounted UNKNOWN is a silent guess."""
-        self.counts.arithmetic_unknown += 0  # keep attribute access explicit
+        """Record an UNKNOWN. An uncounted UNKNOWN is a silent guess.
+
+        The bucket name is checked against the counters that exist. An earlier version had a
+        no-op `arithmetic_unknown += 0` line whose only effect was to raise AttributeError for
+        a typo'd name, which turned a typo into a crash instead of into an obvious mistake.
+        """
+        if not hasattr(self.counts, bucket):
+            raise AttributeError(
+                f"{bucket!r} is not an EvalCounts field; an UNKNOWN must be counted in a "
+                f"real counter, not invented on the fly")
         setattr(self.counts, bucket, getattr(self.counts, bucket) + 1)
 
     def caveat(self, code: str, node: str | None = None) -> None:
