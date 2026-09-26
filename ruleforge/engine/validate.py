@@ -259,6 +259,20 @@ def _screen_regexes(node: Any) -> None:
             for item in value.values():
                 walk(item, depth + 1)
             return
+        # `operands` IS ITS OWN CASE, NOT PART OF THE `Call` BRANCH.
+        #
+        # The descent into `operands` used to live at the end of the `Call` arm,
+        # behind `hasattr(value, "function") and hasattr(value, "args")`. A
+        # `BoolOp` has `operands` and NEITHER of those, so it never reached the
+        # loop -- the arm returned nothing and the walk stopped. The result was
+        # that `Filter(eq)` was screened and `Filter(BoolOp("and", (eq, rx)))`
+        # was not, so the ReDoS guard was defeated by ADDING A SECOND `<field>`
+        # to a Wazuh rule, or an `and` to a KQL `where`. App-reachable, and the
+        # guard is the whole reason `validate_graph` screens patterns at all.
+        if hasattr(value, "operands"):
+            for operand in getattr(value, "operands", ()) or ():
+                walk(operand, depth + 1)
+            return
         if hasattr(value, "function") and hasattr(value, "args"):
             for arg in getattr(value, "args", ()):
                 if isinstance(arg, str) and "regex" in str(
@@ -268,8 +282,6 @@ def _screen_regexes(node: Any) -> None:
                 walk(arg, depth + 1)
             for attr in ("left", "right"):
                 walk(getattr(value, attr, None), depth + 1)
-            for operand in getattr(value, "operands", ()) or ():
-                walk(operand, depth + 1)
             return
         if hasattr(value, "name"):
             walk(getattr(value, "pattern", None), depth + 1)

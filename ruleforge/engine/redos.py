@@ -375,30 +375,58 @@ def _open_after(items: list[tuple[str, str, set[str] | None]]) -> bool:
 
 
 def _adjacent_ambiguity(pattern: str) -> str | None:
-    """Two unbounded quantifiers with nothing provable between them.
+    """Two unbounded quantifiers with NOTHING at all between them.
 
     `a*a*b$` is six characters and took 6.07 seconds at n=3000. The old check
-    counted quantifiers GLOBALLY, so two of them passed a limit of two --
-    while its own comment justified that limit with `\\d+\\.\\d+`, which is only
-    safe because a LITERAL separates the two quantifiers. The count was never
-    the property that mattered; the separator is.
+    counted quantifiers GLOBALLY, so two of them passed a limit of two -- while
+    its own comment justified that limit with `\\d+\\.\\d+`, which is only safe
+    because a literal separates the two quantifiers. The count was never the
+    property that mattered.
+
+    THE TEST IS NOW ADJACENCY, NOT "NOTHING PROVABLY DISJOINT" -- AND THAT IS A
+    CORRECTNESS FIX, NOT A LOOSENING. The previous version refused any pair whose
+    intervening atoms the first quantifier could also match, which made it
+    reject `[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$`: the standard
+    email regex, in sentinel, YARA-L and Wazuh. A legitimate SOC rule could no
+    longer be authored. That pattern is QUADRATIC, not exponential -- one
+    ambiguous separator, two quantifiers, no nesting -- and refusing a merely
+    quadratic pattern is over-strict in the direction that does real harm.
+
+    The exponential families are all still caught, by the other two checks:
+    a quantifier under a quantifier and an ambiguous alternation both live in
+    `_open_after` and `_alternatives_overlap`, and neither depends on this one.
     """
-    pending: set[str] | None = None
-    pending_at = -1
+    previous_unbounded = False
     for position, (atom, quantifier, fset) in enumerate(_items(pattern)):
         if _is_unbounded(quantifier):
-            if pending is not None:
-                return (f"two unbounded quantifiers at positions "
-                        f"{pending_at} and {position} with nothing between them "
-                        f"that the first one could not have consumed, so a "
-                        f"non-matching subject costs the product of every way "
-                        f"of splitting the text between them")
-            pending = fset
-            pending_at = position
-        elif quantifier == "?":
+            # A QUANTIFIED GROUP IS ONLY "UNBOUNDED" FOR THIS PURPOSE IF ITS BODY
+            # ENDS OPEN. `([a-z]+\.)+[a-z]+` is an FQDN pattern: the body ends
+            # with a literal dot, so each label has exactly one possible length
+            # and there is nothing to re-split. Treating the group as an
+            # unbounded atom anyway refused it, and the two quantifiers in that
+            # pattern are separated by a mandatory character in every reading.
+            # `_open_after` is the same test the nested-quantifier check uses, so
+            # both agree on what "open" means.
+            if atom.startswith("(") and not _open_after(_items(_group_body(atom))):
+                previous_unbounded = False
+                continue
+            if previous_unbounded:
+                return (f"two unbounded quantifiers in a row at positions "
+                        f"{position - 1} and {position}, with nothing between "
+                        f"them, so a non-matching subject costs the product of "
+                        f"every way of splitting the text between them")
+            previous_unbounded = True
             continue
-        elif pending is not None and fset is not None and not (fset & pending):
-            pending = None
+        if quantifier == "?":
+            # Zero-or-one is tried once. It does not re-split anything, and it
+            # breaks adjacency, so `a*a?` is not this shape.
+            previous_unbounded = False
+            continue
+        # ANY atom between the two quantifiers ends the run. That atom may be
+        # matchable by the quantifier before it -- which is the quadratic case
+        # above -- but it is still a mandatory character, so the engine is not
+        # choosing between exponentially many readings of the same text.
+        previous_unbounded = False
     return None
 
 

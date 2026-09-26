@@ -332,8 +332,8 @@ def render(ir: RuleIR) -> str:
     search is not a QRadar rule and calling it one is the mistake this tool
     exists to prevent.
     """
-    where = ""
-    having = ""
+    where_terms: list[str] = []
+    having_terms: list[str] = []
     group_by: list[str] = []
     select_items: list[str] = []
     order_by: list[str] = []
@@ -346,18 +346,24 @@ def render(ir: RuleIR) -> str:
             source = node.selector.name
         elif name == "Filter":
             text = _render_expr(node.condition)
-            # THESE ACCUMULATED. THEY ASSIGNED. `where = ...` inside a loop over
-            # `ir.nodes` means the LAST Filter wins and every earlier one is
-            # discarded -- so `index=windows EventCode=4625 | search bytes>1024`
-            # rendered `SELECT * FROM events WHERE bytes > '1024'` with the index
-            # and the event-code selection silently GONE. The rule did not fail
-            # to match; it matched a much larger set of events than it said, and
-            # the only thing on the artifact was the cosmetic
-            # "not a deployable QRadar rule" header. Same for `having`.
+            # THESE ACCUMULATE, AND THEY ACCUMULATE INTO A LIST.
+            #
+            # Round 6 fixed the loss by changing `where = ` to `where += `, which
+            # stopped discarding the earlier filters and immediately created a
+            # second bug: AQL has ONE `WHERE` keyword, so two pre-aggregate
+            # Filters emitted
+            #
+            #     WHERE EventCode = '4625'
+            #     WHERE bytes = '1024'
+            #
+            # which QRadar rejects. Round 7 caught it. So the fix traded silent
+            # widening for a query that will not load, which is not a fix.
+            # AQL conjoins predicates with AND inside a single clause, so the
+            # list is joined once at the end.
             if _is_post_aggregate(ir, node):
-                having += f"\nHAVING {text}"
+                having_terms.append(text)
             else:
-                where += f"\nWHERE {text}"
+                where_terms.append(text)
         elif name == "Aggregate":
             group_by = [k.name for k in node.keys]
             for measure in node.measures:
@@ -412,12 +418,16 @@ def render(ir: RuleIR) -> str:
              "-- create offenses. See cre_from_ir for that shape.",
              "SELECT " + ", ".join(select_items),
              f"FROM {source}"]
-    if where:
-        lines.append(where)
+    # ONE `WHERE`, ONE `HAVING`. AQL has exactly one of each, and it conjoins
+    # predicates with AND inside the clause. Emitting a second keyword does not
+    # merge the conditions -- it produces a query the engine rejects, which is a
+    # different failure from the one the accumulation was introduced to stop.
+    if where_terms:
+        lines.append("WHERE " + " AND ".join(where_terms))
     if group_by:
         lines.append("GROUP BY " + ", ".join(group_by))
-    if having:
-        lines.append(having)
+    if having_terms:
+        lines.append("HAVING " + " AND ".join(having_terms))
     if order_by:
         lines.append("ORDER BY " + ", ".join(order_by))
     if limit:
