@@ -153,7 +153,9 @@ def _scalar_comparison(subject: Any, pattern: str, kind: str) -> Any:
     return Comparison(op="=", left=subject, right=Literal(value=literal))
 
 
-def _rule_condition(rule: WazuhRule) -> tuple[Any, ...]:
+def _rule_condition(rule: WazuhRule,
+                    diagnostics: list[dict[str, Any]] | None = None,
+                    ) -> tuple[Any, ...]:
     """Every `<field>` in a rule, ANDed. An empty rule has NO condition.
 
     A negated equality becomes a `not` over the comparison. A negated REGEX is
@@ -190,6 +192,29 @@ def _rule_condition(rule: WazuhRule) -> tuple[Any, ...]:
             f"rule that matches EVERY event while reporting success. Add a "
             f"<field> to say what the event must contain, or evaluate this rule "
             f"in Wazuh, where the decoder is real.", "wazuh")
+
+    # THE COMMENT ABOVE PROMISED THIS DIAGNOSTIC AND NOTHING WROTE IT.
+    # `_rule_condition` had no `diagnostics` parameter at all, so the claim was
+    # not merely unimplemented -- it was structurally impossible, and the round-6
+    # security review pointed at exactly that: "The comment is false about its
+    # own code; that is worse than the bug, because it is what a reviewer would
+    # check." A reviewer reads the comment, believes the gap is disclosed, and
+    # ships a rule that fires on any decoder's `eventID=577`. So the parameter
+    # exists now and the note is emitted, which is what the comment always
+    # described.
+    if decoder_only and diagnostics is not None:
+        names = ", ".join(sorted(decoder_only))
+        diagnostics.append({
+            "code": "WAZUH_DECODER_PREDICATE_DROPPED",
+            "severity": "caution",
+            "rule_id": rule.rule_id,
+            "message": (
+                f"rule {rule.rule_id} also requires {names}. The rule matches on "
+                f"the <field> alone, so it will fire on that field's value from "
+                f"ANY decoder, not only the one this rule names. The IR cannot "
+                f"carry a decoder constraint. Re-check the source rule in Wazuh, "
+                f"where the decoder is real."),
+        })
     return tuple(conditions)
 
 
@@ -208,7 +233,7 @@ def _lower_plain(chain: Any, time_field: str, source_name: str,
     """
     conditions: list[Any] = []
     for rule in chain.rules:
-        conditions.extend(_rule_condition(rule))
+        conditions.extend(_rule_condition(rule, diagnostics))
 
     nodes: list[Any] = [_read("read", source_name), Emit(id="out", input="read")]
     if conditions:
@@ -259,7 +284,7 @@ def _lower_correlation(rules: dict[str, WazuhRule], child: WazuhRule,
     parent_chain = resolve_chain(rules, parent_id)
     parent_conditions: list[Any] = []
     for ancestor in parent_chain.rules:
-        parent_conditions.extend(_rule_condition(ancestor))
+        parent_conditions.extend(_rule_condition(ancestor, diagnostics))
 
     osconf = dict(osconf or {})
 
@@ -272,7 +297,7 @@ def _lower_correlation(rules: dict[str, WazuhRule], child: WazuhRule,
     frequency = resolve(child.frequency, "frequency")
     timeframe = resolve(child.timeframe, "timeframe")
 
-    child_conditions = _rule_condition(child)
+    child_conditions = _rule_condition(child, diagnostics)
     if not child_conditions:
         # Wazuh allows a child with no `<field>` of its own, meaning "the parent,
         # N times". That is legal and must not be refused -- but it must be

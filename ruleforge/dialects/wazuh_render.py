@@ -209,17 +209,35 @@ def _render_correlation(ir: RuleIR, package: Package, rule_id: str,
     # counting 5-in-300s on whatever matched the parent. A `Filter` is
     # renderable on its own, so the generic node check above waves it past --
     # which is why this has to be caught here, where the two node kinds meet.
-    orphans = [n for n in ir.nodes if isinstance(n, Filter)]
+    # EVERY NODE BESIDE THE CORRELATION IS AN ORPHAN, NOT JUST A `Filter`.
+    #
+    # `_render_correlation` reads `package.children` and never looked at
+    # `ir.nodes`, so anything next to a `Package` simply vanished. A `Filter` was
+    # caught in round 6; a `Derive` was not, and neither was a second `Package`,
+    # because both passed the generic allow-list above (`Derive` is renderable on
+    # its own, and `Package` is `next(...)`-ed at the dispatch) and then fell
+    # through here. The reviewer's probe was
+    # `Filter(secret_field == "NEEDLE")` plus a Package, and the rendered rule
+    # contained the correlation and neither the filter nor any mention of the
+    # field.
+    #
+    # Enumerating `Filter` was the same mistake one level down: it fixed the
+    # instance a reviewer happened to try. This asks the question directly --
+    # is this node the correlation, or something else that will not be written?
+    orphans = [n for n in ir.nodes
+               if n is not package
+               and type(n).__name__ not in ("Read", "Emit", "SetRule")]
     if orphans:
+        kinds = ", ".join(sorted({type(n).__name__ for n in orphans}))
         raise Refusal(
-            "WAZUH_CORRELATION_WITH_TRAILING_FILTER",
-            f"this rule has a correlation and {len(orphans)} condition(s) that "
-            f"are not part of it. A Wazuh correlation's own conditions live in "
-            f"its child, and a condition beside it was being dropped -- so the "
-            f"rule rendered as a bare count of whatever matched the parent, "
-            f"which is a different and much broader rule than the one you "
-            f"asked about. Re-parse the source XML, or render with the dialect "
-            f"that can express a correlation and a filter together.", DIALECT)
+            "WAZUH_CORRELATION_WITH_TRAILING_NODE",
+            f"this rule has a correlation and {len(orphans)} node(s) beside it "
+            f"({kinds}). A Wazuh correlation's own conditions live in its child, "
+            f"so anything next to it was being dropped -- which meant the "
+            f"rendered rule counted whatever matched the parent and nothing "
+            f"else, a much broader rule than the one you asked about. Re-parse "
+            f"the source XML, or render with the dialect that can express a "
+            f"correlation and other nodes together.", DIALECT)
 
     same = ", ".join(field.full for field in package.same_fields)
     if not same:
