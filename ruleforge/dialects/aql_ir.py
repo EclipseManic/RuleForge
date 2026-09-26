@@ -346,10 +346,18 @@ def render(ir: RuleIR) -> str:
             source = node.selector.name
         elif name == "Filter":
             text = _render_expr(node.condition)
+            # THESE ACCUMULATED. THEY ASSIGNED. `where = ...` inside a loop over
+            # `ir.nodes` means the LAST Filter wins and every earlier one is
+            # discarded -- so `index=windows EventCode=4625 | search bytes>1024`
+            # rendered `SELECT * FROM events WHERE bytes > '1024'` with the index
+            # and the event-code selection silently GONE. The rule did not fail
+            # to match; it matched a much larger set of events than it said, and
+            # the only thing on the artifact was the cosmetic
+            # "not a deployable QRadar rule" header. Same for `having`.
             if _is_post_aggregate(ir, node):
-                having = f"\nHAVING {text}"
+                having += f"\nHAVING {text}"
             else:
-                where = f"\nWHERE {text}"
+                where += f"\nWHERE {text}"
         elif name == "Aggregate":
             group_by = [k.name for k in node.keys]
             for measure in node.measures:
@@ -470,7 +478,15 @@ def _render_expr(node: Any) -> str:
             return f"{_render_expr(node.left)} IS NOT NULL"
         return f"{_render_expr(node.left)} {node.op} {_render_expr(node.right)}"
     if isinstance(node, FieldExpr):
-        return node.ref.name
+        # `ref.name` IS ONLY THE FIRST SEGMENT. `FieldRef` splits
+        # `win.eventdata.CommandLine` into `name='win'` and
+        # `path=('eventdata','CommandLine')`, so this rendered
+        # `WHERE MATCHES(win, 'lsass.exe')` -- the index and the event code
+        # selection silently gone, and the rule broadened to every event with
+        # that property. `render_splunk` and `render_sentinel` build the full
+        # path from the same IR, so the renderers disagreed about what a field
+        # name is. `full` is the whole dotted path.
+        return node.ref.full
     if isinstance(node, Literal):
         return _render_literal(node)
     raise Refusal("AQL_RENDER_UNSUPPORTED",

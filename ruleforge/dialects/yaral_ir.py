@@ -265,7 +265,32 @@ def render(ir: RuleIR) -> str:
     meta_lines: list[str] = []
     for key, value in sorted(ir.metadata.items()):
         if key.startswith("meta_"):
-            meta_lines.append(f"  {key[len('meta_'):]} = {json_escape(value)}")
+            # THE VALUE WAS ESCAPED AND THE KEY WAS NOT. `parse_yaral` takes
+            # `key.strip()` from anything left of the first `=`, unbounded, so
+            # pasting
+            #
+            #     evil} rule pwned { condition: true = "1"
+            #
+            # closed the meta block, opened a second attacker-chosen rule, and
+            # the real rule followed it. `jobs.author("yaral", ...)` returned
+            # ok=True and the emitted artifact had `rule ` twice and
+            # `condition:` twice -- and RuleForge re-reading its own output saw
+            # ONE rule and no diagnostics, so nothing inside the tool noticed.
+            #
+            # This is the third door in one function. Round 4 hardened
+            # `ir.title`, then the meta VALUE, and left the key and the field
+            # name. A meta key is an identifier by grammar, so validating it is
+            # the correct rendering rather than a fallback.
+            name = key[len("meta_"):]
+            if not _IDENTIFIER.fullmatch(name):
+                raise Refusal(
+                    "YARAL_META_KEY_NOT_AN_IDENTIFIER",
+                    f"the metadata key {name!r} cannot be written as a YARA-L "
+                    f"meta entry, because it is not a plain identifier. "
+                    f"Interpolating it raw would let a pasted rule close the "
+                    f"meta block and open a second rule of its own. Rename the "
+                    f"key to letters, digits and underscores.", "render")
+            meta_lines.append(f"  {name} = {json_escape(value)}")
 
     event_lines: list[str] = []
     condition_terms: list[str] = []
@@ -323,11 +348,33 @@ def render(ir: RuleIR) -> str:
                 f"nodes this renderer does support are Pattern and Filter.",
                 "render")
 
+    # NEVER EMIT AN ALWAYS-TRUE RULE. Round 4 removed one CAUSE of this -- an
+    # unrenderable node falling through -- but left the EFFECT, which is the two
+    # fallbacks below. A Wazuh rule with no `<field>` lowers to `nodes =
+    # [Read, Emit]`, and that rendered as:
+    #
+    #     events:  $e0.metadata.event_type = ""
+    #     condition:
+    #
+    # which parses, loads, and matches every event. So the fallbacks are not a
+    # graceful default; they are the always-true rule, spelled out. `validate_graph`
+    # does not catch it, and RuleForge re-reading its own output reported no
+    # diagnostics. If there is nothing to assert, say so.
+    if not event_lines or not condition_terms:
+        raise Refusal(
+            "YARAL_NOTHING_TO_ASSERT",
+            "this rule has no condition, so the YARA-L output would be a rule "
+            "that matches every event -- an `events:` block testing that an "
+            "unrelated field is empty, with an empty `condition:`. There is no "
+            "honest way to render a rule that asserts nothing, so this is "
+            "refused. If the source rule really has no condition, it is a "
+            "category or a grouping rule, not a detection.", "render")
+
     out_lines = ["rule " + _rule_name(ir), "{", "  meta:"]
     out_lines.extend(meta_lines or ["    author = \"unknown\""])
     out_lines.append("")
     out_lines.append("  events:")
-    out_lines.extend(event_lines or ["    $e0.metadata.event_type = \"\""])
+    out_lines.extend(event_lines)
     out_lines.append("")
     if match_keys and window:
         out_lines.append("  match:")
@@ -450,10 +497,47 @@ def _regex_literal(pattern: str) -> str:
     return pattern.replace("/", "\\/")
 
 
+_FIELD_PATH = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
+
+
 def _field_of(node: Any) -> str:
+    """The event field, in FULL, and only if it is one.
+
+    TWO DEFECTS IN ONE LINE.
+
+    It returned `node.ref.name`, which is the FIRST SEGMENT. `FieldRef` splits
+    `win.eventdata.CommandLine` into `name='win'` and
+    `path=('eventdata','CommandLine')`, so every dotted field rendered as a test
+    against a column called `win` -- silently, in an artifact with no
+    "not deployable" banner, so `$e0.win = /lsass\.exe/` reads as a finished rule
+    that tests a column nobody has. `render_wazuh` and `render_sentinel` build
+    the path correctly from the same IR, so the renderers disagreed about what a
+    field name IS. This affects every dotted Wazuh field, which is the entire
+    eventchannel chain.
+
+    And the name went into the artifact unvalidated. A Wazuh `<field
+    name="a&#10;rule pwned {&#10;  condition: true&#10;}">` -- XML decodes
+    `&#10;` to a real newline -- emitted a complete attacker-chosen rule inside
+    the events block, while the VALUE on the same line went through
+    `json_escape`. That is the fourth door in this renderer after the title, the
+    meta value and the meta key.
+    """
     if isinstance(node, FieldExpr):
-        return node.ref.name
-    return str(node)
+        full = node.ref.full
+        if not _FIELD_PATH.fullmatch(full):
+            raise Refusal(
+                "YARAL_FIELD_NAME_NOT_A_PATH",
+                f"the event field {full!r} is not a dotted field path made of "
+                f"letters, digits and underscores. Wazuh field names come from "
+                f"XML attributes, so a newline or a brace in one would be "
+                f"written straight into the rule body and could open a second "
+                f"rule. This renderer will not emit a field name it cannot "
+                f"prove is inert.", "render")
+        return full
+    raise Refusal(
+        "YARAL_FIELD_NOT_A_FIELD",
+        f"a {type(node).__name__} is not an event field, so it cannot be "
+        f"written on the left of a YARA-L events comparison.", "render")
 
 
 def _var_of(node: Any) -> str:

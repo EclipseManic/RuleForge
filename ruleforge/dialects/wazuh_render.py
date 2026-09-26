@@ -83,24 +83,44 @@ def render(ir: RuleIR) -> str:
     # explains the output -- rather than the generic complaint about whichever
     # node happened to be visited first. Both are refusals, so both are
     # fail-closed; the difference is only whether the message is useful.
-    if package is not None:
-        return _render_correlation(ir, package, rule_id, level)
+    # THE NODE CHECK MUST RUN FIRST, NOT AFTER THE DISPATCH.
+    #
+    # It used to sit below `if package is not None: return _render_correlation(...)`,
+    # so any `Package` bypassed it entirely -- which reopened the exact hole the
+    # check was added for, one branch earlier in the same function. Round 5 caught
+    # it with `Package` + `SetOp(union)`, `Package` + a top-level `Filter`, and
+    # `Package` + `Derive(projects=True)`: all rendered clean, all silently
+    # dropped the other node, all left the correlation with no condition of its
+    # own counting 5-in-300s. The function also never inspected `ir.nodes` for a
+    # `Filter`, which is why the original "correlation dropped its own <field>"
+    # bug survived here in the first place.
+    # AN AGGREGATE REACHES ITS OWN REFUSAL FIRST, ALWAYS.
+    #
+    # `_render_plain` refuses unconditionally when an Aggregate is present, so
+    # putting this first cannot let anything through -- it only decides WHICH
+    # refusal the analyst sees. WAZUH_RENDER_AGGREGATE_NOT_A_RULE says "a Wazuh
+    # rule tests event fields, not computed columns"; the generic node check
+    # would say "SetOp is not renderable" about some other node in the same
+    # graph, which is true and useless.
     if aggregate is not None:
         return _render_plain(ir, filters, derive, aggregate, rule_id, level)
 
     for node in ir.nodes:
-        if isinstance(node, (Filter, Derive, Aggregate)):
+        if isinstance(node, (Filter, Package, Derive, Aggregate)):
             continue
         if type(node).__name__ in ("Read", "Emit", "SetRule"):
             continue
         raise Refusal(
             "WAZUH_NODE_NOT_RENDERABLE",
-            f"this rule contains a {type(node).__name__} node, and a Wazuh rule "
-            f"cannot express one. It was being dropped silently, which meant a "
-            f"union came out as an intersection and a join came out as no join "
-            f"at all -- a rule that matches a different set of events than the "
-            f"one you asked about. Render it with the dialect that supports it.",
-            DIALECT)
+            f"this rule contains a {type(node).__name__} node, and a Wazuh "
+            f"rule cannot express one alongside the rest of what it asks for. "
+            f"It was being dropped silently, which meant a union came out as an "
+            f"intersection and a correlation lost its own condition -- a rule "
+            f"matching a different set of events than the one you asked about. "
+            f"Render it with the dialect that supports it.", DIALECT)
+
+    if package is not None:
+        return _render_correlation(ir, package, rule_id, level)
 
     if filters:
         return _render_plain(ir, filters, derive, aggregate, rule_id, level)
@@ -179,6 +199,27 @@ def _render_correlation(ir: RuleIR, package: Package, rule_id: str,
             "so there is no way to write a correlation that would behave like the "
             "one this came from. Re-parse the original XML instead of rendering "
             "the IR alone.", DIALECT)
+
+    # A TOP-LEVEL FILTER ALONGSIDE A CORRELATION IS DROPPED, NOT RENDERED.
+    # `_render_correlation` reads `package.children` and never looks at
+    # `ir.nodes`, so a `Filter` next to a `Package` simply vanished: the reviewer's
+    # probe was `Filter(secret_field == "NEEDLE")` + a Package, and the rendered
+    # rule contained the correlation and neither the filter nor any mention of
+    # the field. The correlation was emitted with no condition of its own,
+    # counting 5-in-300s on whatever matched the parent. A `Filter` is
+    # renderable on its own, so the generic node check above waves it past --
+    # which is why this has to be caught here, where the two node kinds meet.
+    orphans = [n for n in ir.nodes if isinstance(n, Filter)]
+    if orphans:
+        raise Refusal(
+            "WAZUH_CORRELATION_WITH_TRAILING_FILTER",
+            f"this rule has a correlation and {len(orphans)} condition(s) that "
+            f"are not part of it. A Wazuh correlation's own conditions live in "
+            f"its child, and a condition beside it was being dropped -- so the "
+            f"rule rendered as a bare count of whatever matched the parent, "
+            f"which is a different and much broader rule than the one you "
+            f"asked about. Re-parse the source XML, or render with the dialect "
+            f"that can express a correlation and a filter together.", DIALECT)
 
     same = ", ".join(field.full for field in package.same_fields)
     if not same:

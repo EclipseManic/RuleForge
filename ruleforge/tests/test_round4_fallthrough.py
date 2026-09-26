@@ -222,6 +222,36 @@ class WazuhUnrenderableNodesAreNamed(unittest.TestCase):
             render_wazuh(_union_ir())
         self.assertEqual(caught.exception.code, "WAZUH_NODE_NOT_RENDERABLE")
 
+    def test_a_package_does_not_bypass_the_node_check(self):
+        """THE CHECK ONCE SAT BELOW THE PACKAGE DISPATCH.
+
+        `if package is not None: return _render_correlation(...)` came first, so
+        any Package skipped the check entirely and a sibling node was dropped
+        silently -- the same hole the check was added for, one branch earlier in
+        the same function. Round 5 reached it three ways: Package + SetOp,
+        Package + a top-level Filter, and Package + Derive(projects=True).
+        """
+        from ruleforge.engine.ir import (Comparison, FieldExpr, FieldRef, Filter,
+                                        Literal, SetOp)
+        base, _ = lower_wazuh(CORRELATION, "300")
+        secret = Filter(id="s", input="r", condition=Comparison(
+            "=", FieldExpr(FieldRef("secret_field", ())), Literal("NEEDLE")))
+        for label, extra, expected in (
+                ("SetOp", (SetOp(id="u", op="union", left="s", right="s",
+                                 keys=(FieldRef("secret_field", ()),)),),
+                 "WAZUH_NODE_NOT_RENDERABLE"),
+                # A `Filter` IS renderable on its own, so the generic check waves
+                # it past -- and the correlation renderer never looked at
+                # `ir.nodes`, so it vanished. Different code, same defect: a
+                # condition the analyst wrote, gone from the artifact.
+                ("Filter", (secret,),
+                 "WAZUH_CORRELATION_WITH_TRAILING_FILTER")):
+            with self.subTest(extra_node=label):
+                with self.assertRaises(Refusal) as caught:
+                    render_wazuh(dataclasses.replace(
+                        base, nodes=base.nodes + extra))
+                self.assertEqual(caught.exception.code, expected)
+
 
 class YaraLUnrenderableNodesAreNamed(unittest.TestCase):
     """THE ALWAYS-TRUE RULE.
