@@ -808,7 +808,8 @@ def audit() -> list[str]:
             # Silently refusing every expression would look like a working strict check.
             problems.append(f"vocabulary {name!r} resolved EMPTY from the model; the preflight "
                             f"would refuse every value instead of every unknown one")
-    if vocabulary()["comparison"] != frozenset({"=", "!=", "<", "<=", ">", ">="}):
+    if vocabulary()["comparison"] != frozenset({"=", "!=", "<", "<=", ">", ">=",
+                                                "exists", "is_not_null"}):
         problems.append(f"the model's comparison vocabulary changed: "
                         f"{sorted(vocabulary()['comparison'])}")
 

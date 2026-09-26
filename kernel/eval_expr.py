@@ -364,16 +364,12 @@ def _evaluate_call(expr: Call, row: Row, ctx: EvalContext, scope: Any) -> Any:
             f"{expr.function!r} called with {len(expr.args)} argument(s); the contract allows "
             f"{allowed}", "Call")
 
-    if contract.get("dialect") == "must_be_declared":
-        # `Call` has no `dialect` field, so this is unconditionally true. An undeclared regex
-        # dialect is not portable: (?i), \d vs [[:digit:]] and PCRE-vs-POSIX disagree on real
-        # analyst input. Refusing is the only honest option until Call carries a dialect.
-        raise EvaluationRefusal(
-            "FUNCTION_DIALECT_UNDECLARED",
-            f"{expr.function!r} requires an explicit dialect declaration, and the expression "
-            f"algebra has nowhere to declare one; an undeclared regex dialect is not portable",
-            "Call")
-
+    # The `must_be_declared` check is GONE. `Call.dialect` now exists and the model refuses a
+    # dialect-sensitive call that omits it, so the branch that used to sit here was
+    # unconditionally true for a different reason and could never be reached with a
+    # well-formed Call. EVALUATING each named dialect is the next increment; until then a
+    # declared-dialect matches_regex reaches `_apply_function` and is refused there, which is
+    # stated rather than pretended.
     args = [evaluate(a, row, ctx, scope) for a in expr.args]
     return _apply_function(expr.function, args, ctx)
 

@@ -156,21 +156,11 @@ def _check_frame(frame: Frame) -> list[Caveat]:
     if frame.kind not in _FRAME_KINDS:
         raise EvaluationRefusal("IR_UNSUPPORTED_PARAMETERS",
                                 f"unknown frame kind {frame.kind!r}", "frame")
-    if frame.kind == "sliding":
-        # Frame has `size` and `offset_seconds` but no step. "Sliding window" without an
-        # advance rate is two different operators, and picking either is exactly the
-        # plausible-but-wrong temporal guess this project must not make.
-        raise EvaluationRefusal(
-            "FRAME_SLIDING_STEP_UNDECLARED",
-            "a sliding frame needs an advance rate, and Frame declares only a size and an "
-            "offset; a grid advancing by the size would be a tumbling window under another "
-            "name, so the kernel refuses rather than pick a reading", "frame")
-    if frame.alignment == "explicit":
-        # Frame has an alignment Literal but no anchor field, so any origin would be invented.
-        raise EvaluationRefusal(
-            "FRAME_ALIGNMENT_UNANCHORED",
-            "an explicit frame alignment needs an origin, and Frame declares no anchor; any "
-            "origin the kernel chose would be invented", "frame")
+    # `sliding` and `alignment="explicit"` are no longer refused HERE. The model now carries
+    # `Frame.step` and `Frame.anchor` and refuses at construction when either is missing, which
+    # is strictly better: a sliding frame without an advance rate cannot be built, rather than
+    # being built and then rejected. The branches that used to live here could never fire, and
+    # a guard that cannot fire is read as protection while checking nothing.
     if frame.kind in ("per_event", "cumulative", "session"):
         if frame.offset_seconds:
             raise EvaluationRefusal(
@@ -299,15 +289,10 @@ _COUNT_SENTINEL = _CountSentinel()
 def _aggregate_group(rows: list[Row], node: Aggregate, ctx: EvalContext,
                      scope: dict[str, Any]) -> None:
     for measure in node.measures:
-        if measure.function in _ARG_EXTREME:
-            # Measure carries one `field` and no ordering field, so "the value of A where B is
-            # maximal" is inexpressible. Reading arg_max(f) as max(f) would make it identical
-            # to max and pass as an implementation while guessing.
-            raise EvaluationRefusal(
-                "MEASURE_ARG_EXTREME_UNDER_SPECIFIED",
-                f"measure {measure.name!r} uses {measure.function!r}, which needs a value field "
-                f"AND an ordering field; Measure declares only one field, so the intent cannot "
-                f"be recovered without guessing", measure.name)
+        # `arg_max`/`arg_min` are no longer refused here. `Measure.by` exists and the model
+        # refuses a measure that declares only one of the two fields, so the branch that used
+        # to live here could never fire. EVALUATING them is the next increment, not refusing
+        # them: a guard that cannot fire is read as protection while checking nothing.
         if measure.function in _NEEDS_FIELD and measure.field is None:
             raise EvaluationRefusal(
                 "MEASURE_FIELD_REQUIRED",

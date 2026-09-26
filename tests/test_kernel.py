@@ -214,11 +214,26 @@ class AggregationTests(unittest.TestCase):
             emit("f"))
         self.assertEqual([dict(r.values) for r in result.rows], [{"u": "alice", "Hits": 3}])
 
-    def test_arg_max_is_refused_rather_than_guessed(self):
-        result = self._grouped([{"u": "a", "v": 1}],
-                               (Measure("x", "arg_max", field=FieldRef("v")),))
-        self.assertIs(result.verdict, Verdict.NOT_EVALUATED)
-        self.assertEqual(result.reason.code, "MEASURE_ARG_EXTREME_UNDER_SPECIFIED")
+    def test_arg_max_needs_two_fields_and_the_model_says_so(self):
+        """The MODEL refuses now, which is stronger.
+
+        `Measure` had one `field` and no ordering field, so "the value of A where B is largest"
+        was unrecoverable and the kernel could only refuse at evaluation time. `Measure.by`
+        closes the gap, so the refusal moved to construction - and a `by` on a measure that
+        does not use it is itself refused, because a declared-but-ignored parameter is a
+        parameter that goes missing unnoticed.
+        """
+        from models.rule_ir import RuleIRValidationError
+        with self.assertRaises(RuleIRValidationError) as caught:
+            Measure("x", "arg_max", field=FieldRef("v"))
+        self.assertEqual(caught.exception.code, "ARG_EXTREME_REQUIRES_TWO_FIELDS")
+
+        ok = Measure("x", "arg_max", field=FieldRef("v"), by=FieldRef("t"))
+        self.assertEqual(ok.by.name, "t")
+
+        with self.assertRaises(RuleIRValidationError) as caught:
+            Measure("n", "count", by=FieldRef("t"))
+        self.assertEqual(caught.exception.code, "ORDERING_FIELD_NOT_APPLICABLE")
 
     def test_an_unknown_measure_reference_is_refused(self):
         result = evaluate([{"u": "a"}], read(),
@@ -250,16 +265,30 @@ class WindowTests(unittest.TestCase):
         result = self._tumbling([{"t": 0}, {"t": 5}], 10)
         self.assertEqual(result.counts.windows, 1)
 
-    def test_a_sliding_frame_is_refused_because_it_has_no_step(self):
-        result = self._tumbling([{"t": 0}], 10, kind="sliding")
-        self.assertEqual(result.reason.code, "FRAME_SLIDING_STEP_UNDECLARED")
+    def test_a_sliding_frame_without_a_step_cannot_even_be_built(self):
+        """The MODEL refuses now. A sliding window with no advance rate is two different
+        operators wearing one name, so `Frame.step` is required rather than guessed."""
+        from models.rule_ir import RuleIRValidationError
+        with self.assertRaises(RuleIRValidationError) as caught:
+            Frame(kind="sliding", size=Duration(10))
+        self.assertEqual(caught.exception.code, "FRAME_REQUIRES_STEP")
+        ok = Frame(kind="sliding", size=Duration(600), step=Duration(60))
+        self.assertEqual(ok.step.seconds, 60)
+        with self.assertRaises(RuleIRValidationError) as caught:
+            Frame(kind="tumbling", size=Duration(10), step=Duration(1))
+        self.assertEqual(caught.exception.code, "FRAME_STEP_NOT_APPLICABLE")
 
-    def test_explicit_alignment_is_refused_because_it_has_no_anchor(self):
-        frame = Frame(kind="tumbling", size=Duration(10), alignment="explicit",
-                      time_ref=TimeRef(field_name="t"))
-        agg = Aggregate(id="a", input="r", measures=(Measure("n", "count"),), frame=frame)
-        result = evaluate([{"t": 0}], read(), agg, emit("a"))
-        self.assertEqual(result.reason.code, "FRAME_ALIGNMENT_UNANCHORED")
+    def test_explicit_alignment_without_an_anchor_cannot_even_be_built(self):
+        from models.rule_ir import RuleIRValidationError
+        with self.assertRaises(RuleIRValidationError) as caught:
+            Frame(kind="tumbling", size=Duration(10), alignment="explicit")
+        self.assertEqual(caught.exception.code, "FRAME_REQUIRES_ANCHOR")
+        ok = Frame(kind="tumbling", size=Duration(10), alignment="explicit",
+                   anchor=FieldRef("t"))
+        self.assertEqual(ok.anchor.name, "t")
+        with self.assertRaises(RuleIRValidationError) as caught:
+            Frame(kind="tumbling", size=Duration(10), anchor=FieldRef("t"))
+        self.assertEqual(caught.exception.code, "FRAME_ANCHOR_NOT_APPLICABLE")
 
     def test_an_unresolvable_time_field_is_never_guessed(self):
         frame = Frame(kind="tumbling", size=Duration(10))
@@ -514,15 +543,15 @@ class ExpressionTests(unittest.TestCase):
                           emit("f"))
         self.assertEqual(result.reason.code, "FUNCTION_ARITY_VIOLATION")
 
-    def test_matches_regex_is_refused_because_no_dialect_can_be_declared(self):
-        result = evaluate([{"a": "x"}], read(),
-                          Filter(id="f", input="r",
-                                 condition=Comparison("=", FieldExpr(FieldRef("a")),
-                                                      Call("matches_regex",
-                                                           (FieldExpr(FieldRef("a")),
-                                                            Literal("^x"))))),
-                          emit("f"))
-        self.assertEqual(result.reason.code, "FUNCTION_DIALECT_UNDECLARED")
+    def test_matches_regex_cannot_be_built_without_a_dialect(self):
+        """The MODEL refuses now. An undeclared regex dialect is not portable - `(?i)`, `\\d`
+        vs `[[:digit:]]` and PCRE-vs-POSIX genuinely disagree on real analyst input - so
+        `Call.dialect` makes the declaration possible and the refusal happens at
+        construction rather than at evaluation."""
+        from models.rule_ir import Call, RuleIRValidationError
+        with self.assertRaises(RuleIRValidationError) as caught:
+            Call("matches_regex", (FieldExpr(FieldRef("a")), Literal("^x")))
+        self.assertEqual(caught.exception.code, "DIALECT_REQUIRED")
 
     def test_contains_is_case_insensitive_but_starts_with_is_not(self):
         """The contracts differ: only `contains` declares a case rule."""

@@ -126,7 +126,16 @@ FrameKind = TypingLiteral["tumbling", "sliding", "session", "per_event", "cumula
 @dataclass(frozen=True)
 class Frame:
     """Temporal/partition visibility. This is where every 'window' in the old model
-    belonged, and they are still distinct from one another."""
+    belonged, and they are still distinct from one another.
+
+    `anchor` and `step` close two gaps that made whole kinds inexpressible. `alignment` said
+    "explicit" with no slot to say explicit ABOUT WHAT, so any origin the kernel picked was
+    invented; and `sliding` had a size but no advance rate, which is two different operators
+    wearing one name - a grid advancing by the size is a tumbling window, and a grid advancing
+    by something smaller is a sliding one. Both are optional, and both are REQUIRED when the
+    rest of the frame says they are, because a new field that can be omitted with no consequence
+    is just a new way to be quietly wrong.
+    """
 
     kind: FrameKind
     size: Duration | None = None
@@ -134,12 +143,37 @@ class Frame:
     alignment: TypingLiteral["epoch", "explicit"] = "epoch"
     offset_seconds: int = 0
     partition_by: tuple[FieldRef, ...] = ()
+    anchor: FieldRef | None = None
+    step: Duration | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "partition_by", tuple(self.partition_by or ()))
         if self.kind in {"tumbling", "sliding", "session"} and self.size is None:
             raise RuleIRValidationError(
                 "FRAME_REQUIRES_SIZE", f"Frame(kind={self.kind!r}) needs a size", "frame")
+        if self.alignment == "explicit" and self.anchor is None:
+            raise RuleIRValidationError(
+                "FRAME_REQUIRES_ANCHOR",
+                "alignment='explicit' says the window is aligned to something specific, so "
+                "that something must be named in `anchor`; without it any origin would be "
+                "invented", "frame")
+        if self.alignment == "epoch" and self.anchor is not None:
+            raise RuleIRValidationError(
+                "FRAME_ANCHOR_NOT_APPLICABLE",
+                "alignment='epoch' already fixes the origin at the Unix epoch, so `anchor` "
+                "has no meaning here; a declared-but-ignored parameter is a parameter that "
+                "goes missing unnoticed", "frame")
+        if self.kind == "sliding" and self.step is None:
+            raise RuleIRValidationError(
+                "FRAME_REQUIRES_STEP",
+                "a sliding frame needs an advance rate in `step`; a grid advancing by `size` "
+                "is a tumbling window under another name, and any other rate is a different "
+                "rule, so the kernel will not pick one", "frame")
+        if self.kind != "sliding" and self.step is not None:
+            raise RuleIRValidationError(
+                "FRAME_STEP_NOT_APPLICABLE",
+                f"`step` has no meaning for a {self.kind!r} frame, whose advance is already "
+                f"fixed by its kind", "frame")
 
 
 @dataclass(frozen=True)
@@ -239,6 +273,12 @@ class TimeExpr(Expr):
 class Call(Expr):
     function: FunctionID
     args: tuple[Expr, ...] = ()
+    #: Which regex dialect a pattern is written in, for functions whose contract says so.
+    #: `matches_regex` is unportable without it - `(?i)`, `\d` vs `[[:digit:]]` and
+    #: PCRE-vs-POSIX genuinely disagree on real analyst input - so the contract demanded a
+    #: declaration that had no field to be declared in, and the kernel could only refuse.
+    #: Named values, not free text: an unrecognised dialect is a guess wearing a label.
+    dialect: TypingLiteral["pcre", "posix_extended", "posix_basic"] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "args", tuple(self.args or ()))
@@ -246,13 +286,40 @@ class Call(Expr):
             raise RuleIRValidationError(
                 "UNKNOWN_FUNCTION", f"unknown function {self.function!r}; there is no raw "
                 "function-name escape hatch", "expr")
+        contract = FUNCTION_CONTRACTS[self.function]
+        if contract.get("dialect") == "must_be_declared" and self.dialect is None:
+            raise RuleIRValidationError(
+                "DIALECT_REQUIRED",
+                f"{self.function!r} requires an explicit `dialect`, because its behaviour "
+                f"differs between engines and an undeclared one is not portable", "expr")
+        if self.dialect is not None and contract.get("dialect") != "must_be_declared":
+            raise RuleIRValidationError(
+                "DIALECT_NOT_APPLICABLE",
+                f"{self.function!r} has no dialect-sensitive behaviour, so declaring one is "
+                f"a parameter that would be silently ignored", "expr")
 
 
 @dataclass(frozen=True)
 class Comparison(Expr):
-    op: TypingLiteral["=", "!=", "<", "<=", ">", ">="]
+    #: `exists` and `is_not_null` make the ABSENT-vs-NULL distinction ASKABLE. The kernel
+    #: preserves it everywhere - a missing key and a present-but-null value are different at
+    #: group keys, order keys, set-operation identity and row identity - but with only the six
+    #: ordering operators there was no way for an author to ask the question, so "did this
+    #: field appear?" was inexpressible. `exists` is about PRESENCE, `is_not_null` about VALUE.
+    op: TypingLiteral["=", "!=", "<", "<=", ">", ">=", "exists", "is_not_null"]
     left: Expr
     right: Expr
+
+    def __post_init__(self) -> None:
+        if self.op in ("exists", "is_not_null"):
+            # These take a boolean right-hand side and nothing else, so a value comparison
+            # against one is a mistake rather than a shorthand.
+            from models.rule_ir import Literal as _L
+            if not isinstance(self.right, _L) or not isinstance(self.right.value, bool):
+                raise RuleIRValidationError(
+                    "PRESENCE_PREDICATE_NEEDS_BOOLEAN",
+                    f"{self.op!r} tests whether a field is present, so its right-hand side "
+                    f"must be a boolean literal; got {self.right!r}", "expr")
 
 
 @dataclass(frozen=True)
@@ -390,19 +457,39 @@ class Aggregate:
 class Measure:
     """One named measure. `where` makes it conditional - this is how
     `Failed = countif(ResultType != 0), Success = countif(ResultType == 0)` is represented
-    without a vendor-specific function."""
+    without a vendor-specific function.
+
+    `by` is the ORDERING field, and it is what makes `arg_max`/`arg_min` expressible at all:
+    "the value of A where B is largest" needs two fields, and with only `field` the intent is
+    unrecoverable. Reading `arg_max(f)` as `max(f)` would make it identical to max and pass as
+    an implementation while guessing, so the kernel refused - correctly, given this model.
+    """
 
     name: str
     function: str
     field: FieldRef | None = None
     where: Expr | None = None
     distinct: bool = False
+    by: FieldRef | None = None
 
     def __post_init__(self) -> None:
         if self.function not in AGGREGATE_FUNCTIONS:
             raise RuleIRValidationError(
                 "UNKNOWN_AGGREGATE_FUNCTION",
                 f"aggregate function {self.function!r} is not registered", self.name)
+        if self.function in ("arg_max", "arg_min"):
+            if self.field is None or self.by is None:
+                raise RuleIRValidationError(
+                    "ARG_EXTREME_REQUIRES_TWO_FIELDS",
+                    f"{self.function!r} returns the value of `field` at the extreme of `by`, so "
+                    f"both are required; with one field the intent cannot be recovered without "
+                    f"guessing", self.name)
+        elif self.by is not None:
+            raise RuleIRValidationError(
+                "ORDERING_FIELD_NOT_APPLICABLE",
+                f"`by` only means something for arg_max/arg_min, and {self.function!r} does "
+                f"not use it; a declared-but-ignored parameter is a parameter that goes missing "
+                f"unnoticed", self.name)
 
 
 @dataclass(frozen=True)

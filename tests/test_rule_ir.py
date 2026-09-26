@@ -516,6 +516,17 @@ class StructuralBoundTests(unittest.TestCase):
             validate_ir(self._chain(MAX_GRAPH_NODES + 50))
         self.assertEqual(caught.exception.code, "GRAPH_TOO_LARGE")
 
+    def test_a_presence_predicate_needs_a_boolean_literal(self):
+        """`exists`/`is_not_null` test PRESENCE, so comparing them against a value is a
+        mistake rather than a shorthand."""
+        from models.rule_ir import (Comparison, FieldExpr, FieldRef, Literal,
+                                    RuleIRValidationError)
+        with self.assertRaises(RuleIRValidationError) as caught:
+            Comparison("exists", FieldExpr(FieldRef("a")), Literal("yes"))
+        self.assertEqual(caught.exception.code, "PRESENCE_PREDICATE_NEEDS_BOOLEAN")
+        ok = Comparison("exists", FieldExpr(FieldRef("a")), Literal(True))
+        self.assertEqual(ok.op, "exists")
+
     def test_the_graph_walk_is_bounded_indirectly_by_the_node_bound(self):
         """A depth counter in `_graph_cycle` was tried and REMOVED: it could not be shown to
         fire, so it was decorative. What actually keeps the walk finite is MAX_GRAPH_NODES,

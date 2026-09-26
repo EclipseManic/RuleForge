@@ -903,24 +903,28 @@ class PreflightCoverageTests(unittest.TestCase):
         ir = RuleIR(rule_id="s", nodes=tuple(nodes), output="out")
         self.assertEqual(resolve(ir, AQL()).refusal_code, "UNVERIFIED_SOURCE_REFERENCE")
 
-    def test_a_regex_with_no_declarable_dialect_is_refused(self):
-        """`matches_regex` demands a declared dialect, and `Call` has nowhere to declare one.
+    def test_a_regex_dialect_must_be_declared_by_the_model(self):
+        """The MODEL refuses now, which is stronger than a kernel refusal.
 
-        That is a real gap in the expression algebra rather than a checker quirk, and the
-        honest outcome is a refusal: an undeclared regex dialect is not portable, so
-        guessing one would be exactly the fabrication this project forbids. The adapter's
-        wildcard/windash/base64 mappings are consequently unusable and are recorded as an
-        open item against the adapter, not papered over here.
+        `matches_regex` demanded a declared dialect while `Call` had nowhere to declare one, so
+        the kernel could only refuse at evaluation time - and the adapter's
+        wildcard/windash/base64 mappings stayed unusable. `Call.dialect` closes the gap and the
+        refusal moved to construction. Declaring a dialect on a function with no
+        dialect-sensitive behaviour is itself refused, because a declared-but-ignored parameter
+        is a parameter that goes missing unnoticed.
         """
-        self._with_emitters()
-        ir = simple_graph()
-        node = Filter(id="flt", input="read",
-                      condition=Comparison("=", FieldExpr(FieldRef("a")),
-                                           Call("matches_regex",
-                                                (FieldExpr(FieldRef("payload")),
-                                                 Literal("^a")))))
-        result = resolve(self._swap(ir, "flt", node), AQL())
-        self.assertEqual(result.refusal_code, "FUNCTION_DIALECT_UNDECLARED")
+        from models.rule_ir import Call, RuleIRValidationError
+        with self.assertRaises(RuleIRValidationError) as caught:
+            Call("matches_regex", (FieldExpr(FieldRef("a")), Literal("^x")))
+        self.assertEqual(caught.exception.code, "DIALECT_REQUIRED")
+
+        declared = Call("matches_regex", (FieldExpr(FieldRef("a")), Literal("^x")),
+                        dialect="pcre")
+        self.assertEqual(declared.dialect, "pcre")
+
+        with self.assertRaises(RuleIRValidationError) as caught:
+            Call("lower", (FieldExpr(FieldRef("a")),), dialect="pcre")
+        self.assertEqual(caught.exception.code, "DIALECT_NOT_APPLICABLE")
 
     def test_a_deep_expression_is_refused_rather_than_overflowing(self):
         self._with_emitters()
@@ -1021,9 +1025,14 @@ class VocabularyTests(unittest.TestCase):
     to wave unknown operators through a check built to refuse them.
     """
 
-    def test_the_comparison_vocabulary_is_exactly_the_model_six(self):
+    def test_the_comparison_vocabulary_is_exactly_the_model_eight(self):
+        """Was six, and asserting six is what let a 21-entry allowlist look thorough.
+
+        It grew by `exists` and `is_not_null` when the model gained the ability to ask about
+        field PRESENCE, which the kernel had always preserved but no author could query.
+        """
         self.assertEqual(vocabulary()["comparison"],
-                         frozenset({"=", "!=", "<", "<=", ">", ">="}))
+                         frozenset({"=", "!=", "<", "<=", ">", ">=", "exists", "is_not_null"}))
 
     def test_no_vocabulary_resolves_empty(self):
         for name, allowed in vocabulary().items():
@@ -1031,7 +1040,7 @@ class VocabularyTests(unittest.TestCase):
                                      f"every value rather than every unknown one")
 
     def test_operators_the_model_cannot_express_are_not_accepted(self):
-        for op in ("exists", "is_null", "between", "contains", "matches_regex", "approximately"):
+        for op in ("is_null", "between", "approximately", "matches", "not_in", "subset"):
             self.assertNotIn(op, vocabulary()["comparison"],
                              f"{op!r} is not a Comparison op but was being accepted")
 
