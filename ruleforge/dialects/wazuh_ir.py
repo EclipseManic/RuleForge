@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..engine.values import Refusal
 from ..engine.ir import (
     BoolOp,
     Call,
@@ -167,6 +168,28 @@ def _rule_condition(rule: WazuhRule) -> tuple[Any, ...]:
                 _field_expr(spec.name), spec.pattern, spec.kind)))
             continue
         conditions.append(_field_condition(spec))
+
+    # A RULE WHOSE ONLY CONDITION IS A DECODER PREDICATE HAS NO CONDITION WE CAN
+    # HONOUR. `<decoded_as>json</decoded_as>` or `<category>syslog</category>`
+    # alone used to lower to Read -> Emit, which reports "The rule matched 3 of 3
+    # events" for a rule that should only fire on events a particular decoder
+    # classified. The IR cannot express a decoder constraint, so this is refused
+    # -- the same direction as the nine field predicates, and the same one the
+    # Wazuh Rules Syntax doc uses when it calls both "a requisite to trigger a
+    # rule". Alongside a real `<field>` the rule lowers, and the gap is named in
+    # the diagnostic rather than left implicit.
+    decoder_only = [tag for tag in rule.other_triggers
+                    if tag.split("=", 1)[0] in ("category", "decoded_as")]
+    if decoder_only and not conditions and not rule.if_sid:
+        names = ", ".join(sorted(decoder_only))
+        raise Refusal(
+            "WAZUH_DECODER_PREDICATE_ONLY",
+            f"rule {rule.rule_id}'s only condition is {names}, which says the "
+            f"event must have been decoded a particular way. The IR has no way "
+            f"to express a decoder constraint, so lowering it would produce a "
+            f"rule that matches EVERY event while reporting success. Add a "
+            f"<field> to say what the event must contain, or evaluate this rule "
+            f"in Wazuh, where the decoder is real.", "wazuh")
     return tuple(conditions)
 
 

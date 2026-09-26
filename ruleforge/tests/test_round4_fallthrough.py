@@ -81,15 +81,47 @@ class WazuhPredicatesAreNotPresentation(unittest.TestCase):
 
     def test_presentation_elements_are_still_ignored(self):
         # The ignore-list is not empty, and making it empty would be over-strict
-        # in the wrong direction: refusing `<category>` would make real rulesets
-        # unusable over a label.
+        # in the wrong direction: refusing `<category>` would make the SHIPPED
+        # ruleset unusable, and it uses both `<category>` and `<decoded_as>`.
         xml = ('<group name="g,"><rule id="1" level="3">'
-               "<category>authentication_failed</category>"
-               "<decoded_as>json</decoded_as><info>note</info>"
+               "<info>note</info><comment>c</comment>"
+               "<documentation>d</documentation>"
+               '<field name="cmd">x</field>'
                "<description>d</description></rule></group>")
         ir, _ = lower_wazuh(xml, "1")
         self.assertEqual([type(n).__name__ for n in ir.nodes],
-                         ["Read", "Emit"])
+                         ["Read", "Filter", "Emit"])
+
+    def test_decoder_predicates_alone_are_refused(self):
+        """`<decoded_as>` and `<category>` are NOT presentation.
+
+        The Wazuh Rules Syntax doc says of both, verbatim: "Used as a requisite
+        to trigger a rule. It will be triggered if the event has been decoded by
+        a certain decoder." Ignoring them gave `ok=True`, `graph ['Read','Emit']`
+        and "The rule matched 3 of 3 events" -- the same critical as the nine
+        field predicates, reached through the two elements the doc names
+        explicitly.
+        """
+        for element in ("<category>syslog</category>",
+                        "<decoded_as>json</decoded_as>",
+                        "<decoded_as>smtpd</decoded_as>"):
+            with self.subTest(element=element):
+                xml = (f'<group name="g,"><rule id="1" level="3">{element}'
+                       f"<description>d</description></rule></group>")
+                with self.assertRaises(Refusal) as caught:
+                    lower_wazuh(xml, "1")
+                self.assertEqual(caught.exception.code,
+                                 "WAZUH_DECODER_PREDICATE_ONLY")
+
+    def test_a_decoder_predicate_beside_a_field_still_lowers(self):
+        """Refusing here would break the shipped ruleset, which uses both."""
+        xml = ('<group name="g,"><rule id="1" level="3">'
+               "<category>authentication_failed</category>"
+               '<field name="cmd">x</field>'
+               "<description>d</description></rule></group>")
+        ir, _ = lower_wazuh(xml, "1")
+        self.assertEqual([type(n).__name__ for n in ir.nodes],
+                         ["Read", "Filter", "Emit"])
 
     def test_a_dropped_predicate_never_reports_a_match(self):
         """The end-to-end shape of the defect, not just the refusal code."""

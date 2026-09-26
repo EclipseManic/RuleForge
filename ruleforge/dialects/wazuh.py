@@ -130,11 +130,23 @@ class WazuhParseError(Refusal):
 #: wrong direction -- so it is ignored, and the gap is stated here rather than
 #: discovered later: a noalert rule comes back as an alerting rule.
 #:
-#: `fixed_fields` stays: it is a static mapping applied to every event, so it
-#: adds no per-event condition.
+#: Decoder-derived PREDICATES. Not ignored and not lowered: the IR has no way to
+#: say "the decoder classified this event", so a rule built on one cannot be
+#: executed or rendered faithfully. They are RECORDED, and the lowerer refuses
+#: when they are the rule's only condition -- because then the rule would
+#: otherwise be Read -> Emit and match every event. Alongside a real `<field>`
+#: the rule lowers, with the gap stated rather than hidden.
+#:
+#: The Wazuh Rules Syntax doc says of BOTH, verbatim: "Used as a requisite to
+#: trigger a rule. It will be triggered if the event has been decoded by a certain
+#: decoder." That is the same sentence it uses for the nine predicates round 4
+#: removed. Round 5 caught that these two were still being ignored outright, which
+#: gave `ok=True`, `graph ['Read','Emit']` and "The rule matched 3 of 3 events."
+_DECODER_PREDICATES = frozenset({"category", "decoded_as"})
+
 _IGNORED_ELEMENTS = frozenset({
-    "group", "group_name", "info", "comment", "documentation", "category",
-    "decoded_as", "rule", "fixed_fields", "options",
+    "group", "group_name", "info", "comment", "documentation", "rule",
+    "fixed_fields", "options",
 })
 
 
@@ -214,6 +226,11 @@ def _parse_rule(element: ET.Element) -> WazuhRule:
             if_matched_group = text
         elif tag in TRIGGER_ELEMENTS:
             other_triggers.append(tag)
+        elif tag in _DECODER_PREDICATES:
+            # Recorded, not ignored -- see `_DECODER_PREDICATES`. The lowerer
+            # decides what to do with a rule whose only condition is one of
+            # these, because only it can see whether a `<field>` came with it.
+            other_triggers.append(f"{tag}={text.strip()}")
         elif tag in _IGNORED_ELEMENTS:
             # Presentation and grouping only. These genuinely do not affect
             # which events a rule matches, so ignoring them is correct.

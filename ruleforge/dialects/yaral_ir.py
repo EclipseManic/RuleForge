@@ -406,6 +406,21 @@ def _render_event(condition: Any, var: str) -> list[str]:
         return [f"    {var}.{_field_of(condition.args[0])} = "
                 f"/{_regex_literal(pattern)}/{modifier}"]
     if isinstance(condition, Comparison):
+        # THE OPERATOR WAS NEVER LOOKED AT. `_render_event` had no branch on
+        # `condition.op`, so every operator produced `$e0.user = "admin"`:
+        # `!=` rendered as `=`, and so did `>`, `>=`, `<` and `<=`. A DENY RULE
+        # INVERTED INTO AN ALLOW-EXACT RULE -- the precise inverse of what the
+        # analyst wrote, in an artifact with no warning on it. The YARA-L parser
+        # only ever emits `=`, so this was unreachable through the app, but
+        # `render_yaral` is public and SPL, AQL and KQL all admit the others.
+        if condition.op != "=":
+            raise Refusal(
+                "YARAL_OPERATOR_NOT_RENDERABLE",
+                f"this condition uses `{condition.op}`, and the YARA-L events "
+                f"block here is only written for equality. Emitting it as `=` "
+                f"would turn `{condition.op}` into its opposite -- a deny rule "
+                f"into an allow-exact rule -- so it is refused instead.",
+                "render")
         left = _field_of(condition.left)
         right = condition.right
         if isinstance(right, FieldExpr):

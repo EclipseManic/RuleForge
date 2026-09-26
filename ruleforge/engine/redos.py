@@ -358,8 +358,14 @@ def _open_after(items: list[tuple[str, str, set[str] | None]]) -> bool:
             pending = fset
             open_ = True
         elif quantifier == "?":
-            # Zero-or-one is tried once, so it cannot re-split anything.
-            continue
+            # `?` IS EXEMPT AT THE TOP LEVEL -- it is tried once and cannot
+            # re-split anything, which is why `[0-9]+(\.[0-9]+)?` compiles. But
+            # INSIDE a group that is itself quantified it is a multiplier, and
+            # `(a?a?)+$` is twelve characters that hang: each `a?` can match or
+            # skip, so the ways to divide the text multiply. Skipping `?` here
+            # is what let that through.
+            pending = fset
+            open_ = True
         else:
             if pending is not None and fset is not None and not (fset & pending):
                 pending = None
@@ -487,35 +493,42 @@ def _all_group_bodies(body: str) -> list[str]:
     return out
 
 
-def _overlapping_alternation_anywhere(body: str, _seen: set[str] | None = None) -> bool:
+def _overlapping_alternation_anywhere(body: str, _seen: set[str] | None = None,
+                                      _depth: int = 0) -> bool:
     """Ambiguous alternatives at ANY depth inside `body`.
 
-    THE RECURSION USED TO BE 2^depth, AND THAT MADE THE CONTROL A DoS VECTOR.
-    `_all_group_bodies` returns every group body at every depth, so the
-    innermost one was re-analysed once per group that encloses it: `"("*24 +
-    "a" + ")"*24 + "+$"` is 51 characters and took 15.28 seconds in THIS
-    function, reachable from `POST /api/tune` with a single event. A guard that
-    can be made to hang is worse than no guard, because it reads as protection.
+    THE DEPTH BOUND MUST COUNT DEPTH, NOT CHARACTERS.
 
-    Two fixes, because either alone is insufficient. `_seen` makes each
-    distinct body text cost one analysis, which is what actually removes the
-    blowup -- a pure nesting chain has `depth` distinct bodies, not 2^depth.
-    The depth cap is the backstop for the case memoisation cannot help: many
-    distinct nested bodies. ReDoS needs the alternation inside a QUANTIFIED
-    group, and `re.compile` rejects nesting past ~200 deep on its own, so 64 is
-    far past any pattern that could match.
+    The round-4 fix bounded this with `len(body) > 64`, because the recursion was
+    `2^depth` and had to stop somewhere. But a LENGTH cap is not a DEPTH cap, and
+    the alternation-overlap check is the one that exists for exactly this pattern
+    family -- so every quantified group body longer than 64 characters skipped it
+    entirely. The cap added to kill the analysis blowup is what created the
+    bypass: `([a-c][a-c]|[b-d][b-d])+$` at 21 characters is refused (19.7s at
+    n=24), and the same alternation repeated to 109 characters is ACCEPTED and
+    hangs at n=2. A 17-byte `<field>` reached it end to end, because a `<field>`
+    with no `type` attribute defaults to `os_regex`, which this engine executes.
+
+    So: `_depth` counts recursion, and `_seen` on the body text is what actually
+    removes the blowup -- a pure nesting chain has `depth` distinct bodies, not
+    2^depth. 64 levels of nesting is far past anything `re.compile` will accept.
     """
     if _seen is None:
         _seen = set()
-    if body in _seen:
-        return False
-    if len(body) > _MAX_ANALYSIS_DEPTH:
+    # A BUDGET ON DISTINCT BODIES, NOT JUST ON DEPTH. `_all_group_bodies`
+    # returns every group body at EVERY depth in one call, so the recursion is
+    # one level deep and wide rather than deep: a depth cap alone never fires,
+    # and memoisation leaves the cost at O(n^2) in the pattern length. Depth 900
+    # took 744ms and depth 1500 took 3.7s -- the analysis was a DoS vector again,
+    # one round after it stopped being one. 512 distinct bodies is far more
+    # alternation than any real detection has.
+    if body in _seen or _depth > _MAX_ANALYSIS_DEPTH or len(_seen) > 512:
         return False
     _seen.add(body)
     if _alternatives_overlap(body):
         return True
     for inner in _all_group_bodies(body):
-        if _overlapping_alternation_anywhere(inner, _seen):
+        if _overlapping_alternation_anywhere(inner, _seen, _depth + 1):
             return True
     return False
 

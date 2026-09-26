@@ -632,7 +632,7 @@ def load_events(raw: str) -> list[dict[str, Any]]:
         return []
     try:
         data = json.loads(text)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
         rows: list[dict[str, Any]] = []
         for number, line in enumerate(text.splitlines(), start=1):
             line = line.strip()
@@ -640,10 +640,15 @@ def load_events(raw: str) -> list[dict[str, Any]]:
                 continue
             try:
                 parsed = json.loads(line)
-            except json.JSONDecodeError as exc:
+            except (json.JSONDecodeError, ValueError) as exc:
                 raise Refusal(
                     "EVENTS_BAD_LINE",
-                    f"line {number} is not valid JSON: {exc.msg}. Pasting one "
+                    # NOT `exc.msg`. `JSONDecodeError` has `.msg`; the plain
+                    # `ValueError` raised by CPython's 4300-digit integer limit
+                    # does not, so reading it here would swap a refused payload
+                    # for an AttributeError -- the same inverted blame one level
+                    # up. `str(exc)` is the whole message either way.
+                    f"line {number} is not valid JSON: {exc}. Pasting one "
                     f"JSON object per line works, as does a single JSON array.",
                     "ruleforge") from exc
             if not isinstance(parsed, dict):
