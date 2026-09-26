@@ -486,6 +486,11 @@ def _eval_regex(expr: Call, args: list[Any], ctx: EvaluationContext) -> Any:
     So: dialect must be executable, the pattern must compile under the dialect's
     documented translation, and anything using a construct outside the supported
     subset is refused with the construct named rather than approximated.
+
+    `nocase` IS honoured for an executable dialect, by folding case on both sides
+    before matching. It is not honoured by pretending: for a declared-only dialect
+    the whole call refuses, so a `nocase` PCRE rule renders correctly and is
+    reported as unevaluable rather than being quietly case-sensitised.
     """
     from .regex import compile_pattern
 
@@ -498,9 +503,12 @@ def _eval_regex(expr: Call, args: list[Any], ctx: EvaluationContext) -> Any:
         return UNDECIDED
 
     assert expr.dialect is not None                      # guaranteed by Call
-    cache_key = (expr.dialect, pattern)
+    cache_key = (expr.dialect, pattern, bool(expr.flags))
     compiled = ctx.regex_cache.get(cache_key)
     if compiled is None:
         compiled = compile_pattern(expr.dialect, pattern)
         ctx.regex_cache[cache_key] = compiled
+
+    if "nocase" in expr.flags:
+        return compiled(value.casefold(), case_insensitive=True)
     return compiled(value)

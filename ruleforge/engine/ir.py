@@ -150,6 +150,15 @@ FUNCTIONS: Final[dict[str, tuple[int, int, bool, bool]]] = {
 #: would lose information the analyst explicitly provided.
 REGEX_DIALECTS: Final = frozenset({"pcre", "posix_extended", "posix_basic"})
 
+#: Pattern MODIFIERS, carried as data on the node rather than baked into the
+#: pattern text. Rewriting the pattern to `(?i)...` would change the analyst's
+#: bytes and break the render round-trip; dropping the modifier would silently
+#: make the rule case-sensitive, so `/lsass/i` would stop matching `LSASS.EXE`.
+#: Every platform spells this differently -- YARA-L and YARA write
+#: `/pattern/ nocase`, Splunk writes `field="*pattern*"`, SQL uses ILIKE -- so
+#: holding it as a node attribute is the only way a render can round-trip.
+REGEX_FLAGS: Final = frozenset({"nocase"})
+
 #: Dialects the evaluator can actually run. Kept separate from REGEX_DIALECTS on
 #: purpose: a dialect can be declared without being executable, and conflating
 #: them lets a declared-but-unimplemented dialect reach a comparison and produce
@@ -275,14 +284,29 @@ class Call:
     """A function application.
 
     `dialect` is required exactly when the function's behaviour differs between
-    engines. `matches_regex` is the case that matters: `\d`, `[[:digit:]]`, `\b`
+    engines. `matches_regex` is the case that matters: `\\d`, `[[:digit:]]`, `\\b`
     and inline flags all mean different things in PCRE and POSIX, so a regex
     without a declared dialect is not a portable rule and cannot be built.
+
+    `flags` carries MODIFIERS, which are separate from the pattern text and
+    separate from the dialect. YARA-L writes `/\\lsass\\.exe$/ nocase`; YARA and
+    Splunk write `(?i)`. Two honest options existed and both were wrong:
+
+      * bake `(?i)` into the pattern string -- preserves the matched language
+        exactly, but REWRITES the analyst's bytes, so the render no longer
+        round-trips and a diff against the pasted rule shows a change the author
+        never made;
+      * drop the modifier -- the rule silently becomes case-SENSITIVE, and
+        `/lsass/i` starts failing to match `LSASS.EXE`.
+
+    So the modifier is carried as data, on the node, and rendered back in the
+    vendor's own syntax. The pattern is never rewritten.
     """
 
     function: str
     args: tuple[Any, ...]
     dialect: TypingLiteral["pcre", "posix_extended", "posix_basic"] | None = None
+    flags: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         contract = FUNCTIONS.get(self.function)
@@ -312,6 +336,25 @@ class Call:
             raise Refusal(
                 "DIALECT_UNKNOWN",
                 f"{self.dialect!r} is not one of {sorted(REGEX_DIALECTS)}", "Call")
+
+        unknown = self.flags - REGEX_FLAGS
+        if unknown:
+            raise Refusal(
+                "REGEX_FLAG_UNKNOWN",
+                f"{sorted(unknown)} is not a supported modifier; supported modifiers "
+                f"are {sorted(REGEX_FLAGS)}. An unrecognised modifier would be "
+                f"dropped on render, quietly changing what the rule matches.", "Call")
+        if self.flags and not needs_dialect:
+            raise Refusal(
+                "REGEX_FLAG_NOT_APPLICABLE",
+                f"{self.function!r} takes no modifiers, so declaring "
+                f"{sorted(self.flags)} would be a parameter that is silently ignored",
+                "Call")
+        if "nocase" in self.flags and self.dialect not in EXECUTABLE_DIALECTS:
+            # Not a refusal -- an explicit note. The modifier is RECORDED so the
+            # rule renders correctly and QRadar runs it correctly; this tool simply
+            # cannot execute it, which it will say when asked.
+            pass
 
 
 @dataclass(frozen=True, slots=True)

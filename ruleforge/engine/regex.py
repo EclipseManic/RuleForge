@@ -124,7 +124,7 @@ def _scan(pattern: str) -> str | None:
     return None
 
 
-def compile_pattern(dialect: str, pattern: str) -> Callable[[str], bool]:
+def compile_pattern(dialect: str, pattern: str) -> Callable[..., bool]:
     """Compile `pattern` for `dialect`, or refuse with the reason.
 
     Refusal codes:
@@ -132,6 +132,12 @@ def compile_pattern(dialect: str, pattern: str) -> Callable[[str], bool]:
         REGEX_DIALECT_SPECIFIC  the pattern uses a construct whose meaning this
                                 engine cannot guarantee for that dialect
         REGEX_INVALID           the pattern does not compile
+
+    The returned callable takes `(value, case_insensitive=False)`. Case folding
+    is applied to BOTH sides rather than by rewriting the pattern with `(?i)`,
+    because rewriting would change the analyst's bytes and break the render
+    round-trip -- and because `(?i)` is precisely the inline-flag construct this
+    module refuses elsewhere on portability grounds.
     """
     if dialect not in EXECUTABLE_DIALECTS:
         raise Refusal(
@@ -159,7 +165,10 @@ def compile_pattern(dialect: str, pattern: str) -> Callable[[str], bool]:
             "REGEX_INVALID",
             f"the pattern does not compile: {exc}", "Call") from exc
 
-    def evaluate(value: str, _c: re.Pattern[str] = compiled) -> bool:
+    def evaluate(value: str, case_insensitive: bool = False,
+                 _c: re.Pattern[str] = compiled) -> bool:
+        if case_insensitive:
+            return _c.search(value.casefold()) is not None
         return _c.search(value) is not None
     return evaluate
 
