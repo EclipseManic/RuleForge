@@ -365,11 +365,11 @@ def render(ir: RuleIR) -> str:
             else:
                 where_terms.append(text)
         elif name == "Aggregate":
-            group_by = [k.name for k in node.keys]
+            group_by = [k.full for k in node.keys]
             for measure in node.measures:
                 select_items.append(_render_measure(measure, node))
         elif name == "Arrange":
-            order_by = [f"{ref.name} {direction.upper()}"
+            order_by = [f"{ref.full} {direction.upper()}"
                         for ref, direction in node.order_by]
             if node.limit:
                 limit = f"\nLIMIT {node.limit}"
@@ -451,7 +451,7 @@ def _render_measure(measure: Measure, aggregate: Aggregate) -> str:
     if measure.function == "count":
         return f"COUNT(*) AS {measure.name}"
     if measure.field is not None:
-        return f"{measure.function.upper()}({measure.field.name}) AS {measure.name}"
+        return f"{measure.function.upper()}({measure.field.full}) AS {measure.name}"
     return f"{measure.function.upper()}(*) AS {measure.name}"
 
 
@@ -547,7 +547,7 @@ def cre_from_ir(ir: RuleIR, rule_name: str = "ruleforge_rule") -> dict[str, Any]
             if node.keys:
                 tests.append({
                     "type": "grouping_test",
-                    "group_by": [k.name for k in node.keys],
+                    "group_by": [k.full for k in node.keys],
                     "measures": [m.name for m in node.measures],
                 })
             for measure in node.measures:
@@ -564,7 +564,7 @@ def cre_from_ir(ir: RuleIR, rule_name: str = "ruleforge_rule") -> dict[str, Any]
                 "type": "sequence_test",
                 "stages": len(node.stages),
                 "within": str(node.within),
-                "group_by": [k.name for k in node.key],
+                "group_by": [k.full for k in node.key],
             })
         elif name == "Arrange":
             not_covered.append(

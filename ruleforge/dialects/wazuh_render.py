@@ -14,7 +14,8 @@ refuses to render unless the parent chain is available to emit alongside it.
 """
 from __future__ import annotations
 
-from typing import Any
+import re
+from typing import Any, Final
 from xml.sax.saxutils import escape
 
 from ..engine.ir import (
@@ -344,6 +345,34 @@ def _field(expression: Any) -> str | None:
     return None
 
 
+#: A Wazuh field name. Dotted, because that is what they are:
+#: `win.eventdata.CommandLine`, `win.system.providerName`.
+#:
+#: `_attr` ESCAPES A NAME BUT DOES NOT MAKE IT MEANINGFUL. `escape` handles `&`,
+#: `<`, `>`, `"` and `'`, so a newline in a field name cannot break out of the
+#: attribute -- the round-7 review reported a complete attacker-chosen rule here,
+#: and that is not what happens: the quotes are escaped, so exactly one `<rule>`
+#: is emitted and the document re-parses. What IS true is quieter and still a
+#: defect: `name="a&#10;rule pwned {"` is a legal attribute whose VALUE contains
+#: newlines, so the rendered rule tests a column called
+#: `a<newline>rule pwned {`, which cannot exist. The rule can never match, and
+#: nothing says so. A field name is an identifier, so it is checked as one.
+_FIELD_PATH: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
+
+
+def _check_field_name(name: str) -> str:
+    if not _FIELD_PATH.fullmatch(name):
+        raise Refusal(
+            "WAZUH_FIELD_NAME_NOT_A_PATH",
+            f"the field name {name!r} is not a dotted Wazuh field path made of "
+            f"letters, digits and underscores. Escaping it keeps the document "
+            f"well-formed, but a name containing a newline or a brace names a "
+            f"column that cannot exist, so the rule could never match and "
+            f"nothing would say so. Wazuh event fields look like "
+            f"`win.eventdata.CommandLine`.", DIALECT)
+    return name
+
+
 def _field_elements(expression: Any, name: str) -> list[str]:
     """One expression -> the `<field>` elements that say it, for `name`.
 
@@ -356,7 +385,7 @@ def _field_elements(expression: Any, name: str) -> list[str]:
         negate = ' negate="yes"'
         expression = expression.operand
 
-    safe = _attr(name)
+    safe = _attr(_check_field_name(name))
 
     if isinstance(expression, Call):
         if expression.function == "matches_regex":

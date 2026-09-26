@@ -288,15 +288,31 @@ class WazuhAttributeInjectionTests(unittest.TestCase):
     )
 
     def test_the_injected_attribute_does_not_appear(self):
-        ir, _ = lower_wazuh(self.HOSTILE, "700")
-        rendered = render_wazuh_xml(ir)
-        again = parse_wazuh(rendered)["700"]
-        self.assertEqual(
-            getattr(again.fields[0], "negate", False), False,
-            "a pasted field name injected negate=yes, which INVERTS the match")
+        """The payload is now REFUSED, which is stronger than neutralised.
+
+        `_attr` already escaped the quotes, so the document never re-parsed with
+        `negate="yes"` on it -- the inversion this test was written for was fixed
+        in round 1. What round 7 added is that the name is now checked as an
+        IDENTIFIER as well as escaped, so a name carrying `"` is refused instead
+        of rendered. Either way `negate` cannot appear; the difference is whether
+        a rule referencing a column that cannot exist is produced at all.
+        """
+        with self.assertRaises(Refusal) as caught:
+            ir, _ = lower_wazuh(self.HOSTILE, "700")
+            render_wazuh_xml(ir)
+        self.assertEqual(caught.exception.code, "WAZUH_FIELD_NAME_NOT_A_PATH")
 
     def test_the_field_name_survives_intact(self):
-        ir, _ = lower_wazuh(self.HOSTILE, "700")
+        """The honest half of the original pair: a REAL field name still works.
+
+        Refusing every name with unusual characters would be over-strict in the
+        wrong direction, so the ordinary dotted Wazuh path is asserted here --
+        the same pairing discipline the SPL selector tests use.
+        """
+        rule = ('<group name="g,"><rule id="700" level="5">'
+                '<field name="win.eventdata.newProcessName">evil.exe</field>'
+                '</rule></group>')
+        ir, _ = lower_wazuh(rule, "700")
         again = parse_wazuh(render_wazuh_xml(ir))["700"]
         self.assertIn("newProcessName", again.fields[0].name)
 
