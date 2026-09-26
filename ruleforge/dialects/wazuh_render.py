@@ -69,8 +69,39 @@ def render(ir: RuleIR) -> str:
     derive = next((n for n in ir.nodes if isinstance(n, Derive)), None)
     aggregate = next((n for n in ir.nodes if isinstance(n, Aggregate)), None)
 
+    # INVERT THE DEFAULT. This function used to pick out the Filter, Package,
+    # Derive and Aggregate nodes it knew about and say nothing about the rest, so
+    # a SetOp, Join, Pattern, Expand, Arrange, SetRule or a second Derive
+    # VANISHED and every surviving Filter was joined together -- a union rendered
+    # as an intersection. Latent for the Wazuh lowerer, which only emits Read,
+    # Filter, Package and Emit, but `render_wazuh` is public and the IR is the
+    # documented interchange format, so the hole was one call away.
+    #
+    # ORDER MATTERS AND IT IS NOT COSMETIC. This check runs AFTER the aggregate
+    # dispatch, so a rule that both aggregates and carries a node Wazuh cannot
+    # express gets `WAZUH_RENDER_AGGREGATE_NOT_A_RULE` -- the reason that actually
+    # explains the output -- rather than the generic complaint about whichever
+    # node happened to be visited first. Both are refusals, so both are
+    # fail-closed; the difference is only whether the message is useful.
     if package is not None:
         return _render_correlation(ir, package, rule_id, level)
+    if aggregate is not None:
+        return _render_plain(ir, filters, derive, aggregate, rule_id, level)
+
+    for node in ir.nodes:
+        if isinstance(node, (Filter, Derive, Aggregate)):
+            continue
+        if type(node).__name__ in ("Read", "Emit", "SetRule"):
+            continue
+        raise Refusal(
+            "WAZUH_NODE_NOT_RENDERABLE",
+            f"this rule contains a {type(node).__name__} node, and a Wazuh rule "
+            f"cannot express one. It was being dropped silently, which meant a "
+            f"union came out as an intersection and a join came out as no join "
+            f"at all -- a rule that matches a different set of events than the "
+            f"one you asked about. Render it with the dialect that supports it.",
+            DIALECT)
+
     if filters:
         return _render_plain(ir, filters, derive, aggregate, rule_id, level)
 
@@ -156,7 +187,49 @@ def _render_correlation(ir: RuleIR, package: Package, rule_id: str,
             "a Wazuh correlation groups on a same_* element. Without one the "
             "rendered rule would count anywhere in the log.", DIALECT)
 
+    # THE CORRELATION'S OWN `<field>` WAS DROPPED, AND IT IS APP-REACHABLE.
+    # A rule with `if_matched_sid` AND its own `<field>` lowers correctly -- the
+    # field lands in `package.children` -- and then this function emitted only
+    # the correlation elements, so:
+    #
+    #     in : if_matched_sid=200, same_field=srcip, frequency=5, timeframe=300,
+    #          <field name="win.eventdata.CommandLine">notepad\.exe</field>
+    #     out: <rule id="300" ...><if_matched_sid>200</if_matched_sid>...
+    #
+    # The `notepad.exe` condition was GONE. The deployed rule counted 5 events in
+    # 300 seconds that matched 200, filtered by nothing, with
+    # `diagnostics: NONE`. Reachable by pasting a ruleset -- no hand-built IR
+    # needed. The child conditions have to be written out, before the
+    # correlation elements.
+    conditions: list[str] = []
+    # `children` is a tuple of CONJUNCTIONS -- each entry is already the list of
+    # conditions one child asserts, not a Filter node. So the entry is unpacked
+    # here rather than handed to `_flatten` whole: `_flatten` returns a non-BoolOp
+    # unchanged, so passing the tuple gave `_field` a tuple, which is not a field
+    # test, and every correlation with a condition of its own refused instead of
+    # rendering. That is how the condition stayed missing in the first place.
+    for conjunction in package.children:
+        parts = (conjunction if isinstance(conjunction, (tuple, list))
+                 else (conjunction,))
+        for part in parts:
+            for condition in _flatten(part):
+                name = _field(condition)
+                if name is None:
+                    raise Refusal(
+                        "WAZUH_RENDER_TERM_NOT_A_FIELD_TEST",
+                        "a Wazuh rule can only say `field matches pattern`. This "
+                        "condition is an arithmetic or aggregate expression, "
+                        "which Wazuh has no `<field>` form for. Emitting it as a "
+                        "field test would invent a test the rule never made.",
+                        DIALECT)
+                conditions.extend(_field_elements(condition, name))
+    # NO REFUSAL FOR AN EMPTY `conditions`. A correlation with no condition of
+    # its own is a legitimate Wazuh rule -- "count 5 of whatever matches 200" --
+    # and refusing it would be over-strict in the wrong direction. The defect
+    # was DROPPING the children, not permitting their absence.
+
     body = [
+        *conditions,
         f'  <if_matched_sid>{escape(parent_id)}</if_matched_sid>',
         f'  <same_field>{escape(same.split(",")[0].strip())}</same_field>'
         if len(same.split(",")) == 1 else

@@ -41,10 +41,15 @@ SAME_ELEMENTS = {
     "same_field": "a named field",
 }
 
-#: `if_sid` / `if_slevel` / `if_group` select an already-decided alert, not a raw
+#: `if_sid` / `if_level` / `if_group` select an already-decided alert, not a raw
 #: event condition. Only `if_sid` is resolved here; the others are recorded and
 #: refused, because honouring them needs a rule-tree we do not have.
-TRIGGER_ELEMENTS = ("if_sid", "if_slevel", "if_group", "if_matched_sid",
+#:
+#: THIS WAS `if_slevel`, WHICH IS NOT A WAZUH ELEMENT. The official syntax doc
+#: lists `if_level`; `if_slevel` appears nowhere in Wazuh. So the two halves of
+#: that entry were both wrong: a real `<if_level>5</if_level>` hit the unknown-
+#: element refusal, and the whitelist name could never match anything real.
+TRIGGER_ELEMENTS = ("if_sid", "if_level", "if_group", "if_matched_sid",
                     "if_matched_group")
 
 
@@ -98,19 +103,38 @@ class WazuhParseError(Refusal):
     pass
 
 
-#: Elements that are presentation, grouping or agent plumbing, and genuinely do
-#: not change WHICH events a rule matches. Ignoring these is correct -- unlike
-#: ignoring a `<match>`, which removes the detection entirely.
-#: Elements that are presentation, grouping or AGENT PLUMBING, and genuinely do
-#: not change which events a rule matches. `<decoded_as>` and `<category>` tell
-#: the agent how to decode an event and how to classify an alert; neither is a
-#: predicate, so ignoring them is correct. `<match>` is NOT in here -- that one IS
-#: a predicate, which is why dropping it was so damaging.
+#: Elements that are PRESENTATION, GROUPING or AGENT PLUMBING, and genuinely do
+#: not change WHICH events a rule matches. Ignoring these is correct.
+#:
+#: THIS SET USED TO BE TWICE AS BIG, AND THE EXTRA HALF WAS PREDICATES. The
+#: Wazuh Rules Syntax doc lists `program_name`, `hostname`, `status`, `data`,
+#: `extra_data`, `location`, `regex`, `list` and `check_diff` as "a requisite to
+#: trigger a rule" -- they ARE conditions. The reviewer reproduced it with one
+#: element changed:
+#:
+#:     <rule id="100200" level="12"><program_name>syslogd</program_name>...
+#:
+#:     parse_wazuh  -> ok
+#:     lower        -> 0 Filter nodes
+#:     jobs.author  -> ok=True, refusal=None, graph ['Read','Emit']
+#:     jobs.tune    -> "The rule matched 3 of 3 events."
+#:
+#: That is the round-3 `<match>` critical reached through a different tag: a
+#: detection that fires on everything while reporting success. Every element in
+#: here now has to be genuinely presentational, which is a much smaller set.
+#:
+#: `options` stays, and it is a judgement call worth naming: `<options>noalert
+#: </options>` changes whether an ALERT is raised, not which events match. The
+#: IR models matching, so lowering cannot represent it. Refusing it would make
+#: real rulesets unusable over a cosmetic concern, which is over-strict in the
+#: wrong direction -- so it is ignored, and the gap is stated here rather than
+#: discovered later: a noalert rule comes back as an alerting rule.
+#:
+#: `fixed_fields` stays: it is a static mapping applied to every event, so it
+#: adds no per-event condition.
 _IGNORED_ELEMENTS = frozenset({
-    "group", "options", "info", "check_diff", "comment", "rule",
-    "group_name", "documentation", "category", "decoded_as", "hostname",
-    "status", "firewall", "location", "list", "program_name", "sha1",
-    "sha256", "md5", "extra_data", "data", "fixed_fields", "json", "regex",
+    "group", "group_name", "info", "comment", "documentation", "category",
+    "decoded_as", "rule", "fixed_fields", "options",
 })
 
 

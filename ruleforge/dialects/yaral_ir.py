@@ -275,6 +275,10 @@ def render(ir: RuleIR) -> str:
 
     for node in ir.nodes:
         kind = type(node).__name__
+        # `Read` and `Emit` are the plumbing every rule has. They carry no
+        # condition, so there is nothing to render and nothing to refuse.
+        if kind in ("Read", "Emit"):
+            continue
         if kind == "Pattern":
             for index, stage in enumerate(node.stages):
                 var = f"$e{index}"
@@ -294,8 +298,32 @@ def render(ir: RuleIR) -> str:
             # looking deleted.
             event_lines.extend(_render_event(node.condition, "$e0"))
             condition_terms.append("$e0")
+        else:
+            # INVERT THE DEFAULT. AQL, KQL and SPL each grew an explicit
+            # refusal for a node kind they cannot express, and this loop had no
+            # `else` at all -- so anything that was not Pattern or Filter fell
+            # through, `event_lines` stayed empty, and the fallbacks below
+            # substituted `$e0.metadata.event_type = ""` with a `condition:` of
+            # nothing. A `Package` correlation came back as:
+            #
+            #     events:  $e0.metadata.event_type = ""
+            #     condition:
+            #
+            # An ALWAYS-TRUE RULE. It parses, it loads, and it matches every
+            # event, with `diagnostics: NONE`. A `SetOp(union)` was worse in a
+            # way that was invisible: it contributed no terms, so the surviving
+            # terms were joined with `and` -- union rendered as INTERSECTION.
+            # Refusing by name is the only honest answer, and the whole class
+            # of defect dies here rather than in one renderer at a time.
+            raise Refusal(
+                "YARAL_NODE_NOT_RENDERABLE",
+                f"this rule needs a {kind} node, and YARA-L output cannot "
+                f"express one. Rather than emit a rule that matches every event "
+                f"-- which is what dropping it produced -- this is refused. The "
+                f"nodes this renderer does support are Pattern and Filter.",
+                "render")
 
-    out_lines = ["rule " + (ir.title or ir.rule_id), "{", "  meta:"]
+    out_lines = ["rule " + _rule_name(ir), "{", "  meta:"]
     out_lines.extend(meta_lines or ["    author = \"unknown\""])
     out_lines.append("")
     out_lines.append("  events:")
@@ -330,6 +358,37 @@ def _placeholder_name(field_path: str, used: set[str]) -> str:
     return candidate
 
 
+_IDENTIFIER: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _rule_name(ir: RuleIR) -> str:
+    """A rule name that cannot escape the `rule <name> {` line.
+
+    THE TITLE IS FREE TEXT AND IT WAS INTERPOLATED RAW. For a Wazuh paste,
+    `ir.title` IS the `<description>`, so this was reachable from the app with no
+    hand-built IR. A description containing newlines emitted a complete
+    attacker-chosen `rule pwned { ... condition: $e0 }` AHEAD OF the real body,
+    and the real rule followed it. That is an injection, not a formatting bug.
+
+    SANITISE, DO NOT REFUSE. A YARA-L rule name is an identifier by grammar, so
+    folding a title into one is the correct rendering, not a fallback -- and a
+    title like "Suspicious logon attempt" is an ordinary thing to paste. Every
+    character outside `[A-Za-z0-9_]` becomes `_`, which is what neutralises the
+    injection: a newline can no longer open a brace, so it cannot open a rule.
+    """
+    for candidate in (ir.title, ir.rule_id):
+        if not candidate:
+            continue
+        cleaned = re.sub(r"[^A-Za-z0-9_]", "_", candidate)
+        if not cleaned or not (cleaned[0].isalpha() or cleaned[0] == "_"):
+            cleaned = f"r_{cleaned}"
+        return cleaned
+    raise Refusal(
+        "YARAL_RULE_NAME_MISSING",
+        "this rule has neither a title nor a rule_id, so there is nothing to "
+        "name the YARA-L rule after.", "render")
+
+
 def _render_event(condition: Any, var: str) -> list[str]:
     if isinstance(condition, BoolOp):
         # A conjunction of predicates is SEVERAL events lines, not one. The
@@ -344,14 +403,36 @@ def _render_event(condition: Any, var: str) -> list[str]:
         # nocase is a NODE FIELD, rendered in the vendor's syntax. The pattern
         # itself is untouched.
         modifier = " nocase" if "nocase" in condition.flags else ""
-        return [f"    {var}.{_field_of(condition.args[0])} = /{pattern}/{modifier}"]
+        return [f"    {var}.{_field_of(condition.args[0])} = "
+                f"/{_regex_literal(pattern)}/{modifier}"]
     if isinstance(condition, Comparison):
         left = _field_of(condition.left)
         right = condition.right
         if isinstance(right, FieldExpr):
             return [f"    {var}.{left} = {_var_of(right)}"]
         return [f"    {var}.{left} = {json_escape(str(right.value))}"]
-    return []
+    # THIS USED TO RETURN []. An unrecognised expression vanished, and the
+    # caller's `events:` block then had nothing in it, so the whole rule
+    # degraded to the always-true fallback. `cmd contains "x"` became
+    # `$e0.metadata.event_type = ""` -- a test that an unrelated field is empty.
+    raise Refusal(
+        "YARAL_CONDITION_NOT_RENDERABLE",
+        f"this condition is a {type(condition).__name__}, and the YARA-L "
+        f"renderer cannot express it. It was dropped silently, which turned the "
+        f"rule into one that matches everything. Rewrite it as an equality, a "
+        f"regular expression, or a conjunction of those.",
+        "render")
+
+
+def _regex_literal(pattern: str) -> str:
+    """A `/`-delimited YARA-L regex.
+
+    `https?://[a-z]+/api/v[0-9]+` became `/https?://[a-z]+/api/v[0-9]+/`, which
+    CLOSES AT THE FIRST `/` and leaves the rest of the line as trailing garbage.
+    The delimiter is the only thing standing between the pattern and the rest of
+    the rule, so an unescaped one truncates the condition.
+    """
+    return pattern.replace("/", "\\/")
 
 
 def _field_of(node: Any) -> str:
@@ -363,9 +444,36 @@ def _field_of(node: Any) -> str:
 def _var_of(node: Any) -> str:
     if isinstance(node, FieldExpr):
         name = node.ref.name.split('.')[-1]
-        return name if name.startswith('$') else "`"
-    return "$x"
+        if name.startswith('$'):
+            return name
+        # A BARE BACKTICK IS NOT A FIELD REFERENCE. In YARA-L a backtick is the
+        # match-anything operator, so `field == field` rendered as
+        # `$e0.parent = \`` and a NARROW equality became an UNBOUNDED one -- the
+        # rule matched every event that has a parent. There is no way to name an
+        # arbitrary field on the right-hand side of an events comparison, so this
+        # is refused rather than approximated.
+        raise Refusal(
+            "YARAL_FIELD_EQ_FIELD_NOT_RENDERABLE",
+            f"this condition compares a field to another field "
+            f"({node.ref.name!r}), and YARA-L events cannot compare two fields. "
+            f"The renderer used to emit a bare backtick, which in YARA-L means "
+            f"'any value' -- so an equality that should match one value would "
+            f"have matched every one. Compare against a literal, or move the "
+            f"comparison into the condition block.",
+            "render")
+    raise Refusal(
+        "YARAL_VALUE_NOT_RENDERABLE",
+        f"a {type(node).__name__} cannot be the right-hand side of a YARA-L "
+        f"events comparison.", "render")
 
 
 def json_escape(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    """A YARA-L string literal.
+
+    A REAL NEWLINE HAS TO BE ESCAPED. `\\` and `"` were handled, so a value
+    containing a newline emitted a literal `rule injected { condition: true }`
+    into the middle of the artifact.
+    """
+    return ('"' + value.replace("\\", "\\\\").replace('"', '\\"')
+            .replace("\n", "\\n").replace("\r", "\\r")
+            .replace("\t", "\\t") + '"')
