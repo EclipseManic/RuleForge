@@ -191,13 +191,39 @@ def lower(text: str, rule_id: str = "spl",
             current = f"where_{position}"
         elif command.name in ("head", "sort", "rename", "fields", "dedup",
                               "fillnull", "eval", "regex"):
-            diagnostics.append({
-                "code": "SPL_COMMAND_LOWERED_AS_PASSTHROUGH",
-                "severity": "info",
-                "message": f"`{command.name}` does not change which events are "
-                           f"selected, so it is not represented in the graph. "
-                           f"It is preserved for rendering.",
-            })
+            # BOTH HALVES OF THE OLD DIAGNOSTIC WERE FALSE, FOR ALL EIGHT.
+            #
+            # It said "`regex` does not change which events are selected" --
+            # `| regex` is a FILTERING command in SPL, so
+            # `index=main | regex CommandLine="mimikatz" | stats count BY host`
+            # rendered as `index=main | stats count AS count BY host` and the
+            # entire detection was deleted, with `ok=True` and severity `info`.
+            #
+            # It also said "It is preserved for rendering." Nothing preserved
+            # anything: `render_spl` builds from `ir.nodes`, and no node is added
+            # here, so there is nothing for it to render. `| head 10`,
+            # `| dedup host` and `| fields host, user` all rendered as bare
+            # `index=main`.
+            #
+            # The other seven are the same class and the review is right about
+            # each: `dedup` collapses rows, `head` limits them, `fillnull` fills
+            # empties so a LATER `where` matches rows it otherwise would not,
+            # `rename` rewrites the very field a later term reads, `fields`
+            # restricts the output, `eval` computes a column, `sort` orders.
+            #
+            # So this is refused by name, like the unknown-command branch below.
+            # `info` is the wrong severity for a changed result set: a severity
+            # band is a claim about how much this matters, and this is the
+            # difference between a detection and no detection.
+            raise SplParseError(
+                "SPL_COMMAND_NOT_LOWERABLE",
+                f"`{command.name}` changes which rows the search returns, and it "
+                f"is not represented in the graph, so it would be dropped from "
+                f"the rendered rule. Ignoring it produced an artifact that "
+                f"silently returned a different set of events -- for `regex`, "
+                f"the whole detection. Refused rather than approximated, "
+                f"because an approximated command is a rule you did not write.",
+                DIALECT)
         else:
             raise SplParseError(
                 "SPL_COMMAND_UNKNOWN",

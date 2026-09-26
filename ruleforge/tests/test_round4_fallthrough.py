@@ -141,10 +141,28 @@ class WazuhIfLevelIsNotIfSlevel(unittest.TestCase):
     anything real.
     """
 
-    def test_if_level_is_recognised(self):
-        xml = ('<group name="g,"><rule id="2" level="3">'
-               "<if_level>5</if_level><description>d</description></rule></group>")
-        self.assertIn("if_level", parse_wazuh(xml)["2"].other_triggers)
+    def test_if_level_is_refused_not_merely_recorded(self):
+        """`if_slevel` appears nowhere in Wazuh. The real element is `if_level`.
+
+        So the whitelist entry was doubly wrong: a real `<if_level>5</if_level>`
+        hit the unknown-element refusal, and the name that WAS accepted could
+        never match anything real.
+
+        THIS TEST USED TO ASSERT ONLY THAT THE STRING WAS RECORDED. Round 7 found
+        that the recorded value was never read by anything, and that
+        `other_triggers.append(tag)` discarded the `5` as well -- so it passed
+        while the rule fired on levels it must not. A test that asserts a value
+        was stored, when what matters is whether it was USED, is a test that
+        reads as coverage and provides none. It asserts the refusal now.
+        """
+        for element in ("<if_level>5</if_level>", "<if_group>grp</if_group>"):
+            with self.subTest(element=element):
+                xml = (f'<group name="g,"><rule id="2" level="3">{element}'
+                       f'<description>d</description></rule></group>')
+                with self.assertRaises(Refusal) as caught:
+                    lower_wazuh(xml, "2")
+                self.assertEqual(caught.exception.code,
+                                 "WAZUH_ALERT_LEVEL_TRIGGER_UNSUPPORTED")
 
     def test_if_slevel_is_not_a_wazuh_element(self):
         xml = ('<group name="g,"><rule id="3" level="3">'

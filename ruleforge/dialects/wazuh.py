@@ -225,7 +225,31 @@ def _parse_rule(element: ET.Element) -> WazuhRule:
         elif tag == "if_matched_group":
             if_matched_group = text
         elif tag in TRIGGER_ELEMENTS:
-            other_triggers.append(tag)
+            # THE COMMENT ABOVE SAYS "RECORDED AND REFUSED". NOTHING REFUSED.
+            #
+            # `other_triggers.append(tag)` stored the NAME and threw the VALUE
+            # away, so `<if_level>10</if_level>` did not even survive as `10` --
+            # and the only reader in the whole package filters for
+            # `category`/`decoded_as`, so it was never read either. The rule
+            # lowered to Read -> Filter -> Emit, `ok=True`, `diagnostics=[]`, and
+            # rendered a rule that fires on levels it must not. That is BROADER
+            # than the source, undisclosed, which is the direction that matters.
+            #
+            # Refused rather than recorded-and-ignored, because there is no
+            # honest middle here: the IR cannot say "only when an earlier alert
+            # reached level 10", so any rendering of it is a different rule. This
+            # is the same call as the nine field predicates, and the same one the
+            # Wazuh Rules Syntax doc makes when it lists these as a requisite to
+            # trigger a rule.
+            raise WazuhParseError(
+                "WAZUH_ALERT_LEVEL_TRIGGER_UNSUPPORTED",
+                f"rule {rule_id} contains <{tag}>{text.strip()}</{tag}>, which "
+                f"selects an ALREADY-DECIDED alert rather than testing an event. "
+                f"The IR can only describe conditions over events, so honouring "
+                f"it would need the alert tree this tool does not have -- and "
+                f"ignoring it produced a rule that fires where the original did "
+                f"not, with nothing said. Refuse it and re-parse in Wazuh, where "
+                f"the level of a prior alert is real.", "wazuh")
         elif tag in _DECODER_PREDICATES:
             # Recorded, not ignored -- see `_DECODER_PREDICATES`. The lowerer
             # decides what to do with a rule whose only condition is one of
