@@ -213,8 +213,98 @@ def _reachable_from_sources(ids: dict[str, Any], output: str) -> set[str]:
     return seen
 
 
+def _screen_regexes(node: Any) -> None:
+    """Refuse a catastrophic pattern ANYWHERE in this node, at author time.
+
+    Deliberately blind to the dialect. The executable check lives in
+    `regex.compile_pattern` and knows what this engine can run; this one does
+    not need to, because the pattern is being shipped to somebody ELSE's engine
+    and a refusal here is the last point at which the tool can still say no.
+    """
+    from .redos import catastrophic_reason
+
+    def check(pattern: Any) -> None:
+        if not isinstance(pattern, str) or not pattern:
+            return
+        reason = catastrophic_reason(pattern)
+        if reason is not None:
+            raise Refusal(
+                "REGEX_CATASTROPHIC_BACKTRACKING",
+                f"this rule contains the pattern {pattern!r}, which can take "
+                f"exponential time on a subject that does not match: {reason}. "
+                f"It is refused here because this pattern is about to be "
+                f"written into a rule you will DEPLOY -- a Wazuh agent, a "
+                f"Splunk indexer or a Sentinel rule -- and that engine will run "
+                f"it with none of this tool's guards. Refused rather than given "
+                f"a time limit, because a limit would still let one row exhaust "
+                f"the budget. Rewrite it with a character class, a bounded "
+                f"length, or fewer quantifiers.", "regex")
+
+    def walk(value: Any, depth: int = 0) -> None:
+        if depth > 32:
+            return
+        # A PATTERN ARRIVES WRAPPED. A `<field>` lowers to
+        # `Call(matches_regex, (FieldExpr, Literal("...")))`, so testing
+        # `isinstance(arg, str)` found nothing and every pattern walked straight
+        # through the screen. The first version of this function MISSED all five
+        # known-bad patterns for exactly that reason, and reported no error --
+        # which is the failure mode this whole project keeps hitting.
+        if hasattr(value, "value") and not isinstance(value, (str, bytes)):
+            walk(getattr(value, "value", None), depth + 1)
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item, depth + 1)
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                walk(item, depth + 1)
+            return
+        if hasattr(value, "function") and hasattr(value, "args"):
+            for arg in getattr(value, "args", ()):
+                if isinstance(arg, str) and "regex" in str(
+                        getattr(value, "function", "")):
+                    check(arg)
+            for arg in getattr(value, "args", ()):
+                walk(arg, depth + 1)
+            for attr in ("left", "right"):
+                walk(getattr(value, attr, None), depth + 1)
+            for operand in getattr(value, "operands", ()) or ():
+                walk(operand, depth + 1)
+            return
+        if hasattr(value, "name"):
+            walk(getattr(value, "pattern", None), depth + 1)
+            walk(getattr(value, "left", None), depth + 1)
+            walk(getattr(value, "right", None), depth + 1)
+            return
+        if isinstance(value, str):
+            check(value)
+
+    for attribute in dir(node):
+        if attribute.startswith("_"):
+            continue
+        walk(getattr(node, attribute, None))
+
+
 def _validate_expressions(node: Any) -> None:
-    """Depth-check and shape-check every expression a node carries."""
+    """Depth-check and shape-check every expression a node carries.
+
+    AND SCREEN EVERY REGEX IN THE GRAPH, WHICH UNTIL NOW NOTHING DID.
+
+    `redos.py` had exactly one caller -- `regex.compile_pattern` -- which is
+    called from exactly one place: the evaluator. So the ReDoS check ran only
+    when RuleForge executed a rule LOCALLY, and never when it AUTHORED or
+    RENDERED one. That is the wrong side of the boundary: this tool's product is
+    a rule someone deploys to a Wazuh agent or a Splunk indexer, and those
+    engines run the pattern with no such guard. `jobs.author("wazuh",
+    '<field name="cmd">([a-c]?x|[a-c]?y)+$</field>')` returned `ok=True` and
+    wrote that pattern into deployable XML.
+
+    Three rounds were spent making that analyzer good -- first-set overlap,
+    separator detection, a real depth bound -- and all of it was on the local
+    path. A control has to sit where the value is still known to be right AND
+    where it is shipped, not only where it happens to be exercised.
+    """
+    _screen_regexes(node)
     name = type(node).__name__
 
     if name == "Filter":

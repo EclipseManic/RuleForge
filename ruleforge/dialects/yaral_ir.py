@@ -243,6 +243,37 @@ def _condition_for_event(event: YaraEvent, parsed: ParsedYaraL,
             f"rule would quietly differ from the one written -- so it is refused "
             f"rather than approximated.", "YARA-L")
 
+    # `event.operator` IS NEVER READ. HERE IS WHY THAT IS THE SEVENTH DOOR.
+    #
+    # `yaral.py:272` accepts `== != <= >= < >` and stores the operator on
+    # `YaraEvent.operator`. Every branch above this line built the comparison it
+    # needed and none of them looked at the operator, so a pasted rule
+    #
+    #     $e0.target.user.name != "SYSTEM"
+    #
+    # became `Comparison("=", ...)` and rendered as
+    # `$e0.target.user.name = "SYSTEM"`. A DENY RULE BECAME AN ALLOW-EXACT RULE,
+    # in a deployable artifact, with `ok=True` and no findings. Reachable from
+    # `POST /api/author` with `dialect=yaral`.
+    #
+    # The render-side guard I added in round 4 could not see this, and its
+    # justification was factually wrong: "The YARA-L parser only ever emits `=`".
+    # `yaral.py:272`, in the same package, is the counter-example. The check went
+    # on the renderer when the operator was destroyed by the LOWERER -- the same
+    # mistake as the ReDoS guard, which sat on the local evaluation path while
+    # the product is a deployable artifact. A control has to go where the value
+    # is still known to be right.
+    if getattr(event, "operator", "=") not in ("=", "=="):
+        raise Refusal(
+            "YARAL_OPERATOR_NOT_LOWERABLE",
+            f"{event.field!r} is compared with "
+            f"`{getattr(event, 'operator', '?')}`, and this lowering only "
+            f"implements equality. Every operator used to be lowered to `=`, so "
+            f"`!=` produced a rule that matched the exact opposite set of "
+            f"events -- a deny rule rendered as an allow-exact rule. That is "
+            f"refused here, at the point the operator is still known, rather "
+            f"than silently rewritten in the renderer.", "YARA-L")
+
     return Comparison("=", ref, Literal(str(event.value)))
 
 
