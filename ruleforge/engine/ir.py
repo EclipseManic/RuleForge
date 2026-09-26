@@ -891,6 +891,15 @@ class Package:
     parent: tuple[Any, ...] = ()
     #: Child conditions, each a conjunction evaluated against child events.
     children: tuple[tuple[Any, ...], ...] = ()
+    #: WHAT THE FREQUENCY COUNTS. Wazuh allows a child rule that declares no
+    #: `<field>` of its own, and that is not an empty child -- it means "the
+    #: parent's rule, N times in the timeframe", i.e. the count is over the
+    #: PARENT's own occurrences. Reading it as "the parent once, with no child"
+    #: would fire on the first event and turn a frequency rule into a plain one,
+    #: which is the difference between a brute-force-login detector and a rule
+    #: that alerts on the first password spray. `"child"` means the count is over
+    #: rows matching `children`.
+    count_subject: TypingLiteral["child", "parent"] = "child"
     #: How many child occurrences satisfy a child. Wazuh's `frequency`.
     frequency: int = 1
     #: The window the frequency is counted over. Wazuh's `timeframe`.
@@ -926,7 +935,7 @@ class Package:
                 "shape that produces the false-positive floods this correlation "
                 "style is distrusted for. Declare which field ties them "
                 "together.", "Package")
-        if self.timeframe <= Duration(0):
+        if not self.timeframe.is_positive:
             raise Refusal(
                 "PACKAGE_REQUIRES_TIMEFRAME",
                 "a frequency is counted within a timeframe; with a zero "
@@ -941,6 +950,13 @@ class Package:
             if not child:
                 raise Refusal("PACKAGE_EMPTY_CHILD",
                               f"child {index} has no conditions", "Package")
+        if self.count_subject == "child" and not self.children:
+            raise Refusal(
+                "PACKAGE_CHILD_COUNT_WITHOUT_CHILDREN",
+                "count_subject is 'child' but there are no child conditions, so "
+                "there is nothing to count. Wazuh's way of saying 'count the "
+                "parent N times' is a child rule with no <field> of its own, "
+                "which is count_subject='parent'.", "Package")
 
 
 @dataclass(frozen=True, slots=True)

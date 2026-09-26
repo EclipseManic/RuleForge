@@ -96,7 +96,25 @@ def _scan(pattern: str) -> str | None:
         char = pattern[index]
 
         if char == "\\":
-            return _REFUSED_WITH_REASON["\\"]
+            # AN ESCAPED LITERAL IS NOT DIALECT-SPECIFIC. Refusing every
+            # backslash was defensible but too broad: `\.` is a literal dot in
+            # ERE and in BRE alike, and so are `\+`, `\(`, `\$`, `\\` and the
+            # rest. Wazuh's own shipped rule 60000 is `\.+`, so the refusal made
+            # a real ruleset unexecutable over a character with exactly one
+            # meaning.
+            #
+            # The line is drawn at ALPHANUMERICS. `\d`, `\w`, `\s`, `\b` and `\1`
+            # are character classes, anchors and backreferences, and those DO
+            # differ between engines -- `\b` is a word boundary in ERE but a
+            # backspace in BRE. Those stay refused, because evaluating them here
+            # would return a wrong answer rather than an error.
+            following = pattern[index + 1:index + 2]
+            if not following:
+                return ("a trailing backslash is not a pattern")
+            if following.isalnum():
+                return _REFUSED_WITH_REASON["\\"]
+            index += 2
+            continue
 
         if char == "(" and pattern[index:index + 2] == "(?":
             return _REFUSED_WITH_REASON["(?"]

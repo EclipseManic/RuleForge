@@ -47,6 +47,7 @@ from .values import (
     Refusal,
     Undecided,
     as_number,
+    has_value,
     is_undecided,
 )
 
@@ -74,19 +75,41 @@ def resolve_field(row: Row, ref: FieldRef) -> Any:
     value that is absent is genuinely absent.
     """
     current: Any = row.values.get(ref.name, ABSENT)
+    walked = True
     for segment in ref.path:
         if current is ABSENT or current is None:
-            return ABSENT
+            walked = False
+            break
         if isinstance(current, dict):
             current = current.get(segment, ABSENT)
         elif isinstance(current, (list, tuple)):
             if isinstance(segment, int) and -len(current) <= segment < len(current):
                 current = current[segment]
             else:
-                return ABSENT
+                walked = False
+                break
         else:
-            return ABSENT
-    return current
+            walked = False
+            break
+    if walked:
+        return current
+
+    # FALL BACK TO THE LITERAL DOTTED KEY. Agents deliver the same field in two
+    # shapes: Wazuh's decoder produces nested JSON
+    # (`{"win": {"eventdata": {...}}}`) while plenty of pipelines and exported
+    # event samples keep it flat (`{"win.eventdata.targetUserName": ...}`).
+    # Resolving only the nested form made every dotted field silently ABSENT on
+    # flat input, so a rule matched nothing and reported a clean no_match rather
+    # than a missing field -- the most expensive possible failure, because it
+    # looks like a working rule.
+    #
+    # The nested walk is tried FIRST, so a row carrying both is read the way the
+    # agent that produced it meant it.
+    #
+    # This must not `return ABSENT` from inside the walk loop: an early return
+    # on the first missing segment skipped the fallback entirely, so the flat
+    # shape stayed unresolvable and every dotted field was still ABSENT.
+    return row.values.get(ref.full, ABSENT)
 
 
 # ---------------------------------------------------------------------------
@@ -881,6 +904,9 @@ def eval_package(node: Package, rows: list[Row],
     if not rows:
         return out
 
+    if not node.children and node.count_subject == "parent":
+        return _eval_package_parent_frequency(node, rows, ctx)
+
     for parent_row in rows:
         ctx.budget.spend(1, "package parent")
         if node.parent and not _stage_matches(node.parent, parent_row, ctx):
@@ -897,7 +923,7 @@ def eval_package(node: Package, rows: list[Row],
             continue
 
         if not node.children:
-            out.append(dict(parent_row))
+            out.append(_package_row(parent_row, counted=0, fired=()))
             continue
 
         window_end = parent_time + node.timeframe.seconds
@@ -911,12 +937,22 @@ def eval_package(node: Package, rows: list[Row],
                 "log' would count unrelated events, so the parent is reported "
                 "without a child verdict rather than with a wrong one.",
                 1))
-            out.append(dict(parent_row))
+            out.append(_package_row(parent_row, counted=0, fired=()))
             continue
+
+        # `count_subject` decides WHAT THE FREQUENCY COUNTS. "child" counts rows
+        # matching the child's own conditions. "parent" counts the PARENT's own
+        # occurrences -- Wazuh's meaning for a child rule that declares no
+        # <field> of its own, and the difference between "five failures in four
+        # minutes" and "the first failure". An earlier version ignored this and
+        # always returned the parent, so a frequency-5 rule fired on one event.
+        conditions: tuple[tuple[Any, ...], ...] = (
+            node.children if node.count_subject == "child" else (node.parent,)
+        )
 
         fired: list[str] = []
         counted = 0
-        for child_index, child_condition in enumerate(node.children):
+        for child_index, child_condition in enumerate(conditions):
             child_rows: list[Row] = []
             for candidate in rows:
                 moment = as_number(candidate.get(node.time_field or ""))
@@ -933,16 +969,13 @@ def eval_package(node: Package, rows: list[Row],
                 if _stage_matches(child_condition, candidate, ctx):
                     child_rows.append(candidate)
 
-            ctx.budget.spend(len(child_rows), "package child matching")
+            ctx.budget.spend(len(child_rows), "package frequency counting")
             if len(child_rows) >= node.frequency:
                 counted += 1
                 fired.append(f"child_{child_index}")
 
-            annotated = dict(parent_row)
-            annotated["__package_children_matched__"] = counted
-            annotated["__package_children_required__"] = len(node.children)
-            annotated["__package_children_fired__"] = ",".join(fired)
-            out.append(annotated)
+        out.append(_package_row(parent_row, counted=counted, fired=tuple(fired),
+                                required=len(conditions)))
 
     if len(out) > node.max_matches:
         ctx.add(Caveat(
@@ -950,6 +983,105 @@ def eval_package(node: Package, rows: list[Row],
             f"stopped at {node.max_matches} parent events; more may exist", 0))
         out = out[:node.max_matches]
     return out
+
+
+def _eval_package_parent_frequency(node: Package, rows: list[Row],
+                                   ctx: EvaluationContext) -> list[Row]:
+    """`frequency` occurrences of the PARENT within `timeframe` -- Wazuh's sliding count.
+
+    THIS IS NOT A FORWARD WINDOW FROM THE FIRST OCCURRENCE. An earlier version
+    anchored the window on each parent and counted events strictly after it, so a
+    rule reading "5 times in 240 seconds" needed five FURTHER events after the
+    first and never fired on a spray of exactly five. Wazuh counts occurrences
+    inside a sliding window and alerts when the threshold is reached, so the
+    window trails the current event: [t - timeframe, t].
+
+    The row emitted is the occurrence that COMPLETED the threshold, which is the
+    one an analyst wants to see. Every parent row is a candidate anchor, so a
+    spray of five yields exactly one alert, not five.
+
+    Counting is per `same_field` group, so five events on five hosts is not one
+    attack. A group whose shared field is unusable is reported as undecided
+    rather than merged with the others.
+    """
+    counted_rows: list[Row] = []
+    for row in rows:
+        if node.parent and not _stage_matches(node.parent, row, ctx):
+            continue
+        counted_rows.append(row)
+    if not counted_rows:
+        return []
+
+    groups: dict[Any, list[Row]] = {}
+    unusable = 0
+    for row in counted_rows:
+        key = _package_group_value(row, node.same_fields)
+        if key is None:
+            unusable += 1
+            continue
+        groups.setdefault(key, []).append(row)
+
+    if unusable:
+        ctx.add(Caveat(
+            "PACKAGE_UNDECIDABLE_GROUP",
+            f"{unusable} of {len(counted_rows)} events have no usable value for "
+            f"the field(s) named in same_*, so they are excluded from every "
+            f"count. Counting them together would merge unrelated activity.",
+            unusable))
+
+    span = node.timeframe.seconds
+    out: list[Row] = []
+    for key, group in groups.items():
+        ctx.budget.spend(max(1, len(group)), "package frequency grouping")
+        ordered = sorted(group,
+                         key=lambda r: (as_number(r.get(node.time_field or ""))
+                                        or Decimal(0)))
+        moments = [as_number(r.get(node.time_field or "")) for r in ordered]
+        left = 0
+        for index, moment in enumerate(moments):
+            ctx.budget.spend(1, "package frequency counting")
+            if moment is None:
+                ctx.add(Caveat(
+                    "PACKAGE_UNDECIDABLE_TIME",
+                    "an event has no usable timestamp on the declared time field, "
+                    "so the timeframe cannot be established for it",
+                    1))
+                continue
+            # TRAILING WINDOW. Advance the left edge past anything older than the
+            # timeframe, so the count is "occurrences within the last N seconds",
+            # which is what the rule says.
+            while left < index and moments[left] is not None and \
+                    moment - moments[left] > span:
+                left += 1
+            window_size = index - left + 1
+            if window_size >= node.frequency:
+                out.append(_package_row(
+                    ordered[index], counted=window_size, fired=("parent",),
+                    required=node.frequency))
+                if len(out) >= node.max_matches:
+                    ctx.add(Caveat(
+                        "PACKAGE_MATCH_LIMIT",
+                        f"stopped at {node.max_matches} matches; more may exist", 0))
+                    return out[:node.max_matches]
+    return out
+
+
+def _package_row(parent: Row, counted: int, fired: tuple[str, ...],
+                 required: int = 0) -> Row:
+    """The parent row, annotated with which children fired.
+
+    BUILDS A `Row`, NOT A DICT. An earlier version called `dict(parent_row)`,
+    which raises TypeError on a dataclass. The error was swallowed upstream and
+    the whole node returned zero rows, so a rule whose parent matched every
+    event reported a clean no_match with no caveat anywhere -- the most
+    expensive possible shape of silent failure, because it looks like a rule
+    that simply found nothing.
+    """
+    values = dict(parent.values)
+    values["package_children_matched"] = counted
+    values["package_children_required"] = required
+    values["package_children_fired"] = ",".join(fired)
+    return Row(values, parent.time, parent.index, dict(parent.uncertain))
 
 
 def _package_group_value(row: Row, fields: tuple[FieldRef, ...]) -> Any:
@@ -962,8 +1094,13 @@ def _package_group_value(row: Row, fields: tuple[FieldRef, ...]) -> Any:
     values: list[Any] = []
     for spec in fields:
         value = resolve_field(row, spec)
-        if is_undecided(value):
-            return None  # a partial key is not a key
+        # `is_undecided` is strict identity on UNDECIDED, so an ABSENT field
+        # passed straight through and the group key became the tuple
+        # `(ABSENT,)` -- a key that groups every row missing that field into one
+        # bucket, which is precisely the merge this function exists to prevent.
+        # `has_value` is the check that counts ABSENT and NULL as no value.
+        if not has_value(value):
+            return None
         values.append(value)
     return tuple(values)
 

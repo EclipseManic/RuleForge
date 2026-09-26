@@ -56,7 +56,7 @@ def _input_refs(node: Any) -> list[str]:
     """
     name = type(node).__name__
     if name in ("Filter", "Derive", "Aggregate", "Arrange", "Expand", "Pattern",
-                "Emit"):
+                "Package", "Emit"):
         return [node.input]
     if name in ("Join", "SetOp"):
         return [node.left, node.right]

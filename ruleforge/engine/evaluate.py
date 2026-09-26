@@ -219,26 +219,25 @@ class EvaluationContext:
 
 
 def _lookup(row: Row, ref: FieldRef) -> Any:
-    """Resolve a field reference against a row, walking a nested path.
+    """Resolve a field reference. Delegates to the ONE resolver.
 
-    A path that cannot be walked yields ABSENT rather than raising. A field path
-    into a value that is absent is genuinely absent, not an error, and treating
-    it as one would make a rule unreadable on rows that simply lack the nesting.
+    This used to be a SECOND, independent implementation of nested-path walking.
+    That is the exact defect `resolve_field`'s own docstring warns about, and it
+    had already happened once: the expression layer and the node layer disagreed
+    about what a field was, so `FieldRef("event", ("v",))` meant `event.v` inside
+    a Filter and the whole `event` dict inside an Aggregate, a Join key and a
+    time reference.
+
+    It bit again the moment `resolve_field` learned to fall back to a flat dotted
+    key while this copy did not: a Wazuh `<field name="win.system.eventID">`
+    resolved in an Aggregate and did not resolve inside the expression that
+    tested it, so the rule reported a clean no_match on every row. Two
+    implementations of "read this field" is one too many, so this one is gone
+    rather than kept in step.
     """
-    current: Any = row.get(ref.name)
-    if not ref.path:
-        return current
-    for segment in ref.path:
-        if isinstance(current, dict):
-            current = current.get(segment, ABSENT)
-        elif isinstance(current, (list, tuple)):
-            if isinstance(segment, int) and -len(current) <= segment < len(current):
-                current = current[segment]
-            else:
-                return ABSENT
-        else:
-            return ABSENT
-    return current
+    from .nodes import resolve_field
+
+    return resolve_field(row, ref)
 
 
 def eval_expr(expr: Any, row: Row, ctx: EvaluationContext,
