@@ -359,6 +359,21 @@ def render(ir: RuleIR) -> str:
                         for ref, direction in node.order_by]
             if node.limit:
                 limit = f"\nLIMIT {node.limit}"
+        elif name == "Derive":
+            # A DERIVED COLUMN IS A PREDICATE IN AQL. `| project` and `| eval`
+            # both change the shape of the row, and an AQL search has neither:
+            # a computed column in a `WHERE` would be a filter on something the
+            # search never produced. It was in no branch at all, so a graph with
+            # one rendered as `SELECT * FROM events` with the derived column
+            # gone, no refusal and no diagnostic -- the same silent drop as the
+            # Join/SetOp/Pattern case, one node lower on the list.
+            raise Refusal(
+                "AQL_NODE_NOT_RENDERABLE",
+                "this rule contains a Derive node, which computes new columns. AQL "
+                "searches index-time fields and has no `project` or `eval`, so a "
+                "computed column has no AQL form. Rendering the rest would hand "
+                "you a query with the derivation missing from it.",
+                "AQL")
         elif name in ("Join", "SetOp", "Pattern", "Package", "Expand"):
             # NO SILENT `else`, AND THAT IS THE POINT. This loop used to fall
             # through for every node type it did not name, so a graph containing

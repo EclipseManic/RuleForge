@@ -377,10 +377,15 @@ def _lower_operator(operator: str, args: str, source: str, node_id: str,
         condition = _expression(args)
         node = Filter(id=node_id, input=source, condition=condition)
     elif operator == "project":
-        node = Derive(id=node_id, input=source,
+        # `projects=True` IS THE RECORD THAT THIS REPLACES THE ROW. The
+        # renderers used to re-derive it by matching the node id, which is a
+        # second source of truth minted here and read there -- so one dialect's
+        # naming convention decided whether a Wazuh artifact got a `<fields>`
+        # list.
+        node = Derive(id=node_id, input=source, projects=True,
                       assignments=tuple(_assignments(args, diagnostics)))
     elif operator == "extend":
-        node = Derive(id=node_id, input=source,
+        node = Derive(id=node_id, input=source, projects=False,
                       assignments=tuple(_assignments(args, diagnostics)))
     elif operator == "summarize":
         node = _summarize(args, source, node_id, diagnostics)

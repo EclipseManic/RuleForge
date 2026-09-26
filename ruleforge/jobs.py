@@ -266,6 +266,23 @@ def author(dialect: str, text: str, rule_id: str = "rule",
 # ---------------------------------------------------------------------------
 
 
+def _lower_validated(dialect: str, text: str, rule_id: str) -> Any:
+    """Lower AND validate, as one step, for every job that needs a graph.
+
+    `author` validated on its own and `understand` and `tune` did not, so
+    `MAX_NODES` was enforced on one of three routes: a 602-node graph came back
+    whole from `understand` and from `tune`, walked and serialised, with
+    `MAX_NODES` and `MAX_EXPRESSION_DEPTH` unenforced. A limit that applies to
+    one entrance is not a limit, so all three go through here.
+    """
+    ir, _ = lower_for(dialect, text, rule_id)
+    try:
+        validate_graph(ir)
+    except Refusal as refusal:
+        raise Refusal(refusal.code, refusal.message, "validation") from refusal
+    return ir
+
+
 def understand(ir) -> Outcome:
     """Explain the graph, its cost, and every refusal baked into it."""
     findings: list[Finding] = []
@@ -362,6 +379,13 @@ def tune(ir, events: list[dict[str, Any]] | None = None) -> Outcome:
     """
     findings: list[Finding] = []
     result: dict[str, Any] | None = None
+
+    # THE CAP IS HERE TOO, NOT ONLY IN `load_events`. `tune` is a library entry
+    # point, so `tune(ir, [{} for _ in range(120_000)])` walked straight past a
+    # check that only existed in the parser: 1.5 seconds of work on a list the
+    # caller built in memory. A limit that guards one entrance is not a limit.
+    if events:
+        events = _cap_events(events)
 
     if events:
         findings.extend(_behavioural(ir, events))

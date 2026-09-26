@@ -182,8 +182,7 @@ def _wrap(rule_id: str, level: str, body: list[str],
 
 
 def _is_projection(node: Derive) -> bool:
-    parts = node.id.rsplit("_", 2)
-    return len(parts) >= 2 and parts[-2] == "project"
+    return node.projects
 
 
 def _flatten(expression: Any) -> list[Any]:

@@ -125,21 +125,38 @@ def create_app() -> Flask:
                 return _bad_request("PAYLOAD_FIELD_WRONG_TYPE",
                                     "`fields` must be a list of field-name "
                                     "strings")
+            # IT WAS VALIDATED AND THEN THROTTEN AWAY. `fields` was read, type
+            # checked, and then `None` was passed to the job regardless, so the
+            # induced-rule summary always reported EVERY field in the sample --
+            # asking for one field got all of them, and the answer silently
+            # ignored the question.
+            fields = list(raw_fields)
+
+        # `events` IS THE ONE PAYLOAD KEY THAT WAS NOT TYPE-CHECKED. A list, an
+        # int or a dict reached `load_events` and hit `.strip()` on a non-string,
+        # which the catch-all reported as "a bug in RuleForge, not a problem with
+        # your rule" -- the blame inverted, and once per request in the log.
+        raw_events = payload.get("events", "")
+        if isinstance(raw_events, (list, dict, int, float, bool)):
+            return _bad_request("PAYLOAD_FIELD_WRONG_TYPE",
+                                "`events` must be a JSON string -- either an "
+                                "array or one object per line")
+        events_text = raw_events if isinstance(raw_events, str) else ""
 
         try:
             if job == "author":
                 outcome = jobs.author(dialect, text, rule_id)
             elif job == "understand":
-                ir, _ = jobs.lower_for(dialect, text, rule_id)
+                ir = jobs._lower_validated(dialect, text, rule_id)
                 outcome = jobs.understand(ir)
             elif job == "tune":
-                ir, _ = jobs.lower_for(dialect, text, rule_id)
-                events = jobs.load_events(payload.get("events", ""))
+                ir = jobs._lower_validated(dialect, text, rule_id)
+                events = jobs.load_events(events_text)
                 outcome = jobs.tune(ir, events)
             elif job == "debug_rule_to_logs":
                 outcome = jobs.debug_rule_to_logs(dialect, text, rule_id)
             elif job == "debug_logs_to_rule":
-                events = jobs.load_events(payload.get("events", ""))
+                events = jobs.load_events(events_text)
                 outcome = jobs.debug_logs_to_rule(dialect, events, fields)
         except Refusal as refusal:
             return jsonify({

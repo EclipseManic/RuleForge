@@ -326,9 +326,25 @@ def render_expr(expr: Any) -> str:
     if isinstance(expr, Not):
         return f"NOT {render_expr(expr.operand)}"
     if isinstance(expr, Comparison):
+        # A PRESENCE OP IS NOT AN INFIX COMPARISON. `_COMPARISON.get(op, op)`
+        # rendered `is_not_null` as the bare string between the operands, giving
+        # `foois_not_nulltrue` -- a field name nobody has. `.get(op, op)` is also
+        # a raw-interpolation sink: the moment a new op joins the whitelist it
+        # becomes injectable, so an unknown op is refused rather than echoed.
+        presence_text = {"exists": "isnotnull", "is_not_null": "isnotnull",
+                         "is_null": "isnull"}
+        if expr.op in presence_text:
+            return f"{presence_text[expr.op]}({render_expr(expr.left)})"
+        if expr.op not in _COMPARISON:
+            raise Refusal(
+                "SPL_OPERATOR_NOT_RENDERABLE",
+                f"`{expr.op}` is not an SPL operator this renderer knows. It is "
+                f"named rather than written out verbatim, because emitting an "
+                f"unrecognised operator between two operands produces a search "
+                f"that looks complete and means something else.", DIALECT)
         left = render_expr(expr.left)
         right = render_expr(expr.right)
-        return f"{left}{_COMPARISON.get(expr.op, expr.op)}{right}"
+        return f"{left}{_COMPARISON[expr.op]}{right}"
     if isinstance(expr, FieldExpr):
         return expr.ref.full
     if isinstance(expr, Literal):

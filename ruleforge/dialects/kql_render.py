@@ -187,8 +187,7 @@ def _is_projection(node: Derive) -> bool:
     underscore-separated token, not the last. An earlier version read the last
     token -- the index -- and therefore never detected a projection at all.
     """
-    parts = node.id.rsplit("_", 2)
-    return len(parts) >= 2 and parts[-2] == "project"
+    return node.projects
 
 
 def _render_aggregate(node: Aggregate, names: _Names) -> str:
@@ -280,7 +279,12 @@ def _render_call(expr: Call, names: _Names) -> str:
 
     if expr.function == "matches_regex":
         subject = render_expr(expr.args[0], names)
-        pattern = expr.args[1].value
+        # KQL VERBATIM STRINGS DECODE `""` AS ONE `"`. Interpolating the pattern
+        # raw meant a pattern carrying `a"" | take 0"` closed the literal early
+        # and injected a stage into the DEPLOYED rule -- and `take 0` returns
+        # nothing, so the rule silently matched zero events. This is the same
+        # bug as the SPL one, fixed there and missed here.
+        pattern = str(expr.args[1].value).replace('"', '""')
         # The DIALECT goes back in as KQL's own `kind` argument. It is not
         # dropped: a `pcre` pattern rendered without it would be read as KQL's
         # default RE2 and would silently change what it matches.

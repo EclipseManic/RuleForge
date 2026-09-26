@@ -164,13 +164,20 @@ def _nested_quantifier(pattern: str) -> str | None:
     depth = 0
     quantified: list[bool] = []
     alternation: list[bool] = []
-    #: The group most recently closed, pending a quantifier that may follow it.
-    #: `(a|aa)+` quantifies the group from OUTSIDE, after the `)`, so the flags
-    #: have to survive the pop -- otherwise every `(...)+` looked unquantified and
-    #: the whole check was a no-op for that shape.
+    #: Consecutive unbounded quantifiers at the SAME level, with no group between
+    #: them. `a*a*a*a*a*a*a*a*$` needs no parentheses at all to be catastrophic:
+    #: a 12-character pattern took 31 seconds and timed out past 60. The first
+    #: version of this check only looked INSIDE groups, so that whole class walked
+    #: straight through it -- which is exactly the threat this control exists for,
+    #: since the attacker picks the pattern and not the data.
+    run = 0
     pending: tuple[bool, bool] | None = None
     index = 0
     length = len(pattern)
+
+    #: Two in a row is ordinary (`\d+\.\d+` is separated, but `a*b` is not
+    #: ambiguous); three is the point where the split count turns exponential.
+    MAX_CONSECUTIVE_QUANTIFIERS = 2
 
     while index < length:
         char = pattern[index]
@@ -223,6 +230,18 @@ def _nested_quantifier(pattern: str) -> str | None:
                             f"alternatives overlap, so a non-matching subject "
                             f"makes the engine try exponentially many splits")
                 pending = None
+                run = 0
+            else:
+                # AT THE TOP LEVEL, WITH NO GROUP INVOLVED. Three in a row is
+                # the catastrophic shape and needs no parentheses to reach it.
+                run += 1
+                if run > MAX_CONSECUTIVE_QUANTIFIERS:
+                    return (f"{run} unbounded quantifiers in a row at position "
+                            f"{index}, with nothing between them. A subject that "
+                            f"does not match makes the engine try every way of "
+                            f"splitting it, which is exponential -- a "
+                            f"{len(pattern)}-character pattern of this shape "
+                            f"already takes 30 seconds")
             index += 1
             continue
         if char == "{" and index + 1 < length and pattern[index + 1].isdigit():
@@ -239,6 +258,7 @@ def _nested_quantifier(pattern: str) -> str | None:
             continue
         if not char.isspace():
             pending = None
+            run = 0
         index += 1
     return None
 
@@ -284,28 +304,20 @@ def compile_pattern(dialect: str, pattern: str) -> Callable[..., bool]:
             "REGEX_INVALID",
             f"the pattern does not compile: {exc}", "Call") from exc
 
-    nested = _nested_quantifier(pattern)
-    if nested is not None:
-        # A QUANTIFIER UNDER A QUANTIFIER. The allowlist permits `( ) * + ?`,
-        # which is exactly the shape catastrophic backtracking needs: `(a+)+$`
-        # against a non-matching subject of 28 characters takes 30 seconds, and
-        # it doubles with every character added. No subject-length cap helps --
-        # the attacker picks the pattern, not the data -- so the PATTERN is what
-        # has to be refused.
-        #
-        # This sat unfixed through two review rounds. It was called "latent"
-        # because the dialects that accept a user regex either declare a
-        # non-executable engine or lower the pattern to a string comparison. That
-        # is a mitigation by accident, not a control, and `compile_pattern` is
-        # public.
+    from .redos import catastrophic_reason
+    reason = catastrophic_reason(pattern)
+    if reason is not None:
+        # A QUANTIFIER UNDER A QUANTIFIER, AN OVERLAPPING ALTERNATION, OR A PILE
+        # OF UNBOUNDED QUANTIFIERS. The allowlist permits `( ) * + ?`, which is
+        # the shape catastrophic backtracking needs. The PATTERN is refused, not
+        # the subject, because the attacker picks the pattern and a time limit
+        # would still let one row burn the whole budget.
         raise Refusal(
             "REGEX_CATASTROPHIC_BACKTRACKING",
-            f"{nested} puts a quantifier inside a quantified group, which is the "
-            f"shape that makes matching time explode on a subject that does not "
-            f"match -- `(a+)+$` against 28 non-matching characters takes 30 "
-            f"seconds, and doubles with every character. Refused rather than "
-            f"given a time limit, because a limit would still let one row burn "
-            f"the budget. Rewrite it without nesting, or match a bounded length.",
+            f"this pattern can take exponential time on a subject that does not "
+            f"match: {reason}. Refused rather than given a time limit, because a "
+            f"limit would still let one row exhaust the budget. Rewrite it with "
+            f"a character class, a bounded length, or fewer quantifiers.",
             "Call")
 
     def evaluate(value: str, case_insensitive: bool = False,

@@ -98,6 +98,22 @@ class WazuhParseError(Refusal):
     pass
 
 
+#: Elements that are presentation, grouping or agent plumbing, and genuinely do
+#: not change WHICH events a rule matches. Ignoring these is correct -- unlike
+#: ignoring a `<match>`, which removes the detection entirely.
+#: Elements that are presentation, grouping or AGENT PLUMBING, and genuinely do
+#: not change which events a rule matches. `<decoded_as>` and `<category>` tell
+#: the agent how to decode an event and how to classify an alert; neither is a
+#: predicate, so ignoring them is correct. `<match>` is NOT in here -- that one IS
+#: a predicate, which is why dropping it was so damaging.
+_IGNORED_ELEMENTS = frozenset({
+    "group", "options", "info", "check_diff", "comment", "rule",
+    "group_name", "documentation", "category", "decoded_as", "hostname",
+    "status", "firewall", "location", "list", "program_name", "sha1",
+    "sha256", "md5", "extra_data", "data", "fixed_fields", "json", "regex",
+})
+
+
 _VAR = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
 
 
@@ -174,6 +190,10 @@ def _parse_rule(element: ET.Element) -> WazuhRule:
             if_matched_group = text
         elif tag in TRIGGER_ELEMENTS:
             other_triggers.append(tag)
+        elif tag in _IGNORED_ELEMENTS:
+            # Presentation and grouping only. These genuinely do not affect
+            # which events a rule matches, so ignoring them is correct.
+            pass
         elif tag == "mitre":
             mitre.extend((node.text or "").strip() for node in child
                          if (node.text or "").strip())
@@ -181,6 +201,24 @@ def _parse_rule(element: ET.Element) -> WazuhRule:
             description = text
         elif tag in ("frequency", "timeframe"):
             unexpanded.extend(f"{tag}={v}" for v in _VAR.findall(text))
+        else:
+            # NO SILENT `else`, AND THIS IS THE WORST VERSION OF THAT BUG.
+            # `<match>` is what the shipped Wazuh rulesets actually use --
+            # `<match field="win.eventdata.CommandLine" type="pcre2">` -- and it
+            # was dropped on the floor, so the rule lowered to Read -> Emit with
+            # NO FILTER AT ALL. `notepad.exe` matched. `lsass.exe` matched. The
+            # tool reported "the rule matched 3 of 3 events" and showed no
+            # warning anywhere. A detection that fires on everything while
+            # reporting success is the worst output this project can produce, so
+            # an element we do not understand is named instead.
+            raise WazuhParseError(
+                "WAZUH_ELEMENT_UNKNOWN",
+                f"rule {rule_id} contains a <{tag}> element, which this lowering "
+                f"does not understand. Dropping it would remove the condition "
+                f"from the rule and leave it matching every event in the log "
+                f"while reporting success. <match> in particular is the form the "
+                f"shipped Wazuh rulesets use, so this is a real gap rather than "
+                f"an exotic one.", "wazuh")
 
     for attribute in ("frequency", "timeframe"):
         value = (element.get(attribute) or "").strip()
