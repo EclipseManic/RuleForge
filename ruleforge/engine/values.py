@@ -317,12 +317,20 @@ def presence(field_value: Any, op: str) -> ComparisonResult:
 
       exists(a)      the field is in the row at all
       is_not_null(a) the field is in the row AND is not null
+      is_null(a)     the field is in the row AND IS null
 
-    A row where `a` is present and null satisfies is_not_null but not exists is
-    irrelevant to it. Collapsing the two is how a null field becomes a confident
-    "the field was there and had a value", which is the specific false statement
-    that makes tuning a rule against sparse data go wrong.
+    THREE distinct questions. `is_null` was added because AQL's `IS NULL` had no
+    op of its own and was being given the name `is_not_null` -- the exact
+    opposite of what it means. One op name with two meanings, in a module whose
+    entire purpose is that `null` and `absent` are not the same thing, and a
+    SPL bare term rendered to AQL as `WHERE EventCode IS NULL`.
     """
+    if op == "is_null":
+        if field_value is ABSENT:
+            return ComparisonResult(False, field_value, False,
+                                    "field is absent, which is not the same as "
+                                    "being null")
+        return ComparisonResult(field_value is None, field_value, True, "")
     if op == "exists":
         held = field_value is not ABSENT
         return ComparisonResult(held, field_value, True,

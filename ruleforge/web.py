@@ -77,10 +77,54 @@ def create_app() -> Flask:
 
     @app.post("/api/<job>")
     def run_job(job: str) -> Any:
-        payload = request.get_json(silent=True) or {}
+        # AN UNKNOWN JOB IS A 404, CHECKED FIRST. The payload validation below
+        # runs before dispatch, so an unknown route used to be reported as
+        # "no JSON body was sent" -- which is not what was wrong with it.
+        if job not in ("author", "understand", "tune", "debug_rule_to_logs",
+                       "debug_logs_to_rule"):
+            abort(404)
+
+        # THE PAYLOAD IS UNTRUSTED IN ITS SHAPE, NOT JUST ITS CONTENT. Twelve
+        # unhandled 500s came from typing alone: a JSON list body has no `.get`,
+        # `rule_id: 7` has no `.strip`, `dialect: []` is unhashable, `fields: 5`
+        # is not iterable, `fields: {}` is unhashable, and a 100k-deep array
+        # raises RecursionError in the JSON parser. None of those is the
+        # analyst's fault, and all of them produced a bare Werkzeug 500 with no
+        # code for the UI to show.
+        try:
+            payload = request.get_json(silent=True)
+        except RecursionError:
+            return _bad_request("PAYLOAD_TOO_DEEP",
+                                "the pasted JSON is nested too deeply to read")
+        if payload is None:
+            return _bad_request("PAYLOAD_MISSING",
+                                "no JSON body was sent")
+        if not isinstance(payload, dict):
+            return _bad_request("PAYLOAD_NOT_AN_OBJECT",
+                                f"the body is a {type(payload).__name__}, not a "
+                                f"JSON object")
+
         dialect = payload.get("dialect", "")
         text = payload.get("rule", "") or ""
-        rule_id = (payload.get("rule_id") or "rule").strip() or "rule"
+        if not isinstance(dialect, str) or not isinstance(text, str):
+            return _bad_request("PAYLOAD_FIELD_WRONG_TYPE",
+                                "`dialect` and `rule` must be strings")
+
+        raw_id = payload.get("rule_id") or "rule"
+        if not isinstance(raw_id, str):
+            return _bad_request("PAYLOAD_FIELD_WRONG_TYPE",
+                                f"`rule_id` is a {type(raw_id).__name__}, not a "
+                                f"string")
+        rule_id = raw_id.strip() or "rule"
+
+        raw_fields = payload.get("fields")
+        fields = None
+        if raw_fields is not None:
+            if not isinstance(raw_fields, list) or not all(
+                    isinstance(f, str) for f in raw_fields):
+                return _bad_request("PAYLOAD_FIELD_WRONG_TYPE",
+                                    "`fields` must be a list of field-name "
+                                    "strings")
 
         try:
             if job == "author":
@@ -96,20 +140,32 @@ def create_app() -> Flask:
                 outcome = jobs.debug_rule_to_logs(dialect, text, rule_id)
             elif job == "debug_logs_to_rule":
                 events = jobs.load_events(payload.get("events", ""))
-                outcome = jobs.debug_logs_to_rule(dialect, events,
-                                                  payload.get("fields"))
-            else:
-                abort(404)
+                outcome = jobs.debug_logs_to_rule(dialect, events, fields)
         except Refusal as refusal:
             return jsonify({
                 "ok": False,
                 "refusal": {"code": refusal.code, "message": refusal.message},
                 "findings": [],
             }), 200
+        except RecursionError:
+            return _bad_request("INPUT_TOO_DEEP",
+                                "the pasted events are nested too deeply to "
+                                "read")
         except history.Refused as exc:
             return jsonify({"ok": False, "refusal": {
                 "code": "HISTORY_REFUSED", "message": str(exc)},
                 "findings": []}), 200
+        except Exception as exc:  # noqa: BLE001
+            # The LAST RESORT, and it names itself as a bug rather than blaming
+            # the analyst's input. `DEBUG` is off, so a bare 500 would carry no
+            # traceback and no clue at all.
+            app.logger.exception("ruleforge: unhandled error in job %s", job)
+            return _bad_request(
+                "RULEFORGE_INTERNAL_ERROR",
+                f"RuleForge hit an unexpected error handling this request "
+                f"({type(exc).__name__}). That is a bug in RuleForge, not a "
+                f"problem with your rule. The detail is in the terminal "
+                f"running it.")
 
         saved = None
         dropped = 0
@@ -149,6 +205,17 @@ def create_app() -> Flask:
         return jsonify(body), 200
 
     return app
+
+
+def _bad_request(code: str, message: str) -> Any:
+    """A refusal for a malformed request. 200, because a refusal is an answer.
+
+    Every job route answers 200 even when it refuses, and this does too: the UI
+    reads `refusal` and shows the message, so a 4xx would just be a different
+    flavour of the same blank panel.
+    """
+    return jsonify({"ok": False, "refusal": {"code": code, "message": message},
+                    "findings": []}), 200
 
 
 def _one_line(outcome: jobs.Outcome) -> str:

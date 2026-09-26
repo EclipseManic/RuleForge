@@ -109,10 +109,36 @@ def lower(text: str, rule_id: str = "spl",
     # A search that was nothing but `EventCode=4625` rendered as an EMPTY query,
     # still `ok: true`. That is the most ordinary SPL there is, and losing its
     # filter inverts the rule's meaning while looking like success.
+    # THE TERM TREE IS KEPT, NOT FLATTENED. `walk_terms` returned the leaf terms
+    # and discarded the `("and"/"or", ...)` structure, then `_all_of` rejoined the
+    # leaves with "and" unconditionally -- so `index=w a="1" OR b="2"` lowered to
+    # `and(index=w, a="1", b="2")` and rendered as
+    # `| search (a="1" AND b="2")`. For a single-valued field that is
+    # unsatisfiable, so the rule could never fire, and for a multi-valued one it
+    # matched a SUBSET. The `OR` was not merely lost: it was replaced with the
+    # operator that changes what the rule detects. `_term_condition` already
+    # handles the nested tree, so the tree is passed through whole.
+    #
+    # A NEGATED HEAD TERM IS REFUSED rather than dropped. `NOT user=admin` at the
+    # head used to be filtered out by `not term.negate`, so the term vanished and
+    # the rule got BROADER, with ok:true and no findings. The check walks the
+    # FLATTENED view for this test only -- a negated term is nested inside the
+    # tree, so inspecting the root alone would miss it -- while the tree itself
+    # is carried into the lowering so the connectives survive.
+    for leaf in walk_terms(search.terms):
+        if isinstance(leaf, SplTerm) and leaf.negate:
+            raise SplParseError(
+                "SPL_NEGATED_HEAD_TERM",
+                f"`NOT {leaf.field}` appears in the head of the search. A negated "
+                f"term there is easy to drop, and widening the search is the "
+                f"dangerous direction, so it is named. Write it as a `| where` "
+                f"stage, which lowers exactly.", DIALECT)
+
     index_conditions = [
-        _term_condition(term) for term in walk_terms(search.terms)
-        if term.op is not None and not term.negate
+        _term_condition(term)
+        for term in walk_terms(search.terms, keep_structure=True)
     ]
+    index_conditions = [c for c in index_conditions if c is not None]
 
     nodes: list[Any] = [
         Read(id="read", selector=SourceSelector(name="events")),
@@ -195,12 +221,26 @@ def _all_of(conditions: list[Any]) -> Any:
 
 
 def _term_condition(term: Any) -> Any:
-    """One search-language term -> a boolean expression."""
+    """One search-language term -> a boolean expression.
+
+    THE OPERANDS ARE `term[1]`, NOT `term[1:]`. The parser builds
+    `("and", (t1, t2, t3))` -- the operands are ONE element that happens to be a
+    tuple -- so slicing from 1 yields `((t1, t2, t3),)`: a tuple containing the
+    operand list, whose first element is a term rather than a connective, and it
+    fell straight through to the assert. That never fired while the head terms
+    were flattened, which is exactly why the bug survived until the tree was
+    carried through whole.
+    """
     if isinstance(term, tuple) and term and term[0] in ("and", "or"):
-        node = BoolOp(term[0], tuple(_term_condition(c) for c in term[1:]))
-        return Not(node) if term[0] == "or" and False else node
+        operands = term[1] if len(term) == 2 and isinstance(term[1], tuple) \
+            else term[1:]
+        node = BoolOp(term[0], tuple(_term_condition(c) for c in operands))
+        return node
     if isinstance(term, tuple) and term and term[0] == "not":
-        return Not(_term_condition(term[1][0]))
+        inner = term[1]
+        operand = inner[0] if isinstance(inner, tuple) and len(inner) == 1 \
+            and isinstance(inner[0], (tuple, SplTerm)) else inner
+        return Not(_term_condition(operand))
 
     assert isinstance(term, SplTerm)
     if term.op == "in":

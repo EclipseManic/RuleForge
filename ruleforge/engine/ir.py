@@ -82,7 +82,7 @@ ANCHOR_ONLY_ALIGNMENTS: Final = frozenset({"explicit"})
 
 ORDERING_OPS: Final = frozenset({"=", "!=", "<", "<=", ">", ">="})
 
-PRESENCE_OPS: Final = frozenset({"exists", "is_not_null"})
+PRESENCE_OPS: Final = frozenset({"exists", "is_not_null", "is_null"})
 
 BOOL_OPS: Final = frozenset({"and", "or"})
 

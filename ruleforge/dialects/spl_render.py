@@ -94,12 +94,28 @@ def render(ir: RuleIR) -> str:
             # thing: a selector restricts what is SEARCHED so the planner can use
             # the index, and a filter scans and discards. So selector terms go to
             # the head and everything else stays a `search`, and both survive.
-            selector_terms, rest = _split_selector(node.condition)
-            if selector_terms and not selector_emitted:
-                head.extend(selector_terms)
-                selector_emitted = True
-            if rest is not None:
-                stages.append(f"| search {render_expr(rest)}")
+            # ONLY THE FIRST FILTER'S SELECTORS CAN BE HOISTED. A head selector
+            # is a search-time restriction; the same shape appearing later in
+            # the pipeline is a filter at that point, and hoisting it would move
+            # a filter to search time -- or, with two `index=` terms, produce a
+            # search nothing satisfies.
+            #
+            # AND WHEN THE LATCH IS ALREADY SET, THE WHOLE CONDITION MUST BE
+            # EMITTED AS A `search`. It used to be neither hoisted nor emitted,
+            # so `index=main | search sourcetype=WinEventLog:Security` rendered
+            # as `index=main ` -- the sourcetype gone, the search silently
+            # widened to every event in the index, and ok:true. That is the exact
+            # "silently dropped term" defect this function exists to prevent,
+            # reintroduced one branch below where it had just been fixed.
+            if not selector_emitted:
+                selector_terms, rest = _split_selector(node.condition)
+                if selector_terms:
+                    head.extend(selector_terms)
+                    selector_emitted = True
+                    if rest is not None:
+                        stages.append(f"| search {render_expr(rest)}")
+                    continue
+            stages.append(f"| search {render_expr(node.condition)}")
             continue
 
         if kind == "Aggregate":
@@ -139,13 +155,16 @@ def render(ir: RuleIR) -> str:
 
 
 #: A selector value safe to emit bare. Anything with whitespace, a quote, a pipe
-#: or a brace changes the meaning of the search if it is not quoted.
-_BARE_SAFE = re.compile(r"^[A-Za-z0-9_.:@\-*]+$")
+#: or a brace changes the meaning of the search if it is not quoted. Matched with
+#: `fullmatch`, because `re.match` with a trailing `$` accepts a value ENDING in a
+#: newline -- and a newline in a selector value is exactly the injection this
+#: guard exists to stop.
+_BARE_SAFE = re.compile(r"[A-Za-z0-9_.:@\-*]+")
 
 
 def _selector_value(value: Any) -> str:
     text = str(value)
-    if text and _BARE_SAFE.match(text):
+    if text and _BARE_SAFE.fullmatch(text):
         return text
     return render_literal(value)
 
@@ -341,8 +360,12 @@ def _render_call(expr: Call) -> str:
     if expr.function == "ends_with":
         return f"like({render_expr(expr.args[0])}, %{render_expr(expr.args[1])})"
     if expr.function == "matches_regex":
-        pattern = expr.args[1].value
-        return f'match({render_expr(expr.args[0])}, "{pattern}")'
+        # THROUGH `render_literal`, NOT AN F-SRING. The pattern was interpolated
+        # raw, so a pattern of `x" | stats count by host; #` emitted
+        # `match(cmd, "x" | stats count by host; #")` and injected two extra
+        # pipeline stages into the search the analyst pastes into Splunk.
+        return (f"match({render_expr(expr.args[0])}, "
+                f"{render_literal(expr.args[1].value)})")
     if expr.function == "coalesce":
         return "coalesce(" + ", ".join(
             render_expr(a) for a in expr.args) + ")"
@@ -370,7 +393,11 @@ def render_literal(value: Any) -> str:
         return str(value)
     if isinstance(value, (tuple, list)):
         return "(" + ", ".join(render_literal(v) for v in value) + ")"
-    text = str(value).replace('"', '\\"')
+    # BACKSLASH BEFORE QUOTE. Escaping only `"` meant a value ending in `\` came
+    # out as `"a\"` -- the quote escaped, so the literal never closed and the rest
+    # of the stage was swallowed into the string. Windows paths and regexes are
+    # full of backslashes, so this was not an edge case.
+    text = str(value).replace("\\", "\\\\").replace('"', '\\"')
     return f'"{text}"'
 
 

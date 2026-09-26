@@ -152,14 +152,22 @@ class SplSearch:
                      if t.field == "sourcetype" and t.op == "=")
 
 
-def walk_terms(tree: tuple[Any, ...]) -> list[SplTerm]:
-    """Every SplTerm in a parsed term tree, at any depth.
+def walk_terms(tree: tuple[Any, ...],
+               keep_structure: bool = False) -> list[Any]:
+    """The terms in a parsed tree.
 
-    The tree nests under `("and", ...)` / `("or", ...)` / `("not", ...)` because
-    precedence has to be represented. Anything that reaches for `.field` on the
-    top level alone therefore sees tuples, not terms -- an earlier version of
-    `indexes` did exactly that and raised AttributeError on every real search.
+    `keep_structure=False` returns every SplTerm at any depth -- for callers that
+    genuinely want a flat list of leaves.
+
+    `keep_structure=True` returns the TREE, preserving the `("and", ...)` /
+    `("or", ...)` / `("not", ...)` nodes. That flag exists because the flat form
+    DESTROYS the operator: the SPL lowering consumed leaves and rejoined them
+    with "and", so `a="1" OR b="2"` became `a="1" AND b="2"` -- an inverted
+    detection rather than a missing one. Nothing in the parser can recover the
+    operator once the tree is flattened, so the tree is now carried whole.
     """
+    if keep_structure:
+        return list(tree)
     found: list[SplTerm] = []
 
     def visit(node: Any) -> None:

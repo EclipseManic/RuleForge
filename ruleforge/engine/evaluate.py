@@ -364,12 +364,17 @@ def _eval_boolop(expr: BoolOp, row: Row, ctx: EvaluationContext,
                 f"not a yes/no answer)",
                 "not a predicate, so the conjunction has no verdict")
             return UNDECIDED
-    if any(is_undecided(v) for v in values):
-        # All operands are evaluated before combining, even though `and` with one
-        # False could short-circuit. Short-circuiting would skip a caveat the
-        # analyst needs: "the third clause was undecidable" is worth knowing even
-        # when the first clause already decided the answer.
-        return UNDECIDED
+    # AN UNDECIDED OPERAND IS NOT ALWAYS FATAL, AND WHICH DEPENDS ON THE
+    # OPERATOR. `or_(UNDECIDED, True)` is True -- one decided operand is enough,
+    # and demanding that EVERY branch of a disjunction be decidable before
+    # believing a satisfied one made `a="1" OR b="2"` match nothing at all: the
+    # row that satisfied `a="1"` and had no `b` came back UNDECIDED, so the rule
+    # could never fire. `and_` is the opposite -- one False decides it, and
+    # `and_(True, UNDECIDED)` is genuinely UNDECIDED, which `and_` already says.
+    #
+    # The short-circuit concern in the comment below still holds: every operand
+    # IS evaluated above, so the caveat is still recorded even when a sibling
+    # already decided the answer.
     combine = and_ if expr.op == "and" else or_
     return combine(*values)
 

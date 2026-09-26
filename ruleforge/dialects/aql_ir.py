@@ -442,10 +442,17 @@ def _render_expr(node: Any) -> str:
         return f"{node.function.upper()}(" + ", ".join(
             _render_expr(a) for a in node.args) + ")"
     if isinstance(node, Comparison):
-        if node.op == "exists":
-            return f"{_render_expr(node.left)} IS NOT NULL"
-        if node.op == "is_not_null":
+        # EACH OP NAME NOW MEANS WHAT IT SAYS. `is_not_null` used to render as
+        # `IS NULL` -- the exact opposite -- because the AQL parser had given
+        # `IS NULL` the name `is_not_null` and this branch compensated. So an
+        # SPL bare term, which correctly means "exists and is not null", came
+        # out of the AQL renderer as `WHERE EventCode IS NULL`: an inverted
+        # detection, produced by a cross-dialect render. One name, two meanings,
+        # in the module whose whole point is that null and absent differ.
+        if node.op == "is_null":
             return f"{_render_expr(node.left)} IS NULL"
+        if node.op in ("exists", "is_not_null"):
+            return f"{_render_expr(node.left)} IS NOT NULL"
         return f"{_render_expr(node.left)} {node.op} {_render_expr(node.right)}"
     if isinstance(node, FieldExpr):
         return node.ref.name

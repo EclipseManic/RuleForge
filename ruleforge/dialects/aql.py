@@ -258,7 +258,7 @@ class _Parser:
             self.next()
             negated = self.accept_keyword("NOT")
             self.expect_keyword("NULL")
-            op = "exists" if negated else "is_not_null"
+            op = "is_null" if not negated else "is_not_null"
             assert isinstance(left, FieldExpr)
             return Comparison(op, left, Literal(True))
 
