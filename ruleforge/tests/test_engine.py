@@ -40,6 +40,7 @@ from ruleforge.engine import (  # noqa: E402
     or_,
     presence,
 )
+from ruleforge.engine.ir import Call
 
 SRC = SourceSelector(name="events")
 
@@ -118,6 +119,81 @@ class ValueModelTests(unittest.TestCase):
         self.assertIs(presence(ABSENT, "exists").value, False)
         self.assertIs(presence(None, "is_not_null").value, False)
         self.assertIs(presence("x", "is_not_null").value, True)
+
+
+class InSetTests(unittest.TestCase):
+    """`in (...)` was broken in EVERY dialect and no test noticed.
+
+    The arity table allows `in_set(v, a, b, c)`, so the evaluator iterated
+    `args[1:]`. Both dialects instead emit `in_set(field, Literal((a, b, c)))`,
+    so `args[1:]` yielded one item -- the collection itself -- and every
+    membership test compared the value against a tuple. Every `in (...)` filter
+    matched nothing, which in the user's Sentinel rule emptied the LSASS branch
+    so the join never ran and the correlation reported a clean `no_match`: the
+    right verdict shape for the wrong reason. These tests exist because that
+    survived an entire dialect implementation untouched.
+    """
+
+    ACCESS_MASKES = ("0x1fffff", "0x1010", "0x1410", "0x143a")
+
+    def _decide(self, value, options=ACCESS_MASKES):
+        ir = RuleIR(rule_id="t", nodes=(
+            read(),
+            Filter(id="f", input="r", condition=Call(
+                function="in_set",
+                args=(FieldExpr(ref=FieldRef(name="granted_access")),
+                      Literal(value=tuple(options))))),
+            emit("f"),
+        ), output="o")
+        return evaluate(ir, [{"granted_access": value}])
+
+    def test_a_member_of_the_collection_matches(self):
+        result = self._decide("0x1fffff")
+        self.assertIs(result.verdict, Verdict.MATCHED,
+                      "the value is in the collection, so the row must survive")
+
+    def test_a_non_member_does_not_match(self):
+        """The counterpart, so the fix cannot become a blanket True."""
+        result = self._decide("0xdead")
+        self.assertIs(result.verdict, Verdict.NO_MATCH)
+
+    def test_the_match_is_not_a_string_prefix_accident(self):
+        """`0x1010` is a prefix of `0x10100`; membership must not be substringy."""
+        self.assertIs(self._decide("0x10100").verdict, Verdict.NO_MATCH)
+
+    def test_an_absent_field_is_undecided_not_false(self):
+        """The invariant, one level of nesting deeper than the existing guard."""
+        ir = RuleIR(rule_id="t", nodes=(
+            read(),
+            Filter(id="f", input="r", condition=Call(
+                function="in_set",
+                args=(FieldExpr(ref=FieldRef(name="granted_access")),
+                      Literal(value=self.ACCESS_MASKES)))),
+            emit("f"),
+        ), output="o")
+        result = evaluate(ir, [{"event_id": 10}])
+        self.assertIs(result.verdict, Verdict.NOT_EVALUATED)
+
+    def test_an_undecidable_option_makes_the_whole_test_undecided(self):
+        """`any()` would report a confident False past an UNDECIDED option.
+
+        The existing guard only inspects TOP-LEVEL arguments, so an UNDECIDED
+        nested inside the collection slipped through. This is precisely the
+        "undecidable became False" failure the engine exists to prevent, so it
+        gets a test rather than a comment.
+        """
+        ir = RuleIR(rule_id="t", nodes=(
+            read(),
+            Filter(id="f", input="r", condition=Call(
+                function="in_set",
+                args=(FieldExpr(ref=FieldRef(name="granted_access")),
+                      Literal(value=("0xdead", UNDECIDED))))),
+            emit("f"),
+        ), output="o")
+        result = evaluate(ir, [{"granted_access": "0x1fffff"}])
+        self.assertIsNot(result.verdict, Verdict.NO_MATCH,
+                         "an undecidable option must not yield a clean no_match")
+        self.assertIs(result.verdict, Verdict.NOT_EVALUATED)
 
 
 class FilterHonestyTests(unittest.TestCase):

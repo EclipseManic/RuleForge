@@ -446,7 +446,6 @@ def _summarize(args: str, source: str, node_id: str,
                  if k.strip())
 
     frame = Frame(kind="per_event")
-    time_ref = None
     if keys:
         frame = Frame(kind="tumbling", size=Duration(3600),
                       time_ref=TimeRef(keys[0].name))
@@ -535,7 +534,6 @@ def _join(args: str, source: str, node_id: str,
             found = rest.find(candidate)
             if found >= 0 and (marker_at < 0 or found < marker_at):
                 marker_at = found
-                marker = candidate
         if marker_at >= 0:
             right = rest[:marker_at].strip()
             rest = rest[marker_at:].strip()

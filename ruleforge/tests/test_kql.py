@@ -137,7 +137,8 @@ class LoweringTests(unittest.TestCase):
     def test_the_join_is_on_the_two_named_columns(self):
         join = next(n for n in self.ir.nodes if isinstance(n, Join))
         self.assertEqual(join.how, "inner")
-        self.assertEqual({l.name for l, _ in join.on}, {"Computer", "Account"})
+        self.assertEqual({left.name for left, _ in join.on},
+                         {"Computer", "Account"})
 
     def test_between_expands_to_two_conjoined_comparisons(self):
         """`a between (x .. y)` is exactly `a >= x and a <= y`. Expanding it means
@@ -161,6 +162,7 @@ class LoweringTests(unittest.TestCase):
                          "the rule's own `where between` is the window constraint")
 
     def test_the_aggregate_carries_the_four_measures_and_two_keys(self):
+        join = next(n for n in self.ir.nodes if isinstance(n, Join))
         aggregate = next(n for n in self.ir.nodes if isinstance(n, Aggregate))
         measures = {m.name: m.function for m in aggregate.measures}
         self.assertEqual(measures.get("LSASSAccessCount"), "count")
@@ -168,7 +170,31 @@ class LoweringTests(unittest.TestCase):
         self.assertEqual(measures.get("LastSeen"), "max")
         self.assertEqual(measures.get("SourceIPs"), "set",
                          "make_set collects values, it does not count them")
+
+        # THE GROUPING KEYS ARE THE JOIN PREFIXED, NOT BARE. The `summarize`
+        # runs downstream of the join, and the engine's Join stores merged
+        # columns prefixed so one side cannot silently overwrite the other. The
+        # merged row therefore HAS NO BARE `Computer` -- keying on it would be
+        # unresolvable. An earlier version of this test asserted the bare names,
+        # which was written before post-join resolution existed and described a
+        # row shape the engine does not produce.
         self.assertEqual({k.name for k in aggregate.keys},
+                         {"l_Computer", "l_Account"})
+
+        # TIE THE EXPECTATION TO THE JOIN RATHER THAN HARD-CODING THE PREFIX, so
+        # changing `left_prefix` cannot silently invalidate this test.
+        for key in aggregate.keys:
+            self.assertTrue(
+                key.name.startswith((join.left_prefix, join.right_prefix)),
+                f"{key.name} is neither side's column")
+
+        # THE JOIN KEYS THEMSELVES STAY BARE, because they are compared BEFORE
+        # the merge. This is the asymmetry that makes the round-trip recoverable:
+        # a KQL renderer must strip the prefix on post-join references and leave
+        # the join condition untouched. It must NOT strip by string match --
+        # `l_Process` is a legal KQL field name -- so it has to invert the
+        # join's actual column map, which the IR does not yet carry.
+        self.assertEqual({left.name for left, _ in join.on},
                          {"Computer", "Account"})
 
     def test_make_set_is_not_the_same_as_a_distinct_count(self):

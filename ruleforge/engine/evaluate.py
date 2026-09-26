@@ -444,7 +444,30 @@ def _eval_call(expr: Call, row: Row, ctx: EvaluationContext,
             return UNDECIDED
         return args[0].endswith(args[1])
     if name == "in_set":
-        return any(_scalar_eq(args[0], option) for option in args[1:])
+        # THE OPTIONS ARE A COLLECTION, NOT EXTRA ARGUMENTS. The arity table
+        # allows `in_set(v, a, b, c)`, but BOTH dialects emit the two-argument
+        # form `in_set(field, Literal((a, b, c)))` -- `aql_ir.py` reads the
+        # options straight off `right.value`. The evaluator iterated `args[1:]`,
+        # which for the emitted form yields ONE item: the collection itself. So
+        # every membership test compared the value against a tuple, was always
+        # False, and every `in (...)` filter dropped every row. In the user's
+        # Sentinel rule that silently emptied the LSASS branch, so the join never
+        # ran and the correlation reported a clean no_match for the wrong reason.
+        # Both shapes are honoured because the arity table still permits the
+        # variadic one.
+        if len(args) == 2 and isinstance(args[1], (tuple, list, set, frozenset)):
+            options: tuple[Any, ...] = tuple(args[1])
+        else:
+            options = tuple(args[1:])
+
+        # AN UNDECIDABLE OPTION MAKES THE WHOLE MEMBERSHIP TEST UNDECIDABLE. The
+        # guard above only inspects TOP-LEVEL arguments, so an UNDECIDED nested
+        # inside the collection slipped through and `any()` reported a confident
+        # False -- the exact "undecidable became False" failure this engine
+        # exists to prevent, one level of nesting deeper.
+        if any(is_undecided(option) for option in options):
+            return UNDECIDED
+        return any(_scalar_eq(args[0], option) for option in options)
     if name == "length":
         return len(args[0]) if isinstance(args[0], (str, list, tuple, dict)) \
             else UNDECIDED
