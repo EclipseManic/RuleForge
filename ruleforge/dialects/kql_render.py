@@ -336,7 +336,12 @@ def render_literal(value: Any) -> str:
         return format(value.normalize(), "f")
     if isinstance(value, (tuple, list)):
         return "[" + ", ".join(render_literal(v) for v in value) + "]"
-    text = str(value).replace('"', '\\"')
+    # BACKSLASH BEFORE QUOTE. KQL regular strings treat `\` as an escape, so a
+    # trailing backslash escaped the closing quote and the REST OF THE STAGE
+    # became live KQL: `"a\" | take 0"` rendered a rule that returned zero rows
+    # in production, with no error anywhere. It also broke every trailing
+    # backslash Windows path. The SPL renderer had this fixed; KQL was missed.
+    text = str(value).replace("\\", "\\\\").replace('"', '\\"')
     return f'"{text}"'
 
 

@@ -297,13 +297,6 @@ def compile_pattern(dialect: str, pattern: str) -> Callable[..., bool]:
             f"A match or a non-match computed here would not be what {dialect} does, "
             f"so refusing is the only honest answer.", "Call")
 
-    try:
-        compiled = re.compile(pattern)
-    except re.error as exc:
-        raise Refusal(
-            "REGEX_INVALID",
-            f"the pattern does not compile: {exc}", "Call") from exc
-
     from .redos import catastrophic_reason
     reason = catastrophic_reason(pattern)
     if reason is not None:
@@ -319,6 +312,32 @@ def compile_pattern(dialect: str, pattern: str) -> Callable[..., bool]:
             f"limit would still let one row exhaust the budget. Rewrite it with "
             f"a character class, a bounded length, or fewer quantifiers.",
             "Call")
+
+    # THE ANALYSIS MUST COME FIRST. It did not: `re.compile` ran seven lines
+    # above this one, so `"(" * 900 + "a" + ")" * 900` raised a bare
+    # `RecursionError` out of `compile_pattern` -- not a `Refusal`. The catch-all
+    # then reported INPUT_TOO_DEEP, "the pasted events are nested too deeply",
+    # which is the opposite of the truth: the cause was the rule's regex, not
+    # the events. Any refusal that escapes as a non-Refusal is a crash, and a
+    # crash that misattributes blame is worse than the crash alone.
+    try:
+        compiled = re.compile(pattern)
+    except re.error as exc:
+        raise Refusal(
+            "REGEX_INVALID",
+            f"the pattern does not compile: {exc}", "Call") from exc
+    except RecursionError as exc:
+        raise Refusal(
+            "REGEX_NESTING_TOO_DEEP",
+            "this pattern nests parentheses or groups too deeply for the regex "
+            "engine to parse. That is a property of the pattern, not of the "
+            "events. Flatten it -- a character class instead of nested groups.",
+            "Call") from exc
+    except (MemoryError, OverflowError, ValueError) as exc:
+        raise Refusal(
+            "REGEX_RESOURCE_EXHAUSTED",
+            f"this pattern is too large or too deeply nested to compile: "
+            f"{type(exc).__name__}. Flatten it and try again.", "Call") from exc
 
     def evaluate(value: str, case_insensitive: bool = False,
                  _c: re.Pattern[str] = compiled) -> bool:

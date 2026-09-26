@@ -288,3 +288,72 @@ found by a dialect, not by a review — a review had not caught them.**
 5. **The four jobs** wired to the engine, then the full 5-rule acceptance suite.
 
 Final gate: `python-reviewer` **and** `security-reviewer` over the whole tool.
+
+---
+
+## 10. Review rounds -- the most important section
+
+**Four independent review rounds. Every one found real criticals. The suite was
+green through all of them.** 339 -> 376 -> 403 -> 407 -> 424 tests.
+
+| Round | Found | Fixed in |
+|---|---|---|
+| 1 (python + security, parallel) | 5 criticals, 2 injection bugs, 7 highs | `58655e2` |
+| 2 (verification) | 13/14 + 7/7 confirmed fixed; found 7 NEW incl. 2 criticals | `5730957` |
+| 3 (verification) | 13/14 confirmed; `Derive.projects` still dead; 2 NEW criticals | `e6e8b35`, `db64b11` |
+
+### What each round taught
+
+**The recurring class is a SECOND SOURCE OF TRUTH.** Every critical was some
+other piece of code holding its own opinion about what something means:
+`in_set` iterating `args[1:]` while dialects emitted a collection; a duplicate
+`_lookup` field resolver; the KQL renderer stripping a prefix instead of
+inverting a recorded map; `project` vs `extend` decided by a node-id string;
+`_eval_boolop` overriding `or_`; `is_not_null` meaning both "not null" and "is
+null" depending on which dialect minted it. When you add a feature, ask what
+now knows this twice.
+
+**The second class is a SILENT `else`.** AQL's renderer dropped 6 node types.
+Wazuh's parser dropped `<match>`. Both produced a complete-looking artifact with
+the detection missing. Every `if/elif` chain over node types or XML elements now
+ends in a refusal.
+
+**The third is A LIMIT ON ONE ENTRANCE.** The event cap was only in the parser.
+`validate_graph` was only on `author`. The standalone test only scanned `engine/`,
+which is 22% of the package -- and the moment it was widened to all of it, it
+found six test files putting the PARENT TREE on `sys.path` for the whole suite.
+
+### The two criticals from round 3, in case they regress
+
+- A Wazuh `<match>` was dropped, so the rule matched **every event** and
+  reported "the rule matched 3 of 3 events" with no warning.
+- The ReDoS control was defeated by `a*a*a*a*a*a*a*a*$` -- **12 characters, no
+  parentheses**. The detector only looked inside groups. It is now
+  `engine/redos.py` and works on the precise condition: many unbounded
+  quantifiers, or prefix-overlapping alternatives inside a repeated group.
+
+## 11. Current state
+
+`db64b11`, 424 tests, ruff clean, 15/15 mutations, 38 subtests.
+ReDoS: 0 catastrophic accepted, 0 ordinary refused.
+
+Still open, honestly:
+
+- **Round 4 has not happened.** Three rounds in, each has found criticals. Treat
+  the current state as unverified against an independent eye.
+- `sys.path` cannot be made unreachable: `ruleforge` is a subpackage of the
+  directory holding the parent project, so any path entry that makes one
+  importable makes the other importable. The AST allowlist is an
+  import-statement control, not a reachability control, and it says so.
+- History is 0600 on POSIX via `mkstemp`; on Windows `os.chmod` does not model
+  POSIX bits, so the `.gitignore` comment claiming 0600 is false there.
+- `history.py` rewrites the whole file per append: O(N^2*S), ~1 TB of writes at
+  the caps.
+- XML entity expansion is bounded by libexpat's amplification limit, which is a
+  platform accident rather than a stated invariant. `defusedxml` would fix it.
+- Elastic EQL, Falcon CQL and Sigma are not started. They are low priority and
+  are not among the user's five rules. Given four review rounds, adding three new
+  dialects before round 4 clears would be building wider on ground that has not
+  been independently checked.
+- **Blocked on the user:** their verbatim SPL rule is not in the repository, and
+  20 commits are unpushed.
