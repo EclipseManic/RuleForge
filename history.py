@@ -77,11 +77,86 @@ def load(path: Path) -> list[dict[str, Any]]:
     """Every entry, oldest first. A corrupt file is surfaced, not swallowed."""
     if not path.exists():
         return []
-    raw = path.read_text(encoding="utf-8").strip()
-    if not raw:
+    # NOT `.strip()`ED, and the difference is load-bearing. The torn-tail check
+    # below decides whether an unparseable final line is an INTERRUPTED WRITE by
+    # testing whether the file ends in a newline, and a leading `.strip()` throws
+    # that newline away -- so every corrupt final line looked interrupted and was
+    # silently dropped, turning a damaged file into an empty-looking history. The
+    # legacy-array branch below still uses `.strip()`, where it is only cosmetic.
+    raw = path.read_text(encoding="utf-8")
+    if not raw.strip():
         return []
+
+    # JSON LINES, WITH THE LEGACY JSON ARRAY STILL READABLE.
+    #
+    # `append` used to load the whole file, append in memory, and write the whole
+    # file back -- an O(N) read and an O(N) write per append, so filling the
+    # history to its cap costs O(N^2) serialisation. At the caps that is about a
+    # terabyte of writes to store a few hundred megabytes, and the analyst waits
+    # for all of it on a local tool that is supposed to be instant.
+    #
+    # JSONL fixes it at the root: one JSON object per line, so an append is one
+    # `write()` of one line and nothing is re-serialised. It is also MORE
+    # readable for the person this file is written for -- the module's own words
+    # are that it is "a FILE the analyst can read, back up and delete themselves",
+    # and one entry per line is readable where a single JSON array is not.
+    #
+    # THE OLD FORMAT IS STILL READ, so an existing history is not orphaned. A
+    # single JSON document starts with `[` and a JSONL file never does, because
+    # its first line is an object. That is the discriminator, and it is the only
+    # thing distinguishing them.
+    if not raw.lstrip().startswith("["):
+        lines = raw.splitlines()
+        entries: list[dict[str, Any]] = []
+        for number, line in enumerate(lines, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                # A TORN FINAL LINE IS EXPECTED AND TOLERATED. `_append_line`
+                # writes in append mode so an append costs one line rather than
+                # a whole-file rewrite, and the price of that choice is that a
+                # process killed mid-write can leave a partial last line. This is
+                # the shape that takes, and refusing the entire history over it
+                # would turn one lost tail entry into a lost audit trail.
+                #
+                # ONLY THE LAST NON-EMPTY LINE, and only when the file does not
+                # end in a newline -- a complete line is always newline-
+                # terminated, so the absence of one is the evidence that the
+                # write was interrupted. Corruption anywhere ELSE is still
+                # refused, because that is a damaged file rather than an
+                # interrupted append, and hiding it would be the exact failure
+                # the refusal exists to prevent.
+                #
+                # AND ONLY AFTER AT LEAST ONE GOOD ENTRY HAS PARSED. Without that
+                # condition this rule swallows a file whose ONLY line is garbage,
+                # which is what a damaged file usually looks like -- one
+                # unterminated line of nonsense, no valid entry anywhere. A torn
+                # write is always a tail: there is something before it, because
+                # something was already there for the append to extend. A file
+                # with nothing valid in it has not had a torn write, it has been
+                # damaged, and reporting it as an empty history is the precise
+                # failure these refusals exist to prevent.
+                is_last = all(not later.strip() for later in lines[number:])
+                if entries and is_last and not raw.endswith("\n"):
+                    break
+                raise Refused(
+                    f"line {number} of the history file at {path} is not valid "
+                    f"JSON ({exc}). It has not been overwritten. Move it aside to "
+                    f"start a new history, or repair it -- the entries in it may "
+                    f"be the only record of rules you have already run."
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise Refused(
+                    f"line {number} of the history file at {path} is not a "
+                    f"history entry")
+            entries.append(parsed)
+        return entries
+
     try:
-        data = json.loads(raw)
+        data = json.loads(raw.strip())
     except json.JSONDecodeError as exc:
         # A corrupt history is REPORTED. Returning [] would make a damaged audit
         # trail look like an empty one, and the user would carry on believing they
@@ -143,15 +218,86 @@ def append(path: Path, kind: str, dialect: str, rule_id: str, title: str,
             f"trim it to the events that matter.")
 
     with _LOCK:
-        entries = load(path)
-        entries.append(entry)
+        existing = load(path)
+        entries = [*existing, entry]
         dropped = 0
-        if len(entries) > MAX_ENTRIES:
+        trim = len(entries) > MAX_ENTRIES
+        if trim:
             dropped = len(entries) - MAX_ENTRIES
             entries = entries[-MAX_ENTRIES:]
-        _write(path, entries)
+
+        # JSONL, AND ONLY JSONL, UNLESS THE CAP FORCES A REWRITE.
+        #
+        # This is the whole point of the format change. The under-cap path --
+        # which is every append except the last few hundred -- is ONE
+        # `write()` of ONE line. Nothing already on disk is re-read for writing,
+        # re-serialised, or rewritten, so the cost of an append no longer
+        # depends on how much history exists. The previous version re-serialised
+        # the entire file on every single append, so filling the history to its
+        # cap cost O(N^2) serialisation: at the caps, about a terabyte of writes
+        # to store a few hundred megabytes, all of it on a local tool that is
+        # supposed to answer immediately.
+        #
+        # THE LEGACY ARRAY IS UPGRADED HERE, NOT IN `load`. `load` is called by
+        # the read-only routes, and a reader must never rewrite the analyst's
+        # file -- the corruption refusals above promise the file "has not been
+        # overwritten", and a read that silently migrated it would break that
+        # promise while appearing to keep it. So the format only changes when the
+        # analyst asks for a change by saving something.
+        if not trim and not _is_legacy_array(path):
+            _append_line(path, entry)
+        else:
+            _write(path, entries)
 
     return Appended(entry=entry, dropped=dropped)
+
+
+def _is_legacy_array(path: Path) -> bool:
+    """True when the file on disk is the OLD single-JSON-document array.
+
+    A JSONL file's first character is `{`, because its first line is an object.
+    A legacy array's is `[`. An absent or empty file is not legacy, so the first
+    append creates a JSONL file rather than starting one in the old shape.
+    """
+    if not path.exists():
+        return False
+    head = path.read_text(encoding="utf-8")[:1]
+    return head == "["
+
+
+def _append_line(path: Path, entry: dict[str, Any]) -> None:
+    """Append ONE entry as ONE line, and never rewrite the existing ones.
+
+    OPPOSED TO `_write`, AND THE DIFFERENCE IS THE WHOFEATURE. `_write` is
+    temp-file-then-rename, which is the right way to replace a file atomically
+    and the wrong way to add to one: a rename is only atomic because it
+    REPLACES the file, and the point here is to keep the bytes that are already
+    there. So this opens in append mode and writes a single line, which is what
+    makes the cost independent of the file's size.
+
+    `fsync` IS KEPT, and it is the expensive part. It is also the part that
+    makes the entry durable: without it a crash can lose the last append, and a
+    history that quietly drops the record of a rule is worse than a slow one.
+
+    A TORN FINAL LINE IS TOLERATED ON READ, not here. A process killed mid-write
+    can leave a partial last line, and refusing to read the history at all
+    because of that would turn a lost tail entry into a lost audit trail.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(entry, ensure_ascii=False)
+    with path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(line + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    # The 0600 statement lives in `_write`; the same explicit, deliberately
+    # tolerant chmod is applied here so a file created by the APPEND path is not
+    # left with whatever the umask happened to be, while on Windows it stays a
+    # no-op that cannot lose the audit trail over a permission call the platform
+    # does not support.
+    try:
+        os.chmod(path, 0o600)
+    except (OSError, NotImplementedError):
+        pass
 
 
 def _write(path: Path, entries: list[dict[str, Any]]) -> None:
@@ -185,7 +331,13 @@ def _write(path: Path, entries: list[dict[str, Any]]) -> None:
                                          prefix=".history-", suffix=".tmp")
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            json.dump(entries, stream, ensure_ascii=False, indent=2)
+            # JSON LINES, NOT A JSON ARRAY. `_write` is now only reached when the
+            # cap forces a trim, or when upgrading a legacy array, and both of
+            # those rewrite the file anyway -- so the format here matches what
+            # `_append_line` writes, and a trimmed file stays readable by
+            # `load` and by anyone who opens it in a text editor.
+            for one in entries:
+                stream.write(json.dumps(one, ensure_ascii=False) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
         # Explicit, and deliberately tolerant of failure. On POSIX this asserts
