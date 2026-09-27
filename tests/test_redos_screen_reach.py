@@ -64,17 +64,21 @@ PROBES: dict[str, Any] = {
 #: Graph-node types that hold an EXPRESSION and are covered by the explicit
 #: `_nested_in_graph` probes in the anti-drift test rather than by an entry in
 #: `PROBES` (they cannot appear inside `Filter(condition=...)`).
-GRAPH_PROBES = frozenset({"Derive", "Join", "Pattern"})
+GRAPH_PROBES = frozenset({"Derive", "Join", "Pattern", "Package"})
 
-#: Types that trip the `left`/`right`/`measures` field-name heuristic but are
-#: STRUCTURALLY UNABLE to hold a pattern, so no probe can exist:
+#: Types that trip the field-name heuristic but are STRUCTURALLY UNABLE to hold
+#: a pattern, so no probe can exist:
 #:   `SetOp`    -- `left` and `right` are NODE IDS (strings), and `keys` is a
 #:                 tuple of `FieldRef`. There is no expression slot.
 #:   `Aggregate`-- `measures` is a tuple of `Measure(name, function, field, by)`
 #:                 and `frame` is a `Frame`. No expression slot.
-#: Listed with reasons rather than left implicit, so a future `SetOp` that grows
-#: a `condition` field has to delete its exemption here and add a real probe.
-CANNOT_HOLD_A_PATTERN = frozenset({"SetOp", "Aggregate"})
+#:   `Arrange`  -- `order_by` is a tuple of (`FieldRef`, direction) pairs and
+#:                 `limit` is an int. A sort key is a field reference, not an
+#:                 expression, so no pattern can sit there.
+#: Listed with reasons rather than left implicit, so a future `Arrange` that
+#: grows an expression field has to delete its exemption here and add a real
+#: probe.
+CANNOT_HOLD_A_PATTERN = frozenset({"SetOp", "Aggregate", "Arrange"})
 
 
 def _nested_in_graph(node: Any) -> str:
@@ -175,17 +179,29 @@ class TheScreenMustReachEveryContainer(unittest.TestCase):
         # (name, function, field, by) and `keys` is a tuple of `FieldRef`, so
         # neither can carry a pattern and demanding a probe for them would be
         # demanding a test for something structurally unreachable.
+        #
+        # `parent` and `children` ARE in the set because `Package` holds
+        # conditions in both, and a regex there is screenable -- verified by
+        # execution, not by reading the field list. The set is a heuristic, and
+        # this comment is the admission: a new slot under any other name is
+        # silently uncovered until someone adds it here. `Package` itself was
+        # missed for exactly that reason.
         child_fields = {"operand", "operands", "left", "right", "condition",
                         "args", "pattern", "assignments", "ref", "value",
                         "expression", "predicate", "order_by", "group_by",
-                        "stages", "on"}
+                        "stages", "on", "parent", "children"}
         containers = set()
         for cls in ir.NODE_CLASSES:
             if not dataclasses.is_dataclass(cls):
                 continue
-            required = {f.name for f in dataclasses.fields(cls)
-                        if f.default is dataclasses.MISSING}
-            if required & child_fields:
+            # ALL fields, not just the required ones. The previous version
+            # checked required fields only, so `Package` -- whose `parent` and
+            # `children` both default to `()` -- was invisible to it, even
+            # though both can hold a condition containing a regex. An optional
+            # slot is still a slot, and a test that only sees mandatory ones is
+            # blind to every defaulted container in the IR.
+            present = {f.name for f in dataclasses.fields(cls)}
+            if present & child_fields:
                 containers.add(cls.__name__)
 
         # The GRAPH-node types that can actually hold an EXPRESSION. Note what is
@@ -209,6 +225,16 @@ class TheScreenMustReachEveryContainer(unittest.TestCase):
                            time_field=ir.FieldRef("@timestamp"),
                            stages=(BoolOp("and", (OK, RX)), OK))),
             "REGEX_CATASTROPHIC_BACKTRACKING", "Pattern")
+        self.assertEqual(
+            _nested_in_graph(
+                ir.Package(id="p", input="read", parent=(OK,),
+                           children=(RX,),
+                           count_subject=ir.FieldRef("host"), frequency=3,
+                           timeframe=ir.Duration(600),
+                           same_fields=(ir.FieldRef("host"),),
+                           time_field="ts", child_uses_group=False,
+                           max_matches=10)),
+            "REGEX_CATASTROPHIC_BACKTRACKING", "Package")
 
         uncovered = sorted(containers - set(PROBES) - GRAPH_PROBES
                            - CANNOT_HOLD_A_PATTERN)
