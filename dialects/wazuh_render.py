@@ -492,7 +492,26 @@ def _flatten(expression: Any) -> list[Any]:
 
 
 def _field(expression: Any) -> str | None:
-    """The field name an expression tests, or None if it is not a field test."""
+    """The field name an expression tests, or None if it is not a field test.
+
+    A `Not` IS A FIELD TEST in Wazuh: `<field negate="yes">` is exactly a
+    negated field test, and `_field_elements` has always known how to write the
+    `negate="yes"` attribute. But this function had no `Not` branch, so it
+    returned None and the renderer refused with a message blaming an
+    "arithmetic or aggregate expression" -- false for a negation, and blaming
+    the analyst for a shape the tool itself produced. The branch below was
+    therefore unreachable, which is the second-source-of-truth shape: the
+    lowerer emits a node the renderer refuses while the renderer carries code
+    for a node it can never receive.
+
+    Unwrapping here rather than in `_flatten` is deliberate. `_flatten` splits
+    a conjunction into its parts, and a `Not` inside one is a part that must stay
+    wrapped until the field test underneath it is found -- `_field_elements`
+    re-reads the `Not` to decide the attribute. Unwrapping earlier would lose
+    the negation and turn a deny rule into an allow-exact rule.
+    """
+    if isinstance(expression, Not):
+        return _field(expression.operand)
     if isinstance(expression, Comparison):
         left, right = expression.left, expression.right
         if isinstance(left, FieldExpr) and isinstance(right, Literal):

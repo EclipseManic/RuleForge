@@ -296,10 +296,32 @@ def author(dialect: str, text: str, rule_id: str = "rule",
         rendered = render_for(dialect, ir)
     except Refusal as refusal:
         findings.append(Finding(
-            code=refusal.code, severity="caution",
+            code=refusal.code, severity="refusal",
             message=f"understood, but not written back: {refusal.message}",
             verified=True, evidence="the lowered graph"))
-        rendered = ""
+        # ok=False, AND THAT IS THE WHOLE POINT OF THIS BLOCK.
+        #
+        # This used to return `ok=True` with `rendered=""`, which is a report
+        # that nothing was produced dressed as a success. Measured on a Wazuh
+        # rule with `negate="yes"`:
+        #
+        #     ok=True   rendered=""   findings=[WAZUH_RENDER_TERM_NOT_A_FIELD_TEST]
+        #
+        # An empty artifact and a success flag together are the worst combination
+        # this API can produce, because a caller that checks `ok` -- which the
+        # web layer does, to decide whether to write the entry to the permanent
+        # history -- records a rule that was never rendered as though it had
+        # been. The analyst gets a blank output and a green tick.
+        #
+        # The finding is KEPT and its severity RAISED to `refusal`, because it
+        # carries the real explanation: the rule WAS understood, and it is the
+        # write-back that failed. Those are different facts and a `caution`
+        # band does not distinguish them from an advisory note.
+        return Outcome(ok=False, findings=findings, rendered="",
+                       graph=describe(ir), diagnostics=diagnostics,
+                       refusal={"code": refusal.code,
+                                "message": refusal.message,
+                                "stage": "render"})
 
     return Outcome(ok=True, findings=findings, rendered=rendered,
                    graph=describe(ir), diagnostics=diagnostics)

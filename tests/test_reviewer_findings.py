@@ -593,5 +593,110 @@ class WazuhRuleIdDefaultTests(unittest.TestCase):
         self.assertIn("100201", outcome.refusal["message"])
 
 
+class NegateAndSilentNoArtifactTests(unittest.TestCase):
+    """TWO DEFECTS THAT ONLY APPEAR TOGETHER, ON A `negate="yes"` WAZUH RULE.
+
+    Measured before this fix:
+
+        ok=True   rendered=""   findings=[WAZUH_RENDER_TERM_NOT_A_FIELD_TEST]
+
+    An empty artifact with a success flag. The web layer gates its history write
+    on `outcome.ok`, so that combination wrote a rule that was NEVER RENDERED
+    into the append-only, undeletable audit trail and reported it to the analyst
+    as saved. The finding said what went wrong, and nothing acted on it.
+
+    The two root causes are independent and both are fixed, because fixing only
+    the renderer would have left the "empty means success" bug in place for
+    every OTHER render refusal.
+    """
+
+    NEGATED = ('<group name="test,">'
+               '<rule id="100300" level="5">'
+               '<field name="win.system.eventID" negate="yes">^4624$</field>'
+               '</rule></group>')
+
+    PLAIN = ('<group name="test,">'
+             '<rule id="100300" level="5">'
+             '<field name="win.system.eventID">^4624$</field>'
+             '</rule></group>')
+
+    def test_a_negated_field_renders_with_the_negate_attribute(self):
+        """`negate="yes"` is a FIELD TEST, and `_field_elements` always knew how
+        to write it -- but `_field` had no `Not` branch, so the renderer refused
+        and the branch was unreachable."""
+        from jobs import author
+        outcome = author("wazuh", self.NEGATED, rule_id="100300")
+        self.assertTrue(outcome.ok, outcome.findings)
+        self.assertIn('negate="yes"', outcome.rendered)
+        self.assertIn("^4624$", outcome.rendered)
+
+    def test_a_negation_is_not_rendered_as_a_positive_test(self):
+        """The inverse is the dangerous one: rendering a deny rule as an
+        allow-exact rule inverts the detection."""
+        from jobs import author
+        outcome = author("wazuh", self.NEGATED, rule_id="100300")
+        self.assertNotIn('name="win.system.eventID">^4624$',
+                         outcome.rendered)
+
+    def test_a_plain_field_still_renders_without_the_attribute(self):
+        from jobs import author
+        outcome = author("wazuh", self.PLAIN, rule_id="100300")
+        self.assertTrue(outcome.ok, outcome.findings)
+        self.assertNotIn("negate=", outcome.rendered)
+
+    def test_a_render_refusal_is_not_reported_as_success(self):
+        """The general case, on a rule that is understood perfectly well and
+        simply cannot be written back. `level="99999"` is the cleanest example:
+        valid enough to lower, meaningless to a Wazuh agent."""
+        from jobs import author
+        bad = ('<group name="test,">'
+               '<rule id="100300" level="99999">'
+               '<field name="win.system.eventID">^4624$</field>'
+               '</rule></group>')
+        outcome = author("wazuh", bad, rule_id="100300")
+        self.assertFalse(outcome.ok, "a rule that did not render reported ok=True")
+        self.assertEqual(outcome.rendered, "")
+        self.assertIsNotNone(outcome.refusal)
+        self.assertEqual(outcome.refusal["code"], "WAZUH_LEVEL_OUT_OF_RANGE")
+
+    def test_the_finding_is_kept_and_marked_a_refusal_not_a_caution(self):
+        """The rule WAS understood, and it is the WRITE-BACK that failed. Those
+        are different facts, and a `caution` band does not distinguish them from
+        an advisory note."""
+        from jobs import author
+        bad = ('<group name="test,">'
+               '<rule id="100300" level="99999">'
+               '<field name="win.system.eventID">^4624$</field>'
+               '</rule></group>')
+        outcome = author("wazuh", bad, rule_id="100300")
+        severities = {getattr(f, "severity", "") for f in outcome.findings}
+        self.assertIn("refusal", severities)
+        self.assertNotIn("caution", severities)
+
+    def test_the_graph_is_still_returned_so_the_work_is_not_lost(self):
+        """ok=False must not mean "nothing happened". The lowering succeeded and
+        the graph is the evidence for that, so it is still there."""
+        from jobs import author
+        bad = ('<group name="test,">'
+               '<rule id="100300" level="99999">'
+               '<field name="win.system.eventID">^4624$</field>'
+               '</rule></group>')
+        outcome = author("wazuh", bad, rule_id="100300")
+        self.assertFalse(outcome.ok)
+        self.assertTrue(outcome.graph)
+
+    def test_the_web_layer_will_not_save_it(self):
+        """The consequence that mattered. The history is append-only and has no
+        delete path, so a refused rule written into it is permanent."""
+        import inspect
+
+        import web
+        source = inspect.getsource(web)
+        self.assertIn("outcome.ok", source,
+                      "the save gate must still be conditioned on ok")
+        # Assert the gate is a conjunction, not a bare `if outcome.ok` elsewhere.
+        self.assertIn('payload.get("save") and outcome.ok', source)
+
+
 if __name__ == "__main__":
     unittest.main()
