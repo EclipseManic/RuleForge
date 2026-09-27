@@ -31,15 +31,37 @@ Thumbs.db
 # RuleForge history: pasted detection rules and EVENT SAMPLES, which contain
 # hostnames, usernames, source IPs and destination IPs. The server never
 # transmits them, but git add -A from a repo with a remote would publish them.
-# This is the one file RuleForge writes.
+# THESE ARE THE FILES RuleForge WRITES, and this used to name one:
+#
+#   data/history.json        the history itself
+#   data/history.json.lock   a sidecar `history.append` takes a cross-process
+#                            lock on, so two copies of RuleForge cannot have one
+#                            of them unlink an entry the other was told it had
+#                            saved. It holds no history and is 0 bytes on POSIX
+#                            and 1 NUL byte on Windows, which is a byte for
+#                            `msvcrt.locking` to lock; it is 0600 on POSIX.
+#   data/.history-*.tmp      the temp file a rewrite is built in. Exists for
+#                            milliseconds, and a process killed mid-rewrite
+#                            leaves one behind, which is the one case where a
+#                            full copy of the history can sit in `data/`
+#                            unmanaged. The prefix is a dot, and the `data/`
+#                            rule at the bottom covers all three.
+#
+# The lock file is deliberately NEVER UNLINKED -- see `history._exclusive` for
+# why unlinking a lock is how you end up with two writers each holding one.
 #
 # THE PERMISSION CLAIM WAS FALSE ON WINDOWS AND IS NOW WRITTEN DOWN. This
 # comment used to say "filesystem permissions are 0600" as though that were
 # simply true everywhere. It is not:
 #
-#   POSIX   0600, set explicitly by `history._write` via `os.chmod` (and by
-#           `mkstemp` before it). The explicit call is there so the guarantee
-#           does not rest on a stdlib implementation detail.
+#   POSIX   0600. On the ORDINARY path, which is every append that does not
+#           fill the cap -- 1999 of every 2000 -- `history._append_line` passes
+#           the mode to `os.open` so the file is never briefly readable, and
+#           chmods afterwards as a second statement of the same intent. On the
+#           rarer REWRITE path, `history._write` chmods explicitly and
+#           `mkstemp` has already created the temp at 0600. The earlier version
+#           of this comment named only `_write` and `mkstemp`, which are the
+#           path almost nothing takes.
 #   win32   `os.chmod` has ONE bit -- the read-only flag -- and does not model
 #           POSIX permission bits. The file is exactly as readable as the
 #           directory holding it. The real control there is the inherited ACL:
