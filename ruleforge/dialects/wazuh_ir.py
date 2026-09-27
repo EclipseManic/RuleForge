@@ -67,6 +67,7 @@ def lower(xml_text: str, rule_id: str,
             "WAZUH_RULE_NOT_IN_DOCUMENT",
             f"rule {rule_id} is not in the supplied document", DIALECT)
 
+    chain_ids: set[str] = set()
     if target.is_correlation:
         ir = _lower_correlation(rules, target, osconf=ossec,
                                 time_field=time_field, source_name=source_name,
@@ -75,6 +76,37 @@ def lower(xml_text: str, rule_id: str,
         chain = resolve_chain(rules, rule_id)
         ir = _lower_plain(chain, time_field=time_field, source_name=source_name,
                           diagnostics=diagnostics)
+        chain_ids = {rule.rule_id for rule in chain.rules}
+
+    # SAY WHAT ELSE WAS IN THE PASTE.
+    #
+    # Pasting rules 200, 300 and 400 and asking for 300 returned 300, which is
+    # CORRECT -- one rule was asked for. The defect was silence: a second
+    # correlation in the same paste simply never became a node, so the renderer's
+    # orphan check could not see it, and the artifact looked like the whole
+    # ruleset. Someone pasting a ruleset and getting one rule out has no way to
+    # tell that from someone whose paste contained one rule.
+    #
+    # Refusing would be over-strict in the wrong direction: asking for one rule
+    # of a document is a reasonable thing to do, and the tool already supports
+    # it. So the other rules are named instead. The chain that rule 300 depends
+    # on is not "other" -- those parents ARE part of rule 300's meaning -- so
+    # only rules outside the resolved chain are reported.
+    others = sorted(set(rules) - {rule_id} - chain_ids)
+    if others:
+        preview = ", ".join(others[:6]) + (f" (+{len(others) - 6} more)"
+                                          if len(others) > 6 else "")
+        diagnostics.append({
+            "code": "WAZUH_OTHER_RULES_IN_PASTE_NOT_LOWERED",
+            "severity": "caution",
+            "rule_id": rule_id,
+            "message": (
+                f"this document also contains {len(others)} other rule(s) "
+                f"({preview}). Only rule {rule_id} and the chain it depends on "
+                f"were lowered, because one rule was asked for. The others "
+                f"produced no node and no rendered output -- if you expected "
+                f"the whole ruleset, lower each rule by id."),
+        })
 
     return ir, diagnostics
 
