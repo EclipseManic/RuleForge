@@ -1,6 +1,17 @@
 Flask>=3.0,<4.0
 PyYAML>=6.0.3,<7.0
 
+# XML entity expansion is a memory amplification primitive, and a pasted Wazuh
+# ruleset is attacker-reachable. libexpat's amplification limit happens to stop a
+# billion-laughs document on this platform, which is an implementation detail of
+# one C library rather than a guarantee this tool makes. defusedxml refuses DTDs
+# and entity declarations outright, so the property is stated instead of assumed.
+#
+# There is NO SILENT FALLBACK to xml.etree: a missing defusedxml is a loud
+# refusal naming this line, because a fallback would restore the exact accident
+# this replaces and would do it invisibly.
+defusedxml>=0.7,<1.0
+
 # THE SIGMA BLOCK BELOW IS NOT USED BY THIS TOOL, AND THE COMMENT THAT USED TO
 # BE HERE WAS FALSE.
 #

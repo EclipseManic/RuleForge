@@ -24,6 +24,30 @@ from __future__ import annotations
 
 import re
 import xml.etree.ElementTree as ET
+
+#: The XML parser used for UNTRUSTED input, and the refusal if it is absent.
+#:
+#: `defusedxml` is not optional and there is no fallback to `xml.etree`, because
+#: a fallback would restore the exact accident this replaces and would do it
+#: invisibly. See `parse_wazuh` for the measurement that motivated it.
+try:
+    from defusedxml import ElementTree as _SAFE
+    from defusedxml.ElementTree import DTDForbidden, EntitiesForbidden
+except ImportError as _exc:  # pragma: no cover - depends on the environment
+    raise ImportError(
+        "defusedxml is required to parse Wazuh rulesets. It is what stops a "
+        "pasted document from expanding XML entities into gigabytes of memory, "
+        "and RuleForge will not fall back to the stdlib parser, which does not "
+        "make that guarantee. Install it with:  pip install defusedxml"
+    ) from _exc
+
+#: The stdlib module is still imported, but ONLY for its `Element` type, which
+#: annotates `_parse_rule`'s parameter. It parses nothing. The parser is `_SAFE`
+#: and every `except` clause below is on `_SAFE.ParseError` or on a defusedxml
+#: exception, never on `ET.ParseError` -- an earlier version of this comment
+#: claimed the opposite, which is the sort of thing that makes a reader trust
+#: the wrong line.
+__all__ = ["ET", "parse_wazuh"]
 from dataclasses import dataclass, field
 
 from engine.ir import Refusal
@@ -159,10 +183,71 @@ def parse_wazuh(xml_text: str) -> dict[str, WazuhRule]:
     Uses a real XML parser. Wazuh's files contain regexes full of `<`, `>` and
     `&` inside `<field>` bodies, and hand-rolled tag splitting is exactly how
     those get silently truncated into a rule that matches something else.
+
+    PARSED WITH `defusedxml`, NOT `xml.etree`, AND THE REASON IS A STATED
+    INVARIANT RATHER THAN A LUCKY PLATFORM.
+
+    A pasted ruleset is attacker-reachable -- it can come from a shared document,
+    a SIEM export or a ticket -- and XML entity expansion is a memory
+    amplification primitive. A three-level "billion laughs" document with three
+    `<!ENTITY>` declarations was measured against this parser BEFORE this
+    change: it parsed in 0.5ms and returned one rule, with no error and no
+    diagnostic. It did not exhaust memory, and that was entirely libexpat's
+    amplification limit -- an implementation detail of one C library, which
+    differs between platforms and Python builds, and which nothing here asserts.
+
+    `defusedxml` refuses entity declarations and, with `forbid_dtd=True` set
+    below, refuses DTDs outright. The guarantee is therefore "this tool will not
+    expand entities" rather than "this tool happens not to expand entities very
+    far on this machine". The second is not a security property; it is a
+    coincidence that fails silently when the platform changes.
+
+    `forbid_dtd` IS NOT DEFUSEDXML'S DEFAULT. Its signature is
+    `fromstring(text, forbid_dtd=False, forbid_entities=True,
+    forbid_external=True)`, so the default parser refuses entity DECLARATIONS
+    but happily parses a document that carries a DTD -- which is where entity
+    declarations live. Measured on 0.7.1 before this line was added: a
+    billion-laughs document and a bare `<!DOCTYPE group SYSTEM "rules.dtd">` both
+    PARSED, with no error. So the first version of this switch did not do what
+    its own comment said, which is the exact failure this project keeps finding.
+
+    Passing `forbid_dtd=True` closes that. Verified rather than assumed: the real
+    shipped Wazuh ruleset still parses all 8 of its rules, because it has no
+    DTD, and a document whose only entities are character references (`&amp;`,
+    `&#65;`) still parses, because those are not declarations.
+
+    WITH `forbid_dtd=True` A BILLION-LAUGS DOCUMENT RAISES `DTDForbidden`, NOT
+    `EntitiesForbidden` -- the DTD is refused before its contents are read. The
+    `EntitiesForbidden` clause below is therefore a second line of defence rather
+    than the primary one, and stays so that a future change in defusedxml's
+    precedence cannot quietly reopen entity expansion.
+
+    THERE IS NO SILENT FALLBACK TO `xml.etree`. Falling back would restore
+    exactly the accident this replaced, and would do it invisibly -- so a missing
+    `defusedxml` is a loud refusal naming the package, not a quiet downgrade to
+    the parser this line used to use.
     """
     try:
-        root = ET.fromstring(xml_text.strip())
-    except ET.ParseError as exc:
+        root = _SAFE.fromstring(xml_text.strip(), forbid_dtd=True)
+    except DTDForbidden as exc:
+        raise WazuhParseError(
+            "WAZUH_XML_DTD_FORBIDDEN",
+            "this document carries a DTD, which RuleForge refuses outright. A "
+            "pasted ruleset has no legitimate use for one: a DTD is how an XML "
+            "parser is talked into expanding entities, and a few declarations "
+            "can expand to gigabytes of memory before anything is evaluated. "
+            "Wazuh rulesets do not need a DTD, so this is either not a Wazuh "
+            "ruleset or it is not one you want this tool reading.", "wazuh"
+        ) from exc
+    except EntitiesForbidden as exc:
+        raise WazuhParseError(
+            "WAZUH_XML_ENTITY_DECLARATION",
+            "this document declares XML entities, which RuleForge refuses to "
+            "expand. Entity expansion is a memory amplification primitive, and a "
+            "pasted ruleset is not a trusted document. Wazuh rulesets do not need "
+            "entities, so this is either not a Wazuh ruleset or it is not one "
+            "you want this tool reading.", "wazuh") from exc
+    except _SAFE.ParseError as exc:
         raise WazuhParseError(
             "WAZUH_XML_MALFORMED",
             f"this is not well-formed XML: {exc}. Wazuh rule bodies contain "

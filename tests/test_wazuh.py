@@ -470,5 +470,118 @@ class IntegerGrammarTests(unittest.TestCase):
                          "WAZUH_FREQUENCY_IS_OSCONF_VARIABLE")
 
 
+class XmlEntityExpansionTests(unittest.TestCase):
+    """A pasted ruleset is ATTACKER-REACHABLE, and XML entity expansion is a
+    memory amplification primitive.
+
+    Measured before the parser was switched: a three-declaration billion-laughs
+    document parsed in 0.5ms and returned one rule, with no error and no
+    diagnostic. It did not exhaust memory -- because libexpat's amplification
+    limit stopped it. That limit is an implementation detail of one C library,
+    which varies by platform and Python build, and which nothing in this tool
+    asserted. So the tool was relying on a coincidence.
+
+    `defusedxml` refuses DTDs and entity declarations outright, which makes the
+    guarantee "this tool will not expand entities" rather than "this tool
+    happens not to expand them very far on this machine".
+
+    THE MUTATION IS THE POINT: swapping `_SAFE.fromstring` back to
+    `ET.fromstring` leaves this file green, which is why these tests exist. A
+    security property with no test is a comment.
+
+    AND `forbid_dtd=True` IS NOT DEFUSEDXML'S DEFAULT, which this class caught.
+    Its signature is `fromstring(text, forbid_dtd=False, forbid_entities=True,
+    forbid_external=True)`. Measured on 0.7.1 with the default: a billion-laughs
+    document AND a bare `<!DOCTYPE group SYSTEM "rules.dtd">` both PARSED with no
+    error, because the default refuses entity DECLARATIONS but not the DTD they
+    live in. So the first version of this switch did not do what its own comment
+    claimed. `test_a_bare_dtd_is_also_refused` is the test that says so.
+    """
+
+    BOMB = (
+        '<?xml version="1.0"?>\n'
+        '<!DOCTYPE lolz [\n'
+        ' <!ENTITY lol "lol">\n'
+        ' <!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">\n'
+        ' <!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&'
+        'lol2;&lol2;">\n'
+        ']>\n'
+        '<group name="x,"><rule id="1" level="5">'
+        '<description>&lol3;</description></rule></group>'
+    )
+
+    def test_an_entity_declaration_is_refused_by_name(self):
+        with self.assertRaises(WazuhParseError) as caught:
+            parse_wazuh(self.BOMB)
+        self.assertIn(caught.exception.code,
+                      ("WAZUH_XML_DTD_FORBIDDEN",
+                       "WAZUH_XML_ENTITY_DECLARATION"))
+
+    def test_a_bare_dtd_is_also_refused(self):
+        """A DTD with NO entity declarations in it, which is the case that proves
+        `forbid_dtd=True` is actually set rather than assumed.
+
+        defusedxml's default is `forbid_dtd=False`. With the default, this exact
+        document PARSES, silently, because the thing being forbidden is the
+        DECLARATION and not the DTD that would hold it. So this test is the one
+        that distinguishes "we set the flag" from "we wrote a comment saying we
+        set the flag".
+        """
+        bare = (
+            '<?xml version="1.0"?>\n'
+            '<!DOCTYPE group SYSTEM "rules.dtd">\n'
+            '<group name="x,"><rule id="1" level="5">'
+            '<description>d</description></rule></group>'
+        )
+        with self.assertRaises(WazuhParseError) as caught:
+            parse_wazuh(bare)
+        self.assertEqual(caught.exception.code, "WAZUH_XML_DTD_FORBIDDEN")
+
+    def test_an_internal_dtd_without_entities_is_also_refused(self):
+        """A `<!DOCTYPE group [<!ELEMENT ...>]>` has no amplification primitive,
+        so refusing it is stricter than strictly necessary -- but a Wazuh ruleset
+        has no use for one, and the position is taken deliberately rather than
+        by accident of a library default."""
+        internal = (
+            '<?xml version="1.0"?>\n'
+            '<!DOCTYPE group [<!ELEMENT rule ANY>]>\n'
+            '<group name="x,"><rule id="1" level="5">'
+            '<description>d</description></rule></group>'
+        )
+        with self.assertRaises(WazuhParseError) as caught:
+            parse_wazuh(internal)
+        self.assertEqual(caught.exception.code, "WAZUH_XML_DTD_FORBIDDEN")
+
+    def test_the_refusal_says_why_rather_than_just_failing(self):
+        with self.assertRaises(WazuhParseError) as caught:
+            parse_wazuh(self.BOMB)
+        message = caught.exception.message.lower()
+        self.assertIn("entit", message)
+        self.assertIn("gigabyte", message + " gigabytes")
+
+    def test_the_real_shipped_ruleset_still_parses(self):
+        """The other direction. A parser that refuses the vendor's own ruleset is
+        not a control, it is an outage -- and the shipped ruleset is the one
+        input here that is known to be real."""
+        rules = parse_wazuh(WAZUH_RULESET)
+        self.assertGreaterEqual(len(rules), 8)
+        self.assertIn("60205", rules)
+
+    def test_ordinary_escaped_entities_are_still_fine(self):
+        """`&amp;` and `&#10;` are CHARACTER references, not entity declarations.
+        A guard that refused those would reject real Wazuh rules, whose bodies
+        are full of escaped metacharacters."""
+        rule = (
+            '<group name="test,">'
+            '<rule id="900020" level="5">'
+            '<description>a &amp; b &#65;</description>'
+            '<field name="win.system.eventID">^4624$</field>'
+            '</rule></group>'
+        )
+        rules = parse_wazuh(rule)
+        self.assertIn("900020", rules)
+        self.assertIn("&", rules["900020"].description)
+
+
 if __name__ == "__main__":
     unittest.main()

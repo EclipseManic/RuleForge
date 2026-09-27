@@ -582,8 +582,19 @@ class StandaloneTests(unittest.TestCase):
     #:
     #: `ruleforge` is no longer in it, because there is no package any more. Its
     #: place is taken by `_own_top_level_names()`.
+    #:
+    #: The two named roots are DECLARED DEPENDENCIES in `requirements.txt`, and
+    #: each was added by being introduced deliberately rather than by editing
+    #: this line to make a failure go away. `flask` is the web layer.
+    #: `defusedxml` is the XML parser for untrusted rulesets: it refuses DTDs and
+    #: entity declarations, which turns "libexpat's amplification limit happens to
+    #: stop a billion-laughs document on this platform" into a stated guarantee.
+    #: That import made this test fail when it was written, which is the correct
+    #: outcome -- a new third-party root should be a deliberate, visible act.
     ALLOWED_IMPORT_ROOTS = (
-        frozenset(sys.stdlib_module_names) | {"flask"} | _own_top_level_names()
+        frozenset(sys.stdlib_module_names)
+        | {"flask", "defusedxml"}
+        | _own_top_level_names()
     )
 
     #: The ONLY two files permitted to touch `sys.path`, and both are guarded.
