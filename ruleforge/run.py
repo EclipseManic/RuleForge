@@ -40,8 +40,21 @@ import threading
 import webbrowser
 from pathlib import Path
 
+#: `run.py` LIVES INSIDE THE PACKAGE, NOT BESIDE IT.
+#:
+#: It started at the repository root, which is shared with an older tool. That
+#: made the launcher ambiguous -- a file called `run.py` next to two projects
+#: does not say which one it starts -- and this repository is the subject of a
+#: rule about never having two answers to one question. It now sits in the same
+#: folder as the code it launches, so "start the new tool" is one file in one
+#: place.
+#:
+#: BEING INSIDE THE PACKAGE MEANS `import ruleforge` DOES NOT YET WORK: Python
+#: puts THIS directory on the path, not its parent, and the package's own name
+#: is what has to be importable. So the parent goes on the path instead.
 HERE = Path(__file__).resolve().parent
-PACKAGE_ROOT = HERE / "ruleforge"
+REPO_ROOT = HERE.parent
+PACKAGE_ROOT = HERE
 
 #: 127.0.0.1, spelled out, because "the loopback interface" and "every
 #: interface" are the same word to most people and not the same thing at all.
@@ -160,16 +173,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     _check_layout()
-    if str(PACKAGE_ROOT) not in sys.path:
-        sys.path.insert(0, str(PACKAGE_ROOT))
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
 
     try:
         from ruleforge import web
     except ImportError as exc:
         raise StartupProblem(
             f"RuleForge could not be imported: {exc}\n"
-            f"  Python {sys.version.split()[0]}, from {Path.cwd()}\n"
-            f"  If you just cloned this, run:  pip install -r requirements.txt") from exc
+            f"  Python {sys.version.split()[0]}, running from {Path.cwd()}\n"
+            f"  If you just cloned this, install Flask with:\n"
+            f"      pip install -r {REPO_ROOT / 'requirements.txt'}") from exc
 
     port = _find_port(args.host, args.port)
     _prepare_data_dir()

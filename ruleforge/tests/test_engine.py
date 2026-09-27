@@ -561,7 +561,18 @@ class StandaloneTests(unittest.TestCase):
     #: it works as `python ruleforge/mutation_check.py` without affecting an
     #: import. Anything else doing this puts the parent tree on the path for the
     #: whole session, which is the failure these tests exist to prevent.
-    PATH_MUTATION_EXEMPT = frozenset({"conftest.py", "mutation_check.py"})
+    #: `run.py` IS EXEMPT, AND THE EXCEPTION IS DELIBERATE. It is the launcher.
+    #: Python puts the folder containing a running script on `sys.path`, and the
+    #: launcher now lives INSIDE `ruleforge/`, so that folder is the package
+    #: itself -- `import ruleforge` cannot resolve until its PARENT is added. That
+    #: one line is the whole reason the tool can be started at all, and the path
+    #: it adds contains nothing but this repository. Every library module keeps
+    #: the prohibition, because for anything the engine imports, a `sys.path`
+    #: edit means it is reaching outside itself. Enforcing the rule without this
+    #: exemption would simply push the launcher back to the repository root, which
+    #: is where the "which tool does this start?" ambiguity came from.
+    PATH_MUTATION_EXEMPT = frozenset({"conftest.py", "mutation_check.py",
+                                      "run.py"})
 
     def _package_files(self) -> list[pathlib.Path]:
         return sorted(pathlib.Path(__file__).resolve().parent.parent
