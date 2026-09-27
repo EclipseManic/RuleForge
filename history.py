@@ -15,12 +15,33 @@ deletes an older one. Two reasons, and the second is the real one:
 
 So there is no update path and no delete path, here or through the web layer.
 
-THE WRITE IS WHOLE-FILE AND THAT IS A REAL LIMITATION. Rewriting the whole file
-on each save is O(history) and is not safe against concurrent writers. For a
-single-user local tool that is the right trade: a partial append can corrupt the
-file, and losing the whole history to a torn write is the one failure this file
-must not have. The write is a temp-file-then-rename, so a reader never sees a
-half-written history and a crash mid-write leaves the old one intact.
+THE WRITE IS NOT WHOLE-FILE ANY MORE, AND THE OLD PARAGRAPH WAS WRONG.
+
+It used to say: "THE WRITE IS WHOLE-FILE AND THAT IS A REAL LIMITATION.
+Rewriting the whole file on each save is O(history) and is not safe against
+concurrent writers." That was true when written and is now false, which is worse
+than a missing note: a reader deciding whether this module is safe to append to
+would take it at face value.
+
+The file is JSON LINES. An append under the entry cap is ONE `write()` of ONE
+line, so its cost does not depend on how much history exists. Filling the history
+to its cap used to rewrite about 1.02 TB to store 1.02 GB, because entry i was
+written i times; now each entry is written exactly once. Measured: 30x less
+written at 60 entries, 100x at 200 -- the reduction is N/2, which is the
+quadratic signature and nothing else produces it.
+
+THE TWO PATHS DIFFER, AND THE DIFFERENCE IS DELIBERATE:
+
+  - the under-cap path APPENDS. Fast, and a killed append can leave a partial
+    last line, which `load` tolerates and the next `append` repairs.
+  - the trim path and the legacy-array upgrade REWRITE, temp-file-then-`replace`.
+    A rename is atomic because it REPLACES the file, which is the right way to
+    swap a whole file and the wrong way to add to one.
+
+So the original safety argument still holds where it applied -- a reader never
+sees a half-written history during a REWRITE, because the old inode is intact
+until the rename -- and no longer holds for the append path, which instead has
+the torn-tail tolerance described above. Neither path is unchecked.
 """
 from __future__ import annotations
 
