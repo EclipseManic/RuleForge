@@ -686,6 +686,26 @@ class Derive:
     #: built by `kql_ir`, so one dialect's naming convention decided whether a
     #: Wazuh artifact got a `<fields>` list.
     projects: bool = False
+    #: The SOURCE COMMAND, when the dialect has one and it matters.
+    #:
+    #: `projects` says whether the row is replaced or extended, which is the
+    #: question `project` versus `extend` answers. It does NOT say which of SPL's
+    #: three superficially similar commands the analyst typed, and those are not
+    #: interchangeable:
+    #:
+    #:   rename user as copy   --  `user` STOPS EXISTING
+    #:   eval copy=user        --  `copy` APPEARS and `user` IS STILL THERE
+    #:
+    #: A renderer that guessed between them from the shape of the assignment
+    #: turned `eval copy=user` into `rename user as copy`, which breaks every
+    #: later term reading `user`. So the dialect records it and the renderer
+    #: reads it. That is the same principle as `projects` immediately above: this
+    #: is DATA, not something another module re-derives by pattern-matching.
+    #:
+    #: Defaults to `""`, meaning "no dialect-specific command", which is every
+    #: dialect except SPL. A renderer that does not know about `kind` is
+    #: unaffected, so this is additive rather than a migration.
+    kind: str = ""
 
     def __post_init__(self) -> None:
         if not self.assignments:

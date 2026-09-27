@@ -396,20 +396,85 @@ class PipelineCommandLoweringTests(unittest.TestCase):
         self.assertIn("SPL_SORT_FIELD_NOT_A_NAME",
                       getattr(caught.exception, "code", ""))
 
-    def test_the_four_harder_commands_are_still_refused(self):
-        """`dedup`, `fillnull`, `regex` and `eval` are NOT in this commit. Two
-        need an expression parser and two change which rows match in ways the IR
-        does not model. They stay refused -- and refused HONESTLY, by their own
-        names, rather than hiding inside the blanket message this replaced."""
+    def test_the_two_remaining_commands_are_still_refused(self):
+        """`dedup` and `fillnull` are NOT in this commit. `dedup` collapses rows
+        and `fillnull` fills empties so a LATER term matches rows it otherwise
+        would not -- both change which rows match in ways the IR does not model.
+        They stay refused, and refused HONESTLY by name rather than hiding inside
+        the blanket message this replaced. Asserted, so they cannot quietly
+        change into something that silently drops the command.
+
+        `eval` and `regex` WERE refused when this test was written and now lower,
+        so the list shrank -- which is the point of asserting it.
+        """
         for source in ("index=main | dedup host",
-                       "index=main | fillnull value=0",
-                       "index=main | regex CommandLine=\"mimikatz\"",
-                       "index=main | eval x=1"):
+                       "index=main | fillnull value=0"):
             with self.subTest(source=source):
                 with self.assertRaises(Exception) as caught:
                     lower(source)
                 self.assertEqual(getattr(caught.exception, "code", ""),
                                  "SPL_COMMAND_NOT_LOWERABLE")
+
+    def test_eval_and_regex_now_lower(self):
+        """The other half of the above: they are no longer in the refused set."""
+        self.assertEqual(self._round_trip("index=main | eval x=1"),
+                         "index=main | eval x=1")
+        self.assertEqual(
+            self._round_trip('index=main | regex CommandLine="mimikatz"'),
+            'index=main | search CommandLine="mimikatz"')
+
+    def test_a_regex_filter_survives_into_a_later_stats(self):
+        """The exact case the blanket refusal's comment described as having once
+        deleted the whole detection: `| regex ... | stats count by host` must
+        keep the filter."""
+        rendered = self._round_trip(
+            'index=main | regex CommandLine="mimikatz" | stats count by host')
+        self.assertIn('CommandLine="mimikatz"', rendered)
+        self.assertIn("stats count", rendered)
+        self.assertLess(rendered.index("CommandLine"),
+                        rendered.index("stats"),
+                        "the filter must come before the aggregate or the "
+                        "aggregate is counting unfiltered events")
+
+    def test_eval_field_copy_stays_an_eval_and_not_a_rename(self):
+        """`rename` REMOVES the original column and `eval` KEEPS it, so a later
+        term reading the original works under one and finds nothing under the
+        other. The previous version rendered this as `rename` and broke it."""
+        rendered = self._round_trip('index=main | eval copy=user | where user="a"')
+        self.assertIn("| eval copy=user", rendered)
+        self.assertNotIn("rename", rendered)
+        self.assertIn('user="a"', rendered)
+
+    def test_a_comma_inside_a_quoted_eval_value_is_not_an_assignment_separator(self):
+        """`eval list=\"a,b\"` is ONE assignment. Splitting on every comma makes
+        it two broken ones, and the second one is a syntax error the analyst
+        never wrote."""
+        self.assertEqual(self._round_trip('index=main | eval list="a,b"'),
+                         'index=main | eval list="a,b"')
+
+    def test_an_eval_expression_ruleforge_cannot_compute_is_refused(self):
+        """`if()` is a real Splunk function, and refusing it is the honest answer
+        -- approximating a conditional would make every later term read a value
+        the analyst never computed."""
+        with self.assertRaises(Exception) as caught:
+            lower("index=main | eval n=if(a>1,2,3)")
+        self.assertEqual(getattr(caught.exception, "code", ""),
+                         "SPL_EVAL_EXPRESSION_NOT_LOWERABLE")
+
+    def test_a_duplicate_eval_target_is_refused(self):
+        """The second assignment would silently overwrite the first."""
+        with self.assertRaises(Exception) as caught:
+            lower("index=main | eval x=1, x=2")
+        self.assertEqual(getattr(caught.exception, "code", ""),
+                         "SPL_EVAL_DUPLICATE_FIELD")
+
+    def test_a_regex_without_a_field_is_refused(self):
+        """`regex` filters on a NAMED field, and guessing which one is a
+        different rule."""
+        with self.assertRaises(Exception) as caught:
+            lower('index=main | regex "mimikatz"')
+        self.assertEqual(getattr(caught.exception, "code", ""),
+                         "SPL_REGEX_NOT_A_FIELD_TEST")
 
 
 if __name__ == "__main__":

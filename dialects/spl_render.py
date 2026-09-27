@@ -150,15 +150,40 @@ def render(ir: RuleIR) -> str:
             # stops being a guess; that is an IR change, and making it blind in
             # the same commit as this one would have been how I introduced an
             # error I could not see.
-            if node.projects:
+            if node.kind == "fields" or node.projects:
                 columns = ", ".join(alias for alias, _ in node.assignments)
                 stages.append(f"| fields {columns}")
-            elif node.assignments and all(
-                    isinstance(expr, FieldExpr)
-                    for _, expr in node.assignments):
+            elif node.kind == "rename":
                 pairs = ", ".join(f"{expr.ref.full} as {alias}"
                                   for alias, expr in node.assignments)
                 stages.append(f"| rename {pairs}")
+            elif node.kind == "eval":
+                # Checked BEFORE the bare-field-reference test below, because
+                # `| eval copy=user` HAS a bare field reference and is still an
+                # eval. Ordering these two the other way round refused the most
+                # ordinary field-copy form in Splunk.
+                parts = [f"{alias}={render_expr(expr)}"
+                         for alias, expr in node.assignments]
+                stages.append("| eval " + ", ".join(parts))
+            elif node.assignments and all(
+                    isinstance(expr, FieldExpr)
+                    for _, expr in node.assignments):
+                # A hand-built `Derive` with no `kind`, carrying only bare field
+                # references. Rendering it as `rename` is the old guess, and it
+                # is WRONG where it matters: `rename` removes the original field
+                # and `eval` keeps it, so a later term reading the original would
+                # find nothing. Refused instead, because a rule that renders as a
+                # different rule is worse than one that does not render. The SPL
+                # lowerer always sets `kind`, so this only fires for a node built
+                # by hand or by another dialect.
+                raise Refusal(
+                    "SPL_RENDER_DERIVE_KIND_UNKNOWN",
+                    f"this rule computes {', '.join(alias for alias, _ in node.assignments)} "
+                    f"from a field with no recorded command, and Splunk's `rename` "
+                    f"and `eval` are not interchangeable: `rename` removes the "
+                    f"original column and `eval` keeps it. Rendering it as one or "
+                    f"the other would produce a rule that is not the one you "
+                    f"asked about, so it is named instead.", DIALECT)
             else:
                 parts = [f"{alias}={render_expr(expr)}"
                          for alias, expr in node.assignments]

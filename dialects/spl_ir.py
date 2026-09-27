@@ -215,6 +215,135 @@ def _parse_arrange_args(command: str, args: str, position: int,
     return tuple(order), limit
 
 
+def _eval_expression(text: str) -> Any:
+    """One `eval` right-hand side, which is a WIDER language than a condition.
+
+    `_eval_condition` already parses comparisons, AND/OR, NOT, parentheses and
+    function calls, and `| where` uses it. An `eval` assignment can also be a
+    BARE FIELD REFERENCE -- `| eval copy=user` is the ordinary rename-by-eval
+    form -- and a bare name is not a condition, so `_eval_condition` would reject
+    it. Rather than a second parser, this handles the two forms a condition
+    cannot be (a bare field, and a bare literal) and delegates everything else, so
+    there is one implementation of each construct.
+    """
+    body = text.strip()
+    if not body:
+        raise SplParseError("SPL_EVAL_EMPTY", "`eval` has an empty expression",
+                            DIALECT)
+
+    if _FIELD_NAME.fullmatch(body):
+        return FieldExpr(ref=FieldRef(body))
+
+    try:
+        return _eval_condition(body)
+    except SplParseError:
+        pass
+
+    if (body[0] == body[-1] and body[0] in "'\"" and len(body) >= 2):
+        return Literal(value=body[1:-1])
+    if body.isascii() and body.lstrip("-").isdigit():
+        return Literal(value=int(body))
+    if body.isascii() and body.lstrip("-").replace(".", "", 1).isdigit():
+        return Literal(value=float(body))
+    raise SplParseError(
+        "SPL_EVAL_EXPRESSION_NOT_LOWERABLE",
+        f"`{body}` is not something this lowering can compute. RuleForge "
+        f"evaluates a fixed set of expressions and will not approximate the "
+        f"rest, because a computed column that is not the one the analyst meant "
+        f"makes every later term read the wrong value.", DIALECT)
+
+
+def _parse_eval_assignments(args: str) -> tuple[tuple[str, Any], ...]:
+    """`eval a=1, b=user` -> Derive assignments.
+
+    Split on commas that are not inside quotes or brackets, because
+    `eval` arguments routinely contain both: `eval list="a,b"` is one
+    assignment, not two. Splitting naively on every comma is how a single
+    assignment becomes two broken ones.
+    """
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    quote = ""
+    for char in args:
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = ""
+            continue
+        if char in "'\"":
+            quote = char
+            current.append(char)
+            continue
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        if char == "," and depth <= 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    parts.append("".join(current))
+    if quote:
+        raise SplParseError("SPL_EVAL_UNTERMINATED_QUOTE",
+                            f"`eval {args}` has an unterminated quote.", DIALECT)
+
+    assignments: list[tuple[str, Any]] = []
+    seen: set[str] = set()
+    for raw in (p.strip() for p in parts):
+        if not raw:
+            raise SplParseError("SPL_EVAL_EMPTY_ASSIGNMENT",
+                                f"`eval {args}` has an empty assignment. "
+                                f"Refused rather than skipped.", DIALECT)
+        name, separator, expression = raw.partition("=")
+        if not separator:
+            raise SplParseError(
+                "SPL_EVAL_NOT_AN_ASSIGNMENT",
+                f"`eval {raw}` is not `<field>=<expression>`. A bare expression "
+                f"in an `eval` stage computes nothing.", DIALECT)
+        name = name.strip()
+        if not _FIELD_NAME.fullmatch(name):
+            raise SplParseError("SPL_EVAL_TARGET_NOT_A_FIELD",
+                                f"`eval {raw}` does not assign to a plain field "
+                                f"name.", DIALECT)
+        if name in seen:
+            raise SplParseError(
+                "SPL_EVAL_DUPLICATE_FIELD",
+                f"`eval` assigns {name!r} twice, and the second would silently "
+                f"overwrite the first.", DIALECT)
+        seen.add(name)
+        assignments.append((name, _eval_expression(expression)))
+    if not assignments:
+        raise SplParseError("SPL_EVAL_EMPTY", "`eval` with no assignments.",
+                            DIALECT)
+    return tuple(assignments)
+
+
+def _parse_regex_filter(args: str) -> Any:
+    """`| regex Field="value"` -> ONE Filter.
+
+    `regex` IS a filtering command -- the blanket refusal this replaces claimed
+    it was not, and that claim is why `| regex CommandLine="mimikatz" | stats
+    count by host` once rendered as a bare `stats`, deleting the whole detection
+    with `ok=True`. It is a filter whose left side is a FIELD NAME, so
+    `_eval_condition` already parses the comparison; the only thing added here
+    is a refusal when the argument is not that shape, because guessing which
+    field was meant is how a rule detects something else.
+    """
+    text = args.strip()
+    if not text:
+        raise SplParseError("SPL_REGEX_EMPTY", "`regex` has no pattern.",
+                            DIALECT)
+    if "=" not in text:
+        raise SplParseError(
+            "SPL_REGEX_NOT_A_FIELD_TEST",
+            f"`regex {text}` is not `Field=\"pattern\"`. `regex` filters on a "
+            f"named field, and RuleForge will not guess which one, because a "
+            f"different field is a different rule.", DIALECT)
+    return _eval_condition(text)
+
+
 def lower(text: str, rule_id: str = "spl",
           time_field: str = "_time") -> tuple[RuleIR, list[dict[str, Any]]]:
     """Lower an SPL search to a runnable graph, or refuse by name."""
@@ -341,7 +470,8 @@ def lower(text: str, rule_id: str = "spl",
                 nodes.append(Derive(
                     id=f"derive_{position}", input=current,
                     assignments=pairs,
-                    projects=command.name == "fields"))
+                    projects=command.name == "fields",
+                    kind=command.name))
                 current = f"derive_{position}"
             else:
                 order_by, limit = _parse_arrange_args(command.name,
@@ -350,8 +480,19 @@ def lower(text: str, rule_id: str = "spl",
                 nodes.append(Arrange(id=f"arrange_{position}", input=current,
                                      order_by=order_by, limit=limit))
                 current = f"arrange_{position}"
+        elif command.name == "eval":
+            nodes.append(Derive(id=f"derive_{position}", input=current,
+                                assignments=_parse_eval_assignments(
+                                    command.args),
+                                projects=False,
+                                kind="eval"))
+            current = f"derive_{position}"
+        elif command.name == "regex":
+            nodes.append(Filter(id=f"regex_{position}", input=current,
+                                condition=_parse_regex_filter(command.args)))
+            current = f"regex_{position}"
         elif command.name in ("head", "sort", "rename", "fields", "dedup",
-                              "fillnull", "eval", "regex"):
+                              "fillnull"):
             # BOTH HALVES OF THE OLD DIAGNOSTIC WERE FALSE, FOR ALL EIGHT.
             #
             # It said "`regex` does not change which events are selected" --
