@@ -754,7 +754,16 @@ def _is_legacy_array(path: Path) -> bool:
     """
     if not path.exists():
         return False
-    head = path.read_text(encoding="utf-8")[:1]
+    # `utf-8-sig`, like every other read in this file. This one was missed, and
+    # missing it destroyed the history: a BOM made the first character `\ufeff`
+    # rather than `[`, so a LEGACY ARRAY was misclassified as JSONL, the torn-tail
+    # repair then judged a complete unterminated array to be a fragment (a
+    # complete JSONL entry is a dict; an array is not), and the next save
+    # REPLACED three real entries with one. Measured: 387 bytes and three entries
+    # in, 155 bytes and one entry out, with `Appended(dropped=0)` -- the field
+    # whose entire reason for existing is that silently removing history is the
+    # failure it prevents.
+    head = path.read_text(encoding="utf-8-sig")[:1]
     return head == "["
 
 

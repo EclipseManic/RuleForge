@@ -241,8 +241,34 @@ def _screen_regexes(node: Any) -> None:
                 f"length, or fewer quantifiers.", "regex")
 
     def walk(value: Any, depth: int = 0) -> None:
-        if depth > 32:
-            return
+        # THE DEPTH CUTOFF MUST NOT BE BELOW WHAT THE VALIDATOR ACCEPTS.
+        #
+        # This was `if depth > 32: return` with no refusal -- the walk simply
+        # stopped looking. `MAX_EXPRESSION_DEPTH` is 100, so depths 33 to 100 were
+        # an unguarded band, and one extra pair of parentheses was the difference
+        # between a refusal and a deployable artifact:
+        #
+        #     AQL, MATCHES(payload, '(a|aa)+$')
+        #       29 parens -> REGEX_CATASTROPHIC_BACKTRACKING
+        #       31 parens -> ok=True, and the pattern is in the artifact
+        #
+        # The anti-drift test written after round 8 could not catch this, because
+        # it inspects container TYPES and a depth cutoff is not a type. "The walk
+        # must reach every node" was true of every type and false of the tree past
+        # 32 levels.
+        #
+        # So the cutoff is derived from the same limit the validator enforces, not
+        # written as its own smaller number, and going past it REFUSES rather than
+        # returning. A silent `return` here means "I stopped looking and said
+        # nothing", which is how the guard came to be believed total.
+        if depth > MAX_EXPRESSION_DEPTH:
+            raise Refusal(
+                "SCREEN_DEPTH_EXCEEDED",
+                f"the rule nests expressions more than {MAX_EXPRESSION_DEPTH} "
+                f"levels deep, which is the most the validator accepts. Refusing "
+                f"rather than screening part of it: stopping the walk early would "
+                f"leave the deepest terms unscreened, and a pattern there would "
+                f"ship undetected.", "regex")
         # A PATTERN ARRIVES WRAPPED. A `<field>` lowers to
         # `Call(matches_regex, (FieldExpr, Literal("...")))`, so testing
         # `isinstance(arg, str)` found nothing and every pattern walked straight
