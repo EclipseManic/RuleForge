@@ -84,6 +84,17 @@ def render(ir: RuleIR) -> str:
             continue
 
         if kind == "Emit":
+            # `dedupe_by` IS THE DEDUP, AND `continue` WAS DROPPING IT.
+            #
+            # A terminal `| dedup host` lowered correctly and then rendered as
+            # `index=main` -- the de-duplication vanished with no refusal and no
+            # finding, which is the worst combination in this renderer. The node
+            # was reached, recognised, and ignored. `Emit` is the graph's
+            # terminal, so "skip it" was true when `dedupe_by` did not exist and
+            # false the moment it did.
+            if getattr(node, "dedupe_by", ()):
+                fields = ", ".join(ref.full for ref in node.dedupe_by)
+                stages.append(f"| dedup {fields}")
             continue
 
         if kind == "Filter":

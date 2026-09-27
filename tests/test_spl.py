@@ -396,27 +396,54 @@ class PipelineCommandLoweringTests(unittest.TestCase):
         self.assertIn("SPL_SORT_FIELD_NOT_A_NAME",
                       getattr(caught.exception, "code", ""))
 
-    def test_the_two_remaining_commands_are_still_refused(self):
-        """`dedup` and `fillnull` are NOT in this commit. `dedup` collapses rows
-        and `fillnull` fills empties so a LATER term matches rows it otherwise
-        would not -- both change which rows match in ways the IR does not model.
-        They stay refused, and refused HONESTLY by name rather than hiding inside
-        the blanket message this replaced. Asserted, so they cannot quietly
-        change into something that silently drops the command.
+    def test_dedup_lowers_when_it_is_the_last_stage(self):
+        """`Emit.dedupe_by` already modelled this, so no new IR node was needed.
+        The command that made it necessary was the renderer, not the lowerer."""
+        self.assertEqual(self._round_trip("index=main | dedup host"),
+                         "index=main | dedup host")
+        self.assertEqual(self._round_trip("index=main | dedup host, user"),
+                         "index=main | dedup host, user")
+        self.assertEqual(
+            self._round_trip("index=main EventCode=4624 | dedup host"),
+            'index=main | search EventCode="4624" | dedup host')
 
-        `eval` and `regex` WERE refused when this test was written and now lower,
-        so the list shrank -- which is the point of asserting it.
-        """
-        for source in ("index=main | dedup host",
-                       "index=main | fillnull value=0"):
-            with self.subTest(source=source):
-                with self.assertRaises(Exception) as caught:
-                    lower(source)
-                self.assertEqual(getattr(caught.exception, "code", ""),
-                                 "SPL_COMMAND_NOT_LOWERABLE")
+    def test_a_dedup_that_lowered_but_did_not_render_would_be_the_worst_case(self):
+        """The renderer had `if kind == "Emit": continue`, which reached the node,
+        recognised it, and DISCARDED the de-duplication. So `| dedup host`
+        rendered as `index=main` -- the command gone, with no refusal and no
+        finding. Asserted on the rendered text because that is the only place the
+        difference is visible."""
+        ir, _ = lower("index=main | dedup host")
+        rendered = render_spl(ir)
+        self.assertIn("| dedup host", rendered)
+        self.assertEqual(rendered.strip(), "index=main | dedup host")
 
-    def test_eval_and_regex_now_lower(self):
-        """The other half of the above: they are no longer in the refused set."""
+    def test_a_dedup_that_is_not_last_is_refused_not_moved(self):
+        """Moving a mid-pipeline `dedup` to the end would collapse rows at a
+        different point in the pipeline and return a different set of events, so
+        it is named rather than relocated."""
+        with self.assertRaises(Exception) as caught:
+            lower("index=main | dedup host | stats count by host")
+        self.assertEqual(getattr(caught.exception, "code", ""),
+                         "SPL_DEDUP_NOT_TERMINAL")
+
+    def test_two_dedups_are_refused(self):
+        with self.assertRaises(Exception) as caught:
+            lower("index=main | dedup host | dedup user")
+        self.assertEqual(getattr(caught.exception, "code", ""),
+                         "SPL_DEDUP_NOT_TERMINAL")
+
+    def test_a_dedup_with_no_field_list_is_refused(self):
+        """`dedup` with no fields keeps every row, which is a no-op."""
+        with self.assertRaises(Exception) as caught:
+            lower("index=main | dedup")
+        self.assertEqual(getattr(caught.exception, "code", ""),
+                         "SPL_DEDUP_NO_FIELDS")
+
+    def test_eval_and_regex_lower_rather_than_being_refused(self):
+        """`eval` and `regex` were refused when this class was written and now
+        lower, so the refused set has emptied out entirely. Asserted explicitly
+        so the list cannot quietly refill."""
         self.assertEqual(self._round_trip("index=main | eval x=1"),
                          "index=main | eval x=1")
         self.assertEqual(
@@ -426,29 +453,28 @@ class PipelineCommandLoweringTests(unittest.TestCase):
     def test_a_regex_filter_survives_into_a_later_stats(self):
         """The exact case the blanket refusal's comment described as having once
         deleted the whole detection: `| regex ... | stats count by host` must
-        keep the filter."""
+        keep the filter, and the filter must come FIRST."""
         rendered = self._round_trip(
             'index=main | regex CommandLine="mimikatz" | stats count by host')
         self.assertIn('CommandLine="mimikatz"', rendered)
         self.assertIn("stats count", rendered)
-        self.assertLess(rendered.index("CommandLine"),
-                        rendered.index("stats"),
+        self.assertLess(rendered.index("CommandLine"), rendered.index("stats"),
                         "the filter must come before the aggregate or the "
                         "aggregate is counting unfiltered events")
 
     def test_eval_field_copy_stays_an_eval_and_not_a_rename(self):
         """`rename` REMOVES the original column and `eval` KEEPS it, so a later
         term reading the original works under one and finds nothing under the
-        other. The previous version rendered this as `rename` and broke it."""
+        other. The renderer once guessed between them and produced the wrong
+        rule."""
         rendered = self._round_trip('index=main | eval copy=user | where user="a"')
         self.assertIn("| eval copy=user", rendered)
         self.assertNotIn("rename", rendered)
         self.assertIn('user="a"', rendered)
 
     def test_a_comma_inside_a_quoted_eval_value_is_not_an_assignment_separator(self):
-        """`eval list=\"a,b\"` is ONE assignment. Splitting on every comma makes
-        it two broken ones, and the second one is a syntax error the analyst
-        never wrote."""
+        """`eval list="a,b"` is ONE assignment. Splitting on every comma makes it
+        two broken ones, the second of which is an error the analyst never wrote."""
         self.assertEqual(self._round_trip('index=main | eval list="a,b"'),
                          'index=main | eval list="a,b"')
 
@@ -475,6 +501,22 @@ class PipelineCommandLoweringTests(unittest.TestCase):
             lower('index=main | regex "mimikatz"')
         self.assertEqual(getattr(caught.exception, "code", ""),
                          "SPL_REGEX_NOT_A_FIELD_TEST")
+
+    def test_fillnull_is_refused_with_a_reason_you_can_act_on(self):
+        """`fillnull` is the LAST command still refused, and the reason is the IR
+        rather than the parser: there is no node for "fill an empty value" in the
+        complete vocabulary above. It is also not safe to ignore -- filling an
+        empty field makes a LATER `where` match rows that otherwise would not --
+        so dropping it would quietly widen the rule. The message names both."""
+        with self.assertRaises(Exception) as caught:
+            lower("index=main | fillnull value=0")
+        refusal = caught.exception
+        self.assertEqual(getattr(refusal, "code", ""),
+                         "SPL_FILLNULL_NOT_LOWERABLE")
+        message = getattr(refusal, "message", "")
+        self.assertIn("widen", message.lower())
+        self.assertIn("coalesce", message.lower(),
+                      "the message should suggest the rewrite that does work")
 
 
 if __name__ == "__main__":

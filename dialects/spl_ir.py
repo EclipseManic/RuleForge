@@ -432,6 +432,11 @@ def lower(text: str, rule_id: str = "spl",
                             condition=_all_of(index_conditions)))
         current = "selectors"
 
+    #: Set by the `dedup` branch and consumed AFTER the loop, because whether a
+    #: `dedup` is the LAST pipeline stage is not knowable from inside the loop.
+    _pending_dedupe_by: tuple[FieldRef, ...] | None = None
+    _pending_dedupe_position: int = -1
+
     for position, command in enumerate(search.pipeline):
         if command.name == "search":
             condition = _all_of([_term_condition(t)
@@ -491,8 +496,60 @@ def lower(text: str, rule_id: str = "spl",
             nodes.append(Filter(id=f"regex_{position}", input=current,
                                 condition=_parse_regex_filter(command.args)))
             current = f"regex_{position}"
-        elif command.name in ("head", "sort", "rename", "fields", "dedup",
-                              "fillnull"):
+        elif command.name == "dedup":
+            # `dedup` COLLAPSES ROWS, which `Emit.dedupe_by` already models --
+            # so this needs no new IR node. It does need the dedup to be the LAST
+            # stage, because `Emit` is the graph's terminal: there is nowhere to
+            # put a de-duplicating node in the middle of a chain. A `dedup`
+            # followed by anything else is refused by name, with the reason,
+            # rather than silently moving the dedup to the end -- which would
+            # drop rows at a different point and return a different set.
+            #
+            # `_pending_dedupe_by` is checked after the loop, because whether
+            # this is the last command is not knowable until the loop is done.
+            if _pending_dedupe_by is not None:
+                raise SplParseError(
+                    "SPL_DEDUP_NOT_TERMINAL",
+                    "two `dedup` stages. The second would collapse rows the "
+                    "first had already decided to keep, in a different order, "
+                    "so which rows survive is not something RuleForge will "
+                    "guess.", DIALECT)
+            fields = [f.strip() for f in command.args.split(",") if f.strip()]
+            if not fields:
+                raise SplParseError("SPL_DEDUP_NO_FIELDS",
+                                    "`dedup` with no field list keeps every "
+                                    "row, which is a no-op. Refused rather than "
+                                    "rendered as one.", DIALECT)
+            for name in fields:
+                if not _FIELD_NAME.fullmatch(name):
+                    raise SplParseError(
+                        "SPL_DEDUP_FIELD_NOT_A_NAME",
+                        f"`dedup {name}` is not a plain field name. "
+                        f"De-duplicating by a different field keeps a different "
+                        f"set of events.", DIALECT)
+            _pending_dedupe_by = tuple(FieldRef(name) for name in fields)
+            _pending_dedupe_position = position
+        elif command.name == "fillnull":
+            # REFUSED, AND THE REASON IS THE IR RATHER THAN THE PARSER. There is
+            # no node for "fill an empty value": the vocabulary above is the
+            # complete list, and nothing in it can express a default. `fillnull`
+            # also changes which rows a LATER term matches -- filling an empty
+            # field makes `where value=0` match a row that otherwise would not --
+            # so dropping it would quietly widen the rule. Named here rather than
+            # left to fall through to the generic unknown-command message,
+            # because the reason is specific and actionable.
+            raise SplParseError(
+                "SPL_FILLNULL_NOT_LOWERABLE",
+                f"`fillnull {command.args}` gives an empty field a value, and "
+                f"there is no node in RuleForge's vocabulary for that. It is "
+                f"also not safe to ignore: filling an empty field makes a LATER "
+                f"`where` match rows that would otherwise not match, so dropping "
+                f"it would quietly widen the rule. Rewrite the term to treat "
+                f"the empty case explicitly, for example "
+                f"`| where coalesce({command.args.split('=')[0].strip()}, 0) > 0`.",
+                DIALECT)
+        elif command.name in ("head", "sort", "rename", "fields"):
+
             # BOTH HALVES OF THE OLD DIAGNOSTIC WERE FALSE, FOR ALL EIGHT.
             #
             # It said "`regex` does not change which events are selected" --
@@ -534,10 +591,30 @@ def lower(text: str, rule_id: str = "spl",
                 f"carrying the detection, so it is named rather than ignored.",
                 DIALECT)
 
-    nodes.append(Emit(id="out", input=current))
+    # A TERMINAL `dedup` rides on the `Emit`, which is the graph's terminal node
+    # and already carries `dedupe_by`. An empty tuple is a no-op rather than a
+    # change, so nothing else about the Emit moves.
+    #
+    # TERMINAL IS CHECKED HERE, not in the branch, because the branch cannot know:
+    # it runs while the loop is still going and later commands have not been seen
+    # yet. Moving a mid-pipeline `dedup` to the end would collapse rows at a
+    # different point in the pipeline and return a different set of events, so a
+    # non-terminal one is refused rather than relocated.
+    if (_pending_dedupe_by is not None
+            and _pending_dedupe_position != len(search.pipeline) - 1):
+        raise SplParseError(
+            "SPL_DEDUP_NOT_TERMINAL",
+            "`dedup` is not the last stage. RuleForge models de-duplication on "
+            "the graph's terminal node, so a `dedup` in the middle would have to "
+            "be moved to the end -- and collapsing rows at a different point in "
+            "the pipeline returns a different set of events. Put `dedup` last.",
+            DIALECT)
+    nodes.append(Emit(id="out", input=current,
+                      dedupe_by=_pending_dedupe_by or ()))
     return RuleIR(rule_id=rule_id, nodes=tuple(nodes), output="out",
                   title=" ".join(search.text.split())[:200],
                   metadata={"dialect": DIALECT}), diagnostics
+
 
 
 def _all_of(conditions: list[Any]) -> Any:
