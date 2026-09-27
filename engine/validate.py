@@ -273,6 +273,30 @@ def _screen_regexes(node: Any) -> None:
             for operand in getattr(value, "operands", ()) or ():
                 walk(operand, depth + 1)
             return
+        # `Not` IS ITS OWN CASE TOO, AND IT WAS THE SAME BUG AGAIN.
+        #
+        # The `operands` fix above handles a `BoolOp`, which holds a tuple called
+        # `operands`. `Not` holds a SINGLE child called `operand` -- singular, no
+        # tuple. So the arm above does not match, `walk` falls past every later
+        # arm, and the guard dead-ends. Measured, app-reachable, and the
+        # difference between two rules that differ by one word:
+        #
+        #     | where cmd matches regex "(a|aa)+$"     -> REFUSED
+        #     | where not cmd matches regex "(a|aa)+$"  -> ok=True, deployable
+        #
+        # 0.028s at n=24, 0.198s at n=28, 1.430s at n=32 -- about 7x per four
+        # characters, and unbounded. Reached through `POST /api/author` ->
+        # `jobs.author` -> `kql_ir.py`, so this was one `not` away from putting a
+        # catastrophic-backtracking pattern into an artifact the analyst ships.
+        #
+        # THE RULE, SO THE NEXT MISS IS A NEW `if` AND NOT A NEW BUG: this walk
+        # must reach EVERY node in the tree. A container type added to the IR
+        # later is a blind spot the day it is added, and the symptom is a guard
+        # that silently stops guarding. The `screening must not miss a container`
+        # test below is the thing that catches that, not any individual arm.
+        if isinstance(value, Not):
+            walk(value.operand, depth + 1)
+            return
         if hasattr(value, "function") and hasattr(value, "args"):
             for arg in getattr(value, "args", ()):
                 if isinstance(arg, str) and "regex" in str(
