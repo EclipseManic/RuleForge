@@ -111,18 +111,26 @@ def render(ir: RuleIR) -> str:
             # a filter to search time -- or, with two `index=` terms, produce a
             # search nothing satisfies.
             #
-            # AND WHEN THE LATCH IS ALREADY SET, THE WHOLE CONDITION MUST BE
-            # EMITTED AS A `search`. It used to be neither hoisted nor emitted,
-            # so `index=main | search sourcetype=WinEventLog:Security` rendered
-            # as `index=main ` -- the sourcetype gone, the search silently
-            # widened to every event in the index, and ok:true. That is the exact
-            # "silently dropped term" defect this function exists to prevent,
-            # reintroduced one branch below where it had just been fixed.
+            # THE LATCH CLOSES AFTER THE FIRST FILTER WHETHER OR NOT IT HAD
+            # SELECTORS. It used to close only when selectors were actually
+            # found, so a head filter with no selector term left it open and a
+            # LATER filter's selectors were hoisted:
+            #
+            #     EventCode=4625 | search index=other
+            #       ->  index=other | search EventCode="4625"
+            #
+            # The `| search index=other` stage vanished from the pipeline and
+            # reappeared at the head. For `index=` the result set is the same
+            # either way (intersection is idempotent), but the comment above
+            # promises first-filter-only and the code did later-filter-too --
+            # and an explicit mid-pipeline `| where host="h"` being relocated is
+            # a surprise no analyst asked for. The latch now means "the first
+            # filter has passed", not "selectors have been emitted".
             if not selector_emitted:
                 selector_terms, rest = _split_selector(node.condition)
+                selector_emitted = True
                 if selector_terms:
                     head.extend(selector_terms)
-                    selector_emitted = True
                     if rest is not None:
                         stages.append(f"| search {render_expr(rest)}")
                     continue
