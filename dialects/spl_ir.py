@@ -732,8 +732,78 @@ def _field_ref(name: str) -> FieldRef:
     return FieldRef(parts[0], tuple(parts[1:]))
 
 
+def _split_top_level(text: str, keyword: str) -> list[str]:
+    """Split `text` on `keyword`, but ONLY at paren depth 0 and outside a string.
+
+    The plain `text.split(" AND ")` this replaces was wrong three ways at once,
+    and each one changes which rows a detection matches:
+
+      - PRECEDENCE. The old loop tried `" AND "` FIRST and returned immediately,
+        so AND ended up the OUTERMOST operator:
+            a=1 OR b=2 AND c=3   ->   ((a=1 OR b=2) AND c=3)
+        SPL, like SQL, binds AND tighter than OR, so that expression is
+        `a=1 OR (b=2 AND c=3)`. The built tree MISSES a row where a=1 and
+        nothing else holds -- a false NEGATIVE, which is the worst direction a
+        detection rule can be wrong in.
+      - PARENTHESES. `a=1 OR (b=2 AND c=3)` is correct SPL that the old code
+        refused with "'(b=2' is not a comparison", blaming a bare word rather
+        than the splitter's blindness.
+      - QUOTED STRINGS. `msg="x AND y"` is one comparison whose VALUE contains
+        the separator, and the old code split inside the quotes and refused on
+        "'y\"' is not a comparison".
+
+    Quote handling covers both `'` and `"`, with a backslash escape, because a
+    value containing the other kind of quote is ordinary.
+    """
+    needle = keyword
+    parts: list[str] = []
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    start = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in ("'", '"'):
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif depth == 0 and text.startswith(needle, index):
+            before = text[index - 1] if index else " "
+            after = text[index + len(needle):index + len(needle) + 1] or " "
+            # A WHOLE WORD, and the boundary has to be outside the string too.
+            # Without this, `ORANGE` would split on `OR` and the message the
+            # analyst wrote about oranges would become a rule about a variable.
+            if not before.isalnum() and not after.isalnum():
+                parts.append(text[start:index])
+                index += len(needle)
+                start = index
+                continue
+        index += 1
+    parts.append(text[start:])
+    return [part for part in (p.strip() for p in parts) if part]
+
+
 def _eval_condition(args: str) -> Any:
-    """`where` uses the EVAL expression language, not search syntax."""
+    """`where` uses the EVAL expression language, not search syntax.
+
+    OR IS SPLIT FIRST, BECAUSE OR BINDS LOOSEST. SPL, like SQL, is
+    `NOT` > `AND` > `OR`, so the loosest operator has to be the outermost node in
+    the tree. Splitting AND first -- which is what this did, by trying the
+    operator tuple in that order and returning on the first hit -- inverted every
+    mixed expression and produced false negatives. See `_split_top_level`.
+    """
     text = args.strip()
     if not text:
         raise SplParseError("SPL_WHERE_EMPTY", "`where` has no expression", DIALECT)
@@ -744,8 +814,8 @@ def _eval_condition(args: str) -> Any:
     if upper == "FALSE":
         return Literal(value=False)
 
-    for splitter, op in ((" AND ", "and"), (" OR ", "or")):
-        parts = text.split(splitter)
+    for keyword, op in (("OR", "or"), ("AND", "and")):
+        parts = _split_top_level(text, keyword)
         if len(parts) > 1:
             return BoolOp(op, tuple(_eval_condition(p) for p in parts))
 
@@ -757,6 +827,7 @@ def _eval_condition(args: str) -> Any:
 
     node = _eval_comparison(body)
     return Not(node) if negated else node
+
 
 
 def _eval_comparison(text: str) -> Any:
