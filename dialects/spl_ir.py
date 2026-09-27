@@ -21,13 +21,16 @@ reproducible from the inputs at hand or it is named as unavailable.
 """
 from __future__ import annotations
 
-from typing import Any
+import re
+from typing import Any, Final
 
 from engine.ir import (
     Aggregate,
+    Arrange,
     BoolOp,
     Call,
     Comparison,
+    Derive,
     Duration,
     Emit,
     FieldExpr,
@@ -52,6 +55,11 @@ from dialects.spl import (
     parse_stats,
     walk_terms,
 )
+
+#: A plain field name, possibly dotted. Used to REFUSE a malformed
+#: `fields` / `rename` / `sort` argument rather than guessing which column was
+#: meant, because every one of those guesses returns a different set of events.
+_FIELD_NAME: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*")
 
 #: Commands that make a rule un-lowerable rather than merely unsupported. Each
 #: one changes WHAT the rule detects, not just how it is written.
@@ -80,6 +88,131 @@ _EVAL_FUNCTIONS = {
     "true": None,
     "false": None,
 }
+
+
+def _parse_field_aliases(command: str, args: str, position: int,
+                         dialect: str) -> tuple[tuple[str, Any], ...]:
+    """`fields a, b` and `rename user as account` -> Derive assignments.
+
+    `fields` keeps the named columns; `rename` reads one field and writes it
+    under a new name. Both are `Derive`, and `projects` tells them apart.
+
+    EVERY MALFORMED ARGUMENT LIST IS REFUSED RATHER THAN PARTLY HONOURED. A
+    `fields` list that silently drops the one column it could not read narrows
+    the output, and a `rename` that drops the pair leaves the rule reading a
+    column the analyst renamed away. Both are the failure this project exists to
+    prevent, so the whole list is rejected together.
+    """
+    assignments: list[tuple[str, Any]] = []
+    for raw in (part.strip() for part in args.split(",")):
+        if not raw:
+            raise SplParseError(
+                "SPL_FIELD_LIST_MALFORMED",
+                f"`{command} {args}` has an empty entry. Refused rather than "
+                f"skipped, because a dropped column changes what the rule "
+                f"returns.", dialect)
+        if command == "fields":
+            if not _FIELD_NAME.fullmatch(raw):
+                raise SplParseError(
+                    "SPL_FIELD_LIST_MALFORMED",
+                    f"`fields {raw}` is not a plain field name. RuleForge will "
+                    f"not guess which column you meant.", dialect)
+            assignments.append((raw, FieldExpr(ref=FieldRef(raw))))
+            continue
+        # `rename`: `<old> as <new>`, and Splunk also allows `as` to be omitted.
+        if " as " in raw:
+            old, _, new = raw.partition(" as ")
+        else:
+            old, new = raw, raw
+        old, new = old.strip(), new.strip()
+        if not (_FIELD_NAME.fullmatch(old) and _FIELD_NAME.fullmatch(new)):
+            raise SplParseError(
+                "SPL_RENAME_MALFORMED",
+                f"`rename {raw}` is not `<field> as <field>`. Renaming to or "
+                f"from something that is not a plain field name is refused, "
+                f"because the later terms read the renamed field.", dialect)
+        if old == new:
+            raise SplParseError(
+                "SPL_RENAME_NOOP",
+                f"`rename {raw}` renames a field to itself. That is not an "
+                f"error, but it changes nothing, so it is dropped rather than "
+                f"emitted.", dialect)
+        assignments.append((new, FieldExpr(ref=FieldRef(old))))
+    if not assignments:
+        raise SplParseError(
+            f"SPL_{command.upper()}_NO_ARGUMENTS",
+            f"`{command}` with no field list. Refused rather than rendered as a "
+            f"no-op, because a stage that changes nothing and a stage that was "
+            f"meant to change something look identical in the output.", dialect)
+    return tuple(assignments)
+
+
+def _parse_arrange_args(command: str, args: str, position: int,
+                        dialect: str) -> tuple[tuple[tuple[FieldRef, str], ...],
+                                               int | None]:
+    """`sort -count` and `head 5 -_time` -> Arrange's order_by and limit.
+
+    SPL's sign convention, from Splunk's `sort` documentation: a minus sign is
+    DESCENDING and a plus sign is ASCENDING, with ascending the default. That is
+    cited rather than remembered, because the previous version of this file
+    asserted an SPL convention from memory and seven tests certified it -- and
+    the syntax did not exist.
+
+    `head` returns the first N in SEARCH order, so with no field it is a plain
+    limit and no ordering is invented: inventing a sort would change which rows
+    come back.
+    """
+    tokens = args.split()
+    if not tokens:
+        raise SplParseError(
+            "SPL_ARRANGE_NO_ARGUMENTS",
+            f"`{command}` with no arguments. Refused rather than rendered as a "
+            f"no-op.", dialect)
+
+    limit: int | None = None
+    index = 0
+    if command == "head":
+        if not tokens[0].isascii() or not tokens[0].isdigit():
+            raise SplParseError(
+                "SPL_HEAD_LIMIT_NOT_AN_INTEGER",
+                f"`head {tokens[0]}` -- the first argument to `head` is the "
+                f"count, and it is not a plain number. Refused rather than "
+                f"guessed, because the wrong count is a different rule.", dialect)
+        limit = int(tokens[0])
+        if limit <= 0:
+            raise SplParseError(
+                "SPL_HEAD_LIMIT_NOT_POSITIVE",
+                f"`head {limit}` returns no events, so the rule could never "
+                f"fire. Refused rather than rendered.", dialect)
+        index = 1
+
+    order: list[tuple[FieldRef, str]] = []
+    while index < len(tokens):
+        token = tokens[index]
+        direction = "asc"
+        if token.startswith("-"):
+            direction, token = "desc", token[1:]
+        elif token.startswith("+"):
+            token = token[1:]
+        # `sort 0 -field` is a count, not a field: 0 means "no limit".
+        if token.isdigit():
+            index += 1
+            continue
+        if not _FIELD_NAME.fullmatch(token):
+            raise SplParseError(
+                "SPL_SORT_FIELD_NOT_A_NAME",
+                f"`{command} {token}` is not a plain field name. RuleForge will "
+                f"not guess which column you meant, because sorting by a "
+                f"different column returns a different set of events.", dialect)
+        order.append((FieldRef(token), direction))
+        index += 1
+
+    if not order and limit is None:
+        raise SplParseError(
+            "SPL_ARRANGE_NO_MEANING",
+            f"`{command} {args}` names no field and no count, so there is "
+            f"nothing for it to do.", dialect)
+    return tuple(order), limit
 
 
 def lower(text: str, rule_id: str = "spl",
@@ -189,6 +322,34 @@ def lower(text: str, rule_id: str = "spl",
             nodes.append(Filter(id=f"where_{position}", input=current,
                                 condition=_eval_condition(command.args)))
             current = f"where_{position}"
+        elif command.name in ("fields", "rename", "sort", "head"):
+            # FOUR OF THE EIGHT, LOWERED. These need no expression parser, so
+            # they are structural and provable; `eval`, `regex`, `dedup` and
+            # `fillnull` stay refused below with a message that says which.
+            #
+            # `fields` and `rename` are both `Derive`, distinguished by
+            # `projects` -- TRUE restricts the output columns, FALSE rewrites one
+            # field's name. That flag is data, not a name, and the renderer
+            # already branches on it, so no new vocabulary is introduced here.
+            #
+            # `sort` and `head` are both `Arrange`, distinguished by `limit`:
+            # a limit means "first N in this order", which Splunk spells as
+            # `sort` then `head` -- the renderer emits exactly that.
+            if command.name in ("fields", "rename"):
+                pairs = _parse_field_aliases(command.name, command.args,
+                                            position, DIALECT)
+                nodes.append(Derive(
+                    id=f"derive_{position}", input=current,
+                    assignments=pairs,
+                    projects=command.name == "fields"))
+                current = f"derive_{position}"
+            else:
+                order_by, limit = _parse_arrange_args(command.name,
+                                                      command.args, position,
+                                                      DIALECT)
+                nodes.append(Arrange(id=f"arrange_{position}", input=current,
+                                     order_by=order_by, limit=limit))
+                current = f"arrange_{position}"
         elif command.name in ("head", "sort", "rename", "fields", "dedup",
                               "fillnull", "eval", "regex"):
             # BOTH HALVES OF THE OLD DIAGNOSTIC WERE FALSE, FOR ALL EIGHT.

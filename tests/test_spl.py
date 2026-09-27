@@ -27,6 +27,7 @@ from dialects.spl import (
     walk_terms,
 )
 from dialects.spl_ir import lower
+from dialects.spl_render import render as render_spl
 from engine import Verdict, evaluate
 from engine.ir import Aggregate, Filter
 
@@ -284,6 +285,131 @@ class ExecutionTests(unittest.TestCase):
         rows = [self._row(f"h{n}", "u1", "10.0.0.1", "cmd") for n in range(3)]
         result = evaluate(self._ir(), rows)
         self.assertIs(result.verdict, Verdict.NO_MATCH)
+
+
+class PipelineCommandLoweringTests(unittest.TestCase):
+    """`fields`, `rename`, `sort` and `head` LOWER instead of being refused.
+
+    All eight of these used to hit ONE blanket `raise` in `spl_ir.py`, on the
+    reasoning that each "changes which rows the search returns". True of
+    `dedup`, `fillnull` and `regex`. Not true of these four: they change the
+    OUTPUT SHAPE or the ORDER, which the IR models exactly, and the renderers
+    already knew how to emit. So a plain `| fields a, b` -- one of the most
+    ordinary lines in Splunk -- was refused.
+
+    Each test asserts the ROUND TRIP, not just that lowering succeeded. A lowerer
+    that produces a graph the renderer cannot faithfully write back has not fixed
+    anything; it has moved the failure.
+    """
+
+    def _round_trip(self, source):
+        ir, _ = lower(source)
+        return " ".join(render_spl(ir).split())
+
+    def test_fields_restricts_the_output_columns(self):
+        self.assertEqual(
+            self._round_trip("index=main EventCode=4624 | fields a, b"),
+            'index=main | search EventCode="4624" | fields a, b')
+
+    def test_rename_rewrites_the_field_name(self):
+        self.assertEqual(
+            self._round_trip("index=main EventCode=4624 | rename user as account"),
+            'index=main | search EventCode="4624" | rename user as account')
+
+    def test_sort_descending_uses_the_minus_sign(self):
+        """From Splunk's `sort` documentation: minus is descending, plus is
+        ascending, ascending is the default. CITED rather than remembered -- the
+        previous version of this file asserted an SPL convention from memory."""
+        self.assertEqual(self._round_trip("index=main | sort -count"),
+                         "index=main | sort count desc")
+
+    def test_head_becomes_sort_then_head(self):
+        self.assertEqual(self._round_trip("index=main | head 5 -_time"),
+                         "index=main | sort -_time | head 5")
+
+    def test_head_after_stats_keeps_the_aggregate(self):
+        """The ordering case that motivated the renderer fix, end to end."""
+        self.assertEqual(
+            self._round_trip("index=main | stats count by host | head 3 host"),
+            "index=main | stats count AS count by host | sort +host | head 3")
+
+    def test_a_rename_is_followed_by_a_term_reading_the_new_name(self):
+        """The chain has to actually thread, or the rename is decorative."""
+        rendered = self._round_trip(
+            'index=main EventCode=4624 | rename user as account '
+            '| where account="admin"')
+        self.assertIn("rename user as account", rendered)
+        self.assertIn('account="admin"', rendered)
+
+    def test_projection_is_not_rendered_as_eval(self):
+        """`fields a, b` rendered as `| eval a=a, b=b`, which is a NO-OP -- it
+        assigns each field its own value -- so a projection that restricted the
+        output instead kept every column. Asserted explicitly because the
+        round-trip tests above would not catch it: both spellings parse."""
+        ir, _ = lower("index=main | fields a, b")
+        rendered = render_spl(ir)
+        self.assertIn("| fields a, b", rendered)
+        self.assertNotIn("eval", rendered)
+
+    def test_rename_is_not_rendered_as_eval(self):
+        """`rename` rendered as `eval account=user` ADDS a column and leaves the
+        original, so a later term reading `user` still worked and one reading
+        `account` found a different field."""
+        ir, _ = lower("index=main | rename user as account")
+        rendered = render_spl(ir)
+        self.assertIn("| rename user as account", rendered)
+        self.assertNotIn("eval", rendered)
+
+    def test_a_dotted_field_survives_both_directions(self):
+        rendered = self._round_trip("index=main | sort -win.eventdata.targetImage")
+        self.assertIn("win.eventdata.targetImage", rendered)
+
+    def test_a_malformed_field_list_is_refused_not_partly_honoured(self):
+        """A `fields` list that silently dropped the one column it could not
+        read would narrow the output, and a half-applied `rename` leaves later
+        terms reading a field the analyst renamed away. Both are refused whole."""
+        for source, code in (
+            ("index=main | fields a, b,", "SPL_FIELD_LIST_MALFORMED"),
+            ("index=main | fields a, 1bad", "SPL_FIELD_LIST_MALFORMED"),
+            ("index=main | rename user as", "SPL_RENAME_MALFORMED"),
+            ("index=main | rename user as account as x", "SPL_RENAME_MALFORMED"),
+        ):
+            with self.subTest(source=source):
+                with self.assertRaises(Exception) as caught:
+                    lower(source)
+                self.assertEqual(getattr(caught.exception, "code", ""), code)
+
+    def test_a_head_with_no_count_is_refused(self):
+        """`head` with a non-numeric limit is a different rule, so it is named
+        rather than guessed."""
+        for source in ("index=main | head x", "index=main | head 0",
+                       "index=main | head -3"):
+            with self.subTest(source=source):
+                with self.assertRaises(Exception) as caught:
+                    lower(source)
+                self.assertIn("SPL_HEAD_LIMIT",
+                              getattr(caught.exception, "code", ""))
+
+    def test_a_sort_on_something_that_is_not_a_field_is_refused(self):
+        with self.assertRaises(Exception) as caught:
+            lower("index=main | sort 5 = 3")
+        self.assertIn("SPL_SORT_FIELD_NOT_A_NAME",
+                      getattr(caught.exception, "code", ""))
+
+    def test_the_four_harder_commands_are_still_refused(self):
+        """`dedup`, `fillnull`, `regex` and `eval` are NOT in this commit. Two
+        need an expression parser and two change which rows match in ways the IR
+        does not model. They stay refused -- and refused HONESTLY, by their own
+        names, rather than hiding inside the blanket message this replaced."""
+        for source in ("index=main | dedup host",
+                       "index=main | fillnull value=0",
+                       "index=main | regex CommandLine=\"mimikatz\"",
+                       "index=main | eval x=1"):
+            with self.subTest(source=source):
+                with self.assertRaises(Exception) as caught:
+                    lower(source)
+                self.assertEqual(getattr(caught.exception, "code", ""),
+                                 "SPL_COMMAND_NOT_LOWERABLE")
 
 
 if __name__ == "__main__":

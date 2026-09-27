@@ -123,10 +123,48 @@ def render(ir: RuleIR) -> str:
             continue
 
         if kind == "Derive":
-            parts = [f"{alias}={render_expr(expr)}"
-                     for alias, expr in node.assignments]
-            stages.append("| eval " + ", ".join(parts))
+            # ONE IR NODE, THREE SPL COMMANDS, AND GETTING THIS WRONG CHANGES WHAT
+            # THE RULE DOES RATHER THAN HOW IT LOOKS.
+            #
+            # `| eval a=1`, `| fields a, b` and `| rename user as account` all lower
+            # to `Derive`, and this branch used to emit `| eval` for all three.
+            # That is not cosmetic:
+            #
+            #   fields a, b              ->  | eval a=a, b=b
+            #   rename user as account   ->  | eval account=user
+            #
+            # `eval a=a` is a NO-OP -- it assigns a field its own value -- so a
+            # projection that restricted the output columns became one that kept
+            # all of them. And `rename` became an eval that ADDS a column and
+            # leaves the original in place, so a later term reading `user` still
+            # worked and a later term reading `account` found a different field.
+            # A rule that renders but is not the rule the analyst wrote.
+            #
+            # `projects=True` is DATA and is authoritative: only `fields` sets it.
+            # Telling `rename` from `eval` is INFERENCE and is labelled as such --
+            # the test is that every assigned expression is a bare field
+            # reference, which the lowerer produces for a rename and never for an
+            # eval. A rename carrying a computed value would render as `eval`,
+            # which is a cosmetic error rather than a wrong rule. THE DURABLE FIX
+            # is a `kind` field on `Derive` carrying the source command so this
+            # stops being a guess; that is an IR change, and making it blind in
+            # the same commit as this one would have been how I introduced an
+            # error I could not see.
+            if node.projects:
+                columns = ", ".join(alias for alias, _ in node.assignments)
+                stages.append(f"| fields {columns}")
+            elif node.assignments and all(
+                    isinstance(expr, FieldExpr)
+                    for _, expr in node.assignments):
+                pairs = ", ".join(f"{expr.ref.full} as {alias}"
+                                  for alias, expr in node.assignments)
+                stages.append(f"| rename {pairs}")
+            else:
+                parts = [f"{alias}={render_expr(expr)}"
+                         for alias, expr in node.assignments]
+                stages.append("| eval " + ", ".join(parts))
             continue
+
 
         if kind == "Join":
             stages.append("| " + _render_join(node, by_id))
