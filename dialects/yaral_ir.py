@@ -13,7 +13,11 @@ dangerous possible misreading of this rule, so the lowering emits an ORDERING
 between the two events rather than a predicate, and says so in a diagnostic.
 
 `<=` is representable as ordering because a pattern's stages are "at or after"
-the start row. A STRICT `<` is not the same claim and is refused.
+the start row, which is exactly what `<=` claims. A STRICT `<` is a different
+claim, and so are `>` and `>=` -- the last two are the OPPOSITE direction. All
+three used to be accepted and silently rendered as `<=`, so `<` matched pairs
+the rule excludes and `>` fired on the reverse sequence. They are refused by
+name in `_refuse_ordering_the_pattern_cannot_express`.
 """
 
 from __future__ import annotations
@@ -66,12 +70,74 @@ def lower(parsed: ParsedYaraL) -> tuple[RuleIR, list[Diagnostic]]:
 
     time_field = _resolve_time_field(parsed, diagnostics)
 
+    _refuse_ordering_the_pattern_cannot_express(parsed)
+
     if parsed.match.window_seconds is not None:
         ir = _lower_correlation(parsed, time_field, diagnostics)
     else:
         ir = _lower_single_event(parsed, diagnostics)
 
     return ir, diagnostics
+
+
+def _refuse_ordering_the_pattern_cannot_express(parsed: ParsedYaraL) -> None:
+    """Refuse a cross-event comparison that stage order does not mean.
+
+    THE PARSER CAPTURED THE OPERATOR AND THE LOWERER THREW IT AWAY.
+
+    `yaral.py` records every cross-event comparison as
+    `(left, right, operator)`. Both this file's `_resolve_time_field` and
+    `_lower_correlation` then iterated it as `for left, right, _operator` --
+    because only the FIELD names were wanted. The consequence was that `<`, `>`
+    and `>=` produced byte-identical graphs to `<=`, and the same two
+    diagnostics. Measured on the user's own rule with the operator swapped:
+
+        $lsass... <= $login...  ->  lowered, 2 diagnostics
+        $lsass... <  $login...  ->  lowered, 2 diagnostics   <- IDENTICAL
+        $lsass... >  $login...  ->  lowered, 2 diagnostics   <- IDENTICAL
+        $lsass... >= $login...  ->  lowered, 2 diagnostics   <- IDENTICAL
+
+    AND TWO OF THOSE ARE NOT MERELY WIDENED, THEY ARE INVERTED.
+
+    A pattern's stages are "at or after the start row", so a stage order says
+    `left` happened at or before `right`. That is EXACTLY what `<=` claims, so
+    `<=` is representable and is kept. The other three are not variations on it:
+
+      `<`   says STRICTLY before. Distinct from "at or before" whenever the two
+            timestamps are equal, which is common enough to matter. Widening it
+            to `<=` matches pairs the rule excludes.
+      `>`   says AFTER. Rendered as a stage order this is the OPPOSITE claim:
+            the rule fires when the login came FIRST.
+      `>=`  says at-or-after, which is also the opposite direction.
+
+    For a rule whose entire claim is "credential access happened FIRST", an
+    inverted ordering does not degrade the rule, it inverts it. The old
+    behaviour reported the analyst's rule back to them unchanged in the diff and
+    evaluated the opposite sequence.
+
+    So they are refused by name. Only `<=` is expressible, and saying so is more
+    useful than rendering four different operators as one.
+
+    CALLED FROM `lower()` AFTER `_resolve_time_field` AND BEFORE THE DISPATCH,
+    which is the only position that covers both `_lower_correlation` and
+    `_lower_single_event` without sitting below either one's own early returns.
+    """
+    for left, right, operator in parsed.cross_event_order:
+        if operator == "<=":
+            continue
+        raise Refusal(
+            "YARAL_CROSS_EVENT_OPERATOR_NOT_EXPRESSIBLE",
+            f"this rule compares two events with `{operator}` "
+            f"({left.strip()} {operator} {right.strip()}). A YARA-L pattern "
+            f"orders its stages as 'at or after the start row', which is exactly "
+            f"what `<=` means and nothing else. `{operator}` is a different "
+            f"claim"
+            + (", and rendering it as a stage order would fire on the opposite "
+               "sequence" if operator in (">", ">=")
+               else ", and rendering it as a stage order would widen it to "
+                    "'at or before' and match pairs the rule excludes")
+            + ". RuleForge will not quietly substitute one for the other.",
+            "YARA-L")
 
 
 def _resolve_time_field(parsed: ParsedYaraL,
@@ -480,9 +546,22 @@ def _render_event(condition: Any, var: str) -> list[str]:
         # `condition.op`, so every operator produced `$e0.user = "admin"`:
         # `!=` rendered as `=`, and so did `>`, `>=`, `<` and `<=`. A DENY RULE
         # INVERTED INTO AN ALLOW-EXACT RULE -- the precise inverse of what the
-        # analyst wrote, in an artifact with no warning on it. The YARA-L parser
-        # only ever emits `=`, so this was unreachable through the app, but
-        # `render_yaral` is public and SPL, AQL and KQL all admit the others.
+        # analyst wrote, in an artifact with no warning on it.
+        #
+        # THIS REFUSAL IS LIVE, AND THE OLD COMMENT SAID IT WAS NOT. It claimed
+        # "the YARA-L parser only ever emits `=`, so this was unreachable through
+        # the app". That is false, and it was false in a way that mattered: the
+        # YARA-L LOWERER refuses a same-event `!=` earlier, with
+        # YARAL_OPERATOR_NOT_LOWERABLE, so the parser's output is not the reason
+        # this is safe. `render_yaral` is public and takes any RuleIR, and the
+        # Author job renders across dialects -- a KQL rule containing
+        # `where Account != "admin"` lowers to `Comparison(op='!=')` and arrives
+        # here. Verified, and now tested.
+        #
+        # So the real structure is TWO LAYERS refusing the same thing, at
+        # different boundaries, and this comment used to credit the wrong one.
+        # A guard justified by a reason it does not have is a guard someone will
+        # eventually delete on the grounds that it "cannot be reached".
         if condition.op != "=":
             raise Refusal(
                 "YARAL_OPERATOR_NOT_RENDERABLE",
@@ -524,7 +603,12 @@ _FIELD_PATH = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
 
 
 def _field_of(node: Any) -> str:
-    """The event field, in FULL, and only if it is one.
+    r"""The event field, in FULL, and only if it is one.
+
+    RAW, because the regex examples below contain `\.` and this docstring was
+    not raw. Python emitted a SyntaxWarning on EVERY import of this module, and a
+    warning that fires unconditionally is a warning nobody reads -- so the next
+    real one arrives in a log full of this one.
 
     TWO DEFECTS IN ONE LINE.
 

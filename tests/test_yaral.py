@@ -417,5 +417,156 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "PATTERN_REQUIRES_TIME_FIELD")
 
 
+class CrossEventOperatorTests(unittest.TestCase):
+    """A cross-event comparison's OPERATOR was parsed and then thrown away.
+
+    `yaral.py` records every cross-event comparison as
+    `(left, right, operator)`. Both consumers in `yaral_ir` iterated it as
+    `for left, right, _operator` because only the field NAMES were wanted. So
+    the operator had no effect on the graph at all. Measured on the user's own
+    rule with the operator swapped, all four produced byte-identical output and
+    the same two diagnostics:
+
+        <=  lowered   <  lowered   >  lowered   >=  lowered
+
+    `>` and `>=` are not merely widened, they are INVERTED. A pattern's stages
+    are "at or after the start row", so a stage order says the left event came
+    first. A rule saying `>` claims the opposite, and the old behaviour fired on
+    the reverse sequence while showing the analyst an unchanged diff.
+
+    The module docstring claimed all of this was already refused. It was not,
+    and the docstring was the only thing saying so.
+    """
+
+    TARGET = "$lsass.metadata.event_timestamp <="
+
+    def _with_operator(self, operator):
+        self.assertIn(self.TARGET, USER_YARAL_RULE,
+                      "the substitution target moved; this test is now testing "
+                      "nothing")
+        return USER_YARAL_RULE.replace(
+            self.TARGET, f"$lsass.metadata.event_timestamp {operator}")
+
+    def test_the_non_representable_operators_are_refused(self):
+        for operator in ("<", ">", ">=", "=", "==", "!="):
+            with self.subTest(operator=operator):
+                with self.assertRaises(Refusal) as caught:
+                    lower(parse_yaral(self._with_operator(operator)))
+                self.assertEqual(caught.exception.code,
+                                 "YARAL_CROSS_EVENT_OPERATOR_NOT_EXPRESSIBLE")
+
+    def test_at_or_before_still_lowers(self):
+        """`<=` is exactly what a stage order means, so it is the one operator
+        that must keep working. Without this the guard could be satisfied by
+        refusing all four."""
+        ir, _ = lower(parse_yaral(self._with_operator("<=")))
+        self.assertTrue(ir.nodes)
+
+    def test_the_refusal_names_the_operator_it_could_not_express(self):
+        """The message has to be specific enough to act on, or the analyst is
+        left guessing which of four operators was the problem."""
+        for operator in ("<", ">"):
+            with self.subTest(operator=operator):
+                with self.assertRaises(Refusal) as caught:
+                    lower(parse_yaral(self._with_operator(operator)))
+                self.assertIn(operator, caught.exception.message)
+
+    def test_an_inverted_operator_says_it_would_fire_the_other_way(self):
+        """`>` and `<` are different failures and get different sentences.
+        Widening matches extra pairs; inverting fires on the wrong sequence, and
+        conflating them would understate the second."""
+        with self.assertRaises(Refusal) as caught:
+            lower(parse_yaral(self._with_operator(">")))
+        self.assertIn("opposite", caught.exception.message)
+
+        with self.assertRaises(Refusal) as caught:
+            lower(parse_yaral(self._with_operator("<")))
+        self.assertIn("excludes", caught.exception.message)
+
+    def test_each_operator_gives_a_different_graph_before_the_fix(self):
+        """Stated as an executable fact about the OLD behaviour, so the reason
+        this guard exists cannot be quietly rewritten. It asserts the four
+        operators are now distinguishable, which is the property that was
+        missing."""
+        graphs = {}
+        for operator in ("<=", "<"):
+            with self.subTest(operator=operator):
+                try:
+                    ir, _ = lower(parse_yaral(self._with_operator(operator)))
+                    graphs[operator] = tuple(sorted(
+                        (n.id, type(n).__name__) for n in ir.nodes))
+                except Refusal:
+                    graphs[operator] = None
+        self.assertIsNotNone(graphs["<="])
+        self.assertIsNone(graphs["<"],
+                          "a strict `<` must be distinguishable from `<=`, not "
+                          "silently identical to it")
+
+
+class OperatorRenderGuardTests(unittest.TestCase):
+    """YARAL_OPERATOR_NOT_RENDERABLE had NO TEST ANYWHERE, and a comment was
+    standing in for one.
+
+    The comment claimed the guard "was unreachable through the app" because "the
+    YARA-L parser only ever emits `=`". Both halves are wrong. The YARA-L
+    LOWERE refuses a same-event `!=` earlier, with a different code -- so the
+    parser is not what makes this safe. And `render_yaral` is public and takes
+    any RuleIR, so a KQL rule containing `where Account != "admin"` lowers to
+    `Comparison(op='!=')` and reaches this guard directly. Verified before this
+    test existed; it is the test the comment should have been.
+
+    A guard justified by a reason it does not have is a guard someone eventually
+    deletes as dead code, so the reachability is now asserted rather than
+    asserted-about.
+    """
+
+    def test_a_cross_dialect_inequality_reaches_this_guard(self):
+        from dialects.kql import parse_kql
+        from dialects.kql_ir import lower as lower_kql
+
+        ir, _ = lower_kql(parse_kql('DeviceEvents | where Account != "admin"'))
+        with self.assertRaises(Refusal) as caught:
+            render(ir)
+        self.assertEqual(caught.exception.code, "YARAL_OPERATOR_NOT_RENDERABLE")
+
+    def test_equality_from_another_dialect_still_renders(self):
+        """The other direction, so the test above cannot be satisfied by
+        refusing every cross-dialect rule."""
+        from dialects.kql import parse_kql
+        from dialects.kql_ir import lower as lower_kql
+
+        ir, _ = lower_kql(parse_kql('DeviceEvents | where Account == "admin"'))
+        rendered = render(ir)
+        self.assertIn('Account = "admin"', rendered)
+
+    def test_a_yara_l_same_event_inequality_is_refused_earlier_instead(self):
+        """The two layers, named. The YARA-L lowerer catches it first with its
+        own code, which is a BETTER message for a YARA-L rule, and this test
+        says so rather than leaving the two refusals conflated."""
+        rule = (
+            'rule probe {\n'
+            '  meta:\n'
+            '    author = "probe"\n'
+            '  events:\n'
+            '    $e0.metadata.event_type = "USER_LOGIN"\n'
+            '    $e0.principal.user != "admin"\n'
+            '  condition:\n'
+            '    $e0\n'
+            '}\n'
+        )
+        with self.assertRaises(Refusal) as caught:
+            lower(parse_yaral(rule))
+        self.assertEqual(caught.exception.code, "YARAL_OPERATOR_NOT_LOWERABLE")
+
+    def test_the_refusal_names_the_operator(self):
+        from dialects.kql import parse_kql
+        from dialects.kql_ir import lower as lower_kql
+
+        ir, _ = lower_kql(parse_kql('DeviceEvents | where Account != "admin"'))
+        with self.assertRaises(Refusal) as caught:
+            render(ir)
+        self.assertIn("!=", caught.exception.message)
+
+
 if __name__ == "__main__":
     unittest.main()
