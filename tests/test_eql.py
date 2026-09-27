@@ -78,12 +78,141 @@ class BooleanStructureIsCorrect(unittest.TestCase):
             '[any where (not a == 1 and b == 2)]')
 
 
-class EverythingElseIsRefusedByName(unittest.TestCase):
-    def test_sequence_is_refused_with_the_missing_piece_named(self):
+class SequencesLowerOntoPattern(unittest.TestCase):
+    """Slice 2. `sequence` lowers onto the IR's `Pattern` node -- stages,
+    `within` from `maxspan`, `key` from `sequence by`, and `until` with
+    `until_scope="between"` which is EQL's rule."""
+
+    def test_a_plain_sequence_round_trips(self):
+        self.assertEqual(
+            _round_trip('sequence with maxspan=15m\n'
+                        '  [ file where file.extension == "exe" ]\n'
+                        '  [ process where true ]'),
+            'sequence with maxspan=15m\n'
+            '  [file where file.extension == "exe"]\n'
+            '  [process where true]')
+
+    def test_a_sequence_with_by_and_until_round_trips(self):
+        self.assertEqual(
+            _round_trip('sequence by user.name with maxspan=15m\n'
+                        '  [ file where file.extension == "exe" ]\n'
+                        '  [ process where true ]\n'
+                        '  until [ process where event.type == "termination" ]'),
+            'sequence by user.name with maxspan=15m\n'
+            '  [file where file.extension == "exe"]\n'
+            '  [process where true]\n'
+            '  until [process where event.type == "termination"]')
+
+    def test_step_categories_survive_the_round_trip(self):
+        """The category is folded into each stage as `event.category == ...`
+        at lowering time and read back out at render time. Rendering a step as
+        `[any where ...]` would silently widen it."""
+        rendered = _round_trip(
+            'sequence with maxspan=15m\n'
+            '  [ file where file.extension == "exe" ]\n'
+            '  [ network where true ]')
+        self.assertIn("[file where", rendered)
+        self.assertIn("[network where", rendered)
+        self.assertNotIn("[any where", rendered)
+
+    def test_a_sequence_without_maxspan_is_refused_at_lowering(self):
+        """`Pattern.within` is required and there is no unbounded spelling.
+        Using 0 for "no bound" would mean "same timestamp", which is a
+        different rule. Parsed fine; refused when lowering."""
+        from dialects.eql_ir import lower as lower_eql
         with self.assertRaises(Refusal) as caught:
-            parse_eql("sequence by process.pid with maxspan=1h\n"
-                      '  [ process where process.name == "regsvr32.exe" ]')
-        self.assertEqual(caught.exception.code, "EQL_SEQUENCE_NOT_LOWERED")
+            lower_eql(parse_eql(
+                'sequence\n'
+                '  [ file where file.extension == "exe" ]\n'
+                '  [ process where true ]'))
+        self.assertEqual(caught.exception.code, "EQL_SEQUENCE_NEEDS_MAXSPAN")
+
+
+class SequencesExecuteWithEqlUntilSemantics(unittest.TestCase):
+    """The scope is not decoration. `until_scope="between"` is EQL's rule --
+    an expiry after the match leaves it standing -- and this executes a lowered
+    sequence to prove it. Changing the scope to `"window"` must fail here."""
+
+    def _rows(self):
+        def R(cat, ts, **kw):
+            d = {"event.category": cat, "@timestamp": ts}
+            d.update(kw)
+            return d
+        return [
+            R("file", 0, **{"file.extension": "exe"}),
+            R("process", 100),
+            R("process", 200, **{"event.type": "termination"}),
+        ]
+
+    def test_an_expiry_after_the_match_leaves_it_standing(self):
+        """THE DISCRIMINATING CASE, from Elastic's own example. The expiry at
+        t=200 comes after the file->process sequence completed at t=100, so
+        under EQL the sequence matches. Under the "window" scope it would not
+        -- which is exactly what the mutation changes, and why this test
+        exists."""
+        from engine import Verdict, evaluate
+        ir, _ = lower_eql(parse_eql(
+            'sequence with maxspan=15m\n'
+            '  [ file where file.extension == "exe" ]\n'
+            '  [ process where true ]\n'
+            '  until [ process where event.type == "termination" ]'))
+        result = evaluate(ir, self._rows())
+        self.assertIs(result.verdict, Verdict.MATCHED,
+                      "the expiry comes after the sequence completed, so "
+                      "under EQL the match stands")
+
+    def test_an_expiry_between_the_matches_expires_it(self):
+        """The second stage names only the LATER process row, so the expiry
+        row sits strictly between the two matched rows. A `where true` stage
+        would match the first process row it sees and leave nothing between --
+        which is correct EQL, not a test bug, but it cannot discriminate the
+        scopes."""
+        from engine import Verdict, evaluate
+        ir, _ = lower_eql(parse_eql(
+            'sequence with maxspan=15m\n'
+            '  [ file where file.extension == "exe" ]\n'
+            '  [ process where host == "h2" ]\n'
+            '  until [ process where event.type == "termination" ]'))
+        rows = [
+            {"event.category": "file", "file.extension": "exe",
+             "@timestamp": 0},
+            {"event.category": "process", "host": "h1",
+             "event.type": "termination", "@timestamp": 50},
+            {"event.category": "process", "host": "h2", "@timestamp": 100},
+        ]
+        result = evaluate(ir, rows)
+        self.assertIsNot(result.verdict, Verdict.MATCHED,
+                         "the expiry falls between the matched events")
+
+
+class EverythingElseIsRefusedByName(unittest.TestCase):
+    def test_runs_is_refused_at_parse_time(self):
+        """`with runs=N` needs N consecutive repeats and `Pattern` has no
+        repeat count. Recognised in the parser and refused there, with the
+        missing piece named."""
+        with self.assertRaises(Refusal) as caught:
+            parse_eql('sequence with runs=3\n'
+                      '  [ file where true ]\n'
+                      '  [ process where true ]')
+        self.assertEqual(caught.exception.code, "EQL_RUNS_NOT_LOWERED")
+
+    def test_a_missing_event_step_is_refused(self):
+        """`![ ... ]` matches an absence. Dropping it would invert the rule."""
+        with self.assertRaises(Refusal) as caught:
+            parse_eql('sequence with maxspan=1h\n'
+                      '  [ file where true ]\n'
+                      '  ![ process where true ]')
+        self.assertEqual(caught.exception.code,
+                         "EQL_MISSING_EVENT_NOT_LOWERED")
+
+    def test_a_per_step_by_is_refused(self):
+        """`Pattern.key` is global; EQL allows different fields per step."""
+        with self.assertRaises(Refusal) as caught:
+            parse_eql('sequence with maxspan=1h\n'
+                      '  [ file where true ] by file.path\n'
+                      '  [ process where true ]')
+        self.assertEqual(caught.exception.code,
+                         "EQL_PER_STEP_BY_NOT_LOWERED")
 
     def test_sample_is_refused_with_the_missing_piece_named(self):
         with self.assertRaises(Refusal) as caught:
@@ -107,12 +236,16 @@ class EverythingElseIsRefusedByName(unittest.TestCase):
             parse_eql('[ banana where true ]')
         self.assertEqual(caught.exception.code, "EQL_UNKNOWN_CATEGORY")
 
-    def test_no_artifact_is_produced_for_a_sequence(self):
+    def test_a_sequence_produces_an_artifact_now(self):
+        """Sequences lower since slice 2. A test asserting they do not would be
+        certifying a refusal that no longer exists -- the same failure mode as
+        the old `sort count desc` assertion."""
         outcome = jobs.author(
-            "elastic", "sequence by process.pid with maxspan=1h\n"
-            '  [ process where process.name == "regsvr32.exe" ]', "r1")
-        self.assertFalse(outcome.rendered)
-        self.assertEqual(outcome.refusal["code"], "EQL_SEQUENCE_NOT_LOWERED")
+            "elastic", "sequence with maxspan=15m\n"
+            '  [ file where file.extension == "exe" ]\n'
+            '  [ process where true ]', "r1")
+        self.assertTrue(outcome.ok)
+        self.assertIn("sequence with maxspan=15m", outcome.rendered)
 
     def test_the_rendered_output_says_which_dialect_this_is(self):
         """The label must not claim full EQL support."""

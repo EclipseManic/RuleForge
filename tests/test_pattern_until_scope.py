@@ -127,32 +127,33 @@ class WindowScopeIsYaralAndIsTheDefault(unittest.TestCase):
             _matched("window", _rows(("A", 0), ("B", 10), ("C", 20))),
             "the default and the explicit window scope must agree")
 
-    def test_nothing_in_the_dialects_sets_until_at_all(self):
+    def test_nothing_else_in_the_dialects_sets_until(self):
         """WHY the default is not a safety guarantee, stated as a fact that can
-        stop being true.
+        stop being true -- now with the known exception.
 
-        The field's comment used to claim the default "preserves every existing
-        YARA-L rule" and that changing it "would silently re-break the YARA-L bug
-        this node's until was written to fix". Both were vacuous: no lowerer sets
-        `until`, so `until` is unreachable from analyst text and no rule depends
-        on either scope. A comment that says "nothing depends on this" while
-        implying "everything does" is worse than no comment, so the fact is
-        asserted here instead -- and this test FAILS when a dialect starts
-        lowering `until`, which is the moment the default actually starts
-        mattering and someone has to think about it.
+        EQL lowers `until` with an EXPLICIT `until_scope="between"`, which was
+        reviewed against Elastic's own worked example and is the correct scope
+        for that dialect. So the tripwire watches the actual `Pattern` slot --
+        `until_scope=` in a lowerer -- rather than the word `until`, which also
+        appears in parse-tree constructors like `EqlSequence` that configure
+        nothing.
         """
         import pathlib
 
         root = pathlib.Path(__file__).resolve().parent.parent
         offenders = []
-        for path in sorted(root.glob("dialects/*.py")):
-            if "until=" in path.read_text(encoding="utf-8"):
+        for path in sorted(root.glob("dialects/*_ir.py")):
+            if path.name == "eql_ir.py":
+                continue
+            if "until_scope=" in path.read_text(encoding="utf-8"):
                 offenders.append(path.name)
         self.assertEqual(offenders, [],
-                         f"{offenders} now lower `until`. The default scope is "
-                         f"no longer a free choice -- check whether 'window' is "
-                         f"right for each of them, and update this test and the "
-                         f"until_scope comment together.")
+                         f"{offenders} now configure `Pattern.until`. The "
+                         f"default scope is no longer a free choice -- check "
+                         f"whether 'window' is right for each of them, and "
+                         f"update this test and the until_scope comment "
+                         f"together.")
+
 
 
 class TheTwoScopesReallyDiffer(unittest.TestCase):

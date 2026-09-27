@@ -24,10 +24,15 @@ from engine.values import Refusal
 
 
 def render(ir: RuleIR) -> str:
-    """`Read` -> `Filter` -> `Emit` back to `[ category where condition ]`."""
-    {node.id: node for node in ir.nodes}
+    """    A single event back to `[ category where condition ]`, or a `Pattern`
+    back to `sequence`."""
+    pattern = next((n for n in ir.nodes if type(n).__name__ == "Pattern"), None)
+
+    if pattern is not None:
+        return _render_pattern(pattern)
     read = next((n for n in ir.nodes if type(n).__name__ == "Read"), None)
     filt = next((n for n in ir.nodes if type(n).__name__ == "Filter"), None)
+
     if read is None or filt is None:
         raise Refusal("EQL_RENDER_NO_EVENT",
                       "this graph has no single event to render: EQL slice 1 "
@@ -44,6 +49,91 @@ def render(ir: RuleIR) -> str:
             f"a command name was once dropped.", DIALECT)
     category = getattr(getattr(read, "selector", None), "name", "any")
     return f"[{category} where {render_expr(filt.condition)}]"
+
+
+def _render_pattern(pattern: Any) -> str:
+    """A `Pattern` back to `sequence` text.
+
+    Only the shapes slice 2 lowers are renderable: ordered stages, a real
+    `within`, an optional global `key`, and an optional `until`. Anything else
+    is refused rather than flattened, for the same reason an `Aggregate` is.
+    """
+    if not getattr(pattern, "ordered", True):
+        raise Refusal("EQL_RENDER_UNORDERED_PATTERN",
+                      "this pattern is unordered, which is `sample` territory, "
+                      "and `sample` is not lowered yet.", DIALECT)
+    lines = []
+    if getattr(pattern, "key", ()):
+        lines.append("sequence by " + ", ".join(
+            ref.name if hasattr(ref, "name") else str(ref)
+            for ref in pattern.key))
+    else:
+        lines.append("sequence")
+    within = getattr(pattern, "within", None)
+    seconds = getattr(within, "seconds", None) if within is not None else None
+    if seconds is None:
+        raise Refusal("EQL_RENDER_PATTERN_NO_WINDOW",
+                      "this pattern has no window, and a `sequence` without "
+                      "`maxspan` has no spelling here.", DIALECT)
+    lines[0] += f" with maxspan={_format_span(seconds)}"
+    for stage in pattern.stages:
+        if len(stage) != 1:
+            raise Refusal("EQL_RENDER_PATTERN_STAGE",
+                          "a sequence stage holds one event condition here.",
+                          DIALECT)
+        # The category was folded into the condition at lowering time as
+        # `event.category == "<name>"`. Reading it back out is what makes the
+        # round trip exact; rendering every step as `[any where ...]` would
+        # silently widen each one.
+        condition = stage[0]
+        category = "any"
+        if isinstance(condition, BoolOp) and condition.op == "and" \
+                and len(condition.operands) == 2:
+            first, rest = condition.operands
+            name = _category_name(first)
+            if name is not None:
+                category, condition = name, rest
+        lines.append(f"  [{category} where {render_expr(condition)}]")
+    if getattr(pattern, "until", None) is not None:
+        condition = pattern.until
+        category = "any"
+        if isinstance(condition, BoolOp) and condition.op == "and" \
+                and len(condition.operands) == 2:
+            first, rest = condition.operands
+            name = _category_name(first)
+            if name is not None:
+                category, condition = name, rest
+        lines.append(f"  until [{category} where {render_expr(condition)}]")
+    return "\n".join(lines)
+
+
+def _category_name(expr: Any) -> str | None:
+    """`event.category == "<name>"` back to `<name>`, else None.
+
+    Returns None for anything that is not exactly that shape, so a user-written
+    `event.category == "file"` buried inside a larger condition is not mistaken
+    for a folded step category.
+    """
+    if not isinstance(expr, Comparison) or expr.op != "=":
+        return None
+    left = expr.left
+    if not isinstance(left, FieldExpr):
+        return None
+    ref = left.ref
+    if getattr(ref, "name", None) != "event.category":
+        return None
+    right = expr.right
+    value = right.value if isinstance(right, Literal) else right
+    return value if isinstance(value, str) else None
+
+
+def _format_span(seconds: int) -> str:
+    """Seconds back to the largest whole unit, so `3600` renders as `1h` and
+    not as `3600s` -- which is valid but not what anyone writes."""
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60), ("s", 1)):
+        if seconds % size == 0:
+            return f"{seconds // size}{unit}"
+    return f"{seconds}s"
 
 
 def render_expr(expr: Any) -> str:

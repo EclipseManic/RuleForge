@@ -26,12 +26,14 @@ from dialects.eql import DIALECT, EqlQuery
 from engine.ir import (
     BoolOp,
     Comparison,
+    Duration,
     Emit,
     FieldExpr,
     FieldRef,
     Filter,
     Literal,
     Not,
+    Pattern,
     Read,
     RuleIR,
     SourceSelector,
@@ -40,16 +42,97 @@ from engine.values import Refusal
 
 
 def lower(query: EqlQuery, rule_id: str = "rule") -> tuple[RuleIR, list[dict]]:
-    """`[ category where condition ]` -> `Read` -> `Filter` -> `Emit`."""
-    condition = _condition(query.event.condition)
+    """A single event -> `Read` -> `Filter` -> `Emit`; a sequence -> `Pattern`."""
+    if query.sequence is not None:
+        return _lower_sequence(query.sequence, rule_id)
+    event = query.event
+    assert event is not None
+    condition = _condition(event.condition)
     nodes = (
-        Read(id="read", selector=SourceSelector(name=query.event.category)),
+        Read(id="read", selector=SourceSelector(name=event.category)),
         Filter(id="filter", input="read", condition=condition),
         Emit(id="out", input="filter"),
     )
     return (RuleIR(rule_id=rule_id, nodes=nodes, output="out",
-                   title=f"[{query.event.category} where ...]",
+                   title=f"[{event.category} where ...]",
                    metadata={"dialect": DIALECT}), [])
+
+
+def _lower_sequence(sequence, rule_id: str) -> tuple[RuleIR, list[dict]]:
+    """`sequence` onto the IR's `Pattern` node.
+
+    The mapping, construct by construct:
+      steps            -> `stages`, each step's condition parsed as one stage
+      `with maxspan=`  -> `within`, measured from the first event
+      `sequence by`    -> `key`, the shared join keys
+      `until`          -> `until` with `until_scope="between"`, which is EQL's
+                          rule: an expiry between matches expires the sequence,
+                          one after it does not
+      ordering         -> `ordered=True` with `time_field="@timestamp"`, which
+                          is Elasticsearch's implicit event time rather than a
+                          guess -- it is what the engine stamps every event with
+    """
+    if sequence.maxspan is None:
+        # NO UNBOUNDED SPELLING EXISTS. `Pattern.within` is required, and using
+        # 0 for "no bound" would mean "same timestamp", which is a different
+        # rule. EQL allows a sequence with no `maxspan`; the IR cannot express
+        # one yet, so it is refused rather than bounded silently.
+        raise Refusal(
+            "EQL_SEQUENCE_NEEDS_MAXSPAN",
+            "`sequence` with no `with maxspan=` has no time bound, and "
+            "`Pattern.within` is required -- there is no unbounded spelling. "
+            "Add `with maxspan=<duration>`; without one the window is "
+            "undefined and any bound RuleForge invented would be a different "
+            "rule.", DIALECT)
+    stages = tuple((_stage_condition(step),) for step in sequence.steps)
+    key = tuple(FieldRef(name) for name in sequence.by)
+    until = None
+    if sequence.until is not None:
+        # The category is folded in here too, for the same reason as the
+        # stages: rendering `until [any where ...]` for an `until [process
+        # where ...]` would silently widen the expiry.
+        until = _stage_condition(sequence.until)
+    nodes = (
+        Read(id="read", selector=SourceSelector(name="any")),
+        Pattern(id="pattern", input="read", stages=stages,
+                within=Duration(_span_seconds(sequence.maxspan)),
+                key=key, until=until, until_scope="between",
+                ordered=True, time_field="@timestamp"),
+        Emit(id="out", input="pattern"),
+    )
+    return (RuleIR(rule_id=rule_id, nodes=nodes, output="out",
+                   title=f"sequence of {len(stages)} events",
+                   metadata={"dialect": DIALECT}), [])
+
+
+def _stage_condition(step) -> Any:
+    """A sequence step's condition, WITH its category folded in.
+
+    `[ file where X ]` means "a file event satisfying X". Every ECS event
+    carries `event.category`, so the category IS a condition on that field --
+    not metadata about the query, and not something the renderer may drop.
+    Rendering the step back reads it back out, so the round trip is exact and
+    `any` never silently widens a rule that named a category.
+    """
+    condition = _condition(step.condition)
+    if step.category == "any":
+        return condition
+    return BoolOp("and", (Comparison("=", FieldExpr(FieldRef("event.category")),
+                                     Literal(step.category)),
+                          condition))
+
+
+def _span_seconds(span: str) -> int:
+    """`30s`, `15m`, `1h`, `7d` -> seconds. Anything else is refused, because a
+    guessed unit is a guessed window."""
+    match = span.strip().lower()
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if len(match) >= 2 and match[-1] in units and match[:-1].isdigit():
+        return int(match[:-1]) * units[match[-1]]
+    raise Refusal("EQL_MAXSPAN_NOT_A_DURATION",
+                  f"`{span}` is not a duration like `30s`, `15m`, `1h` or "
+                  f"`7d`. Refused rather than guessed, because the wrong unit "
+                  f"is a different window.", DIALECT)
 
 
 def _condition(text: str) -> Any:
