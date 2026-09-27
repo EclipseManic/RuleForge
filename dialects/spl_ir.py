@@ -224,10 +224,12 @@ def _parse_arrange_args(command: str, args: str, position: int,
     while index < len(tokens):
         token = tokens[index]
         direction = "asc"
+        signed = False
         if token.startswith("-"):
-            direction, token = "desc", token[1:]
+            direction, token, signed = "desc", token[1:], True
         elif token.startswith("+"):
-            token = token[1:]
+            token, signed = token[1:], True
+
         # `sort [<count>] <fields>` -- THE COUNT WAS BEING PARSED AND DISCARDED.
         #
         # Splunk's syntax is `sort [<count>] [-|+]<field> [...]`, and the count
@@ -242,7 +244,22 @@ def _parse_arrange_args(command: str, args: str, position: int,
         # generalising it to non-zero counts is where the result set silently
         # widened. Now it is read, and `0` keeps meaning "no limit" because
         # Splunk says so.
+        # A SIGNED COUNT IS NEITHER A COUNT NOR A FIELD.
+        #
+        # Splunk's syntax is `sort [<count>] [-|+]<field>`: the count is never
+        # signed, and the sign belongs to a FIELD. So `-5` is not "descending,
+        # five results" -- it is a sign on something that is not a field name,
+        # because a bare number is never a field. It used to become a count of 5
+        # after the sign was stripped, which is a number the analyst never wrote
+        # as a count.
         if token.isdigit():
+            if signed:
+                raise SplParseError(
+                    "SPL_SORT_SIGNED_COUNT",
+                    f"`{command} {tokens[index]}` -- a sort count is never "
+                    f"signed in SPL, and a bare number is never a field name, "
+                    f"so this is neither. Refused rather than read as a count "
+                    f"of {token}.", dialect)
             # `0` IS SPLUNK'S "NO LIMIT", SO IT BECOMES `None` AND NOT A CAP OF
             # ZERO. A cap of 0 would render as `head 0` and return nothing.
             if limit is None and int(token) > 0:
@@ -1019,6 +1036,27 @@ def _lower_aggregate(command: SplCommand, position: int, source: str,
                       time_ref=TimeRef(field_name=time_field))
     else:
         frame = Frame(kind="per_event")
+
+    # `prestats=` WAS PARSED AND THEN DROPPED.
+    #
+    #     index=main | stats prestats=t count BY host
+    #       ->  index=main | stats count AS count by host    ok=True, findings=[]
+    #
+    # The parser reads `prestats=t` into `SplStats.prestats`, and the lowerer
+    # never looked at the field -- so the artifact was byte-identical to the
+    # rule without it. In Splunk `prestats` is meaningful only with `tstats`,
+    # where it passes partial results between the two; on plain `stats` Splunk
+    # itself ignores it. But an analyst who writes `prestats=t` on a `stats`
+    # almost certainly MEANT `tstats`, and silently accepting it hides that
+    # mistake. Refused by name, naming the command it belongs to.
+    if stats.prestats:
+        raise SplParseError(
+            "SPL_PRESTATS_NOT_ON_STATS",
+            "`prestats=t` passes partial results between `tstats` stages -- it "
+            "has no meaning on plain `stats`, where it would silently do "
+            "nothing. If this was meant to be a `tstats` query, that command is "
+            "refused separately because it reads index-time fields no sample "
+            "can reproduce.", DIALECT)
 
     if stats.from_clause:
 

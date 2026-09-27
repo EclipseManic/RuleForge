@@ -129,8 +129,14 @@ class SplStats:
 class SplCommand:
     name: str
     args: str = ""
-    #: The leading `search` of a bare search line, e.g. `index=main foo=bar`.
-    bare_search: str = ""
+    # `bare_search` WAS HERE, AND IT IS GONE ON PURPOSE. It was declared with a
+    # docstring -- "The leading `search` of a bare search line" -- and never
+    # assigned anywhere in this file, so no command ever carried it. Bare search
+    # heads (`index=main foo=bar`) are handled by the head parsing and lower
+    # correctly without it. A declared-but-never-populated field invites a
+    # reader to believe a value flows through it, and a future writer to read a
+    # value that is always empty. If bare-search handling ever needs its own
+    # slot, it should be added with the code that fills it, not before.
 
 
 @dataclass(slots=True)
