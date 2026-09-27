@@ -112,7 +112,28 @@ class ProcessHarness(unittest.TestCase):
     """Temporary history file, spawned children, and the schedule helpers."""
 
     def setUp(self) -> None:
-        self._dir = tempfile.TemporaryDirectory()
+        # `ignore_cleanup_errors=True`, AND HERE IS WHY IT IS NOT "HIDING A
+        # FAILURE".
+        #
+        # This suite spawns real subprocesses, and several are killed on purpose
+        # -- a holder that wedges the lock is supposed to die without cleaning
+        # up. If an assertion fails BEFORE the kill, the child is still alive
+        # with `history.json.lock` open, and `shutil.rmtree` (which walks the
+        # tree) raises PermissionError on it during cleanup.
+        #
+        # That exception comes from the CLEANUP, so it REPLACES the real
+        # failure. For a long time the only visible error was
+        #
+        #     PermissionError: [WinError 32] ... history.json.lock
+        #
+        # which is what the suite reported, and what I twice misattributed to a
+        # regression in unrelated code. The actual failing assertion was never
+        # printed at all.
+        #
+        # A leaked temp dir is recoverable and the OS clears it; losing the real
+        # failure is not. So cleanup stops competing with the assertion. A
+        # genuine cleanup problem stays visible by the file still being there.
+        self._dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self._dir.cleanup)
         self.root = Path(self._dir.name)
         self.path = self.root / "history.json"
