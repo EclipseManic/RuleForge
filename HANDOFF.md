@@ -100,7 +100,30 @@ found was in the nodes feeding it — which is the lesson worth carrying.
 | **Sentinel KQL** | ✅ | ✅ | ✅ | ✅ |
 | **Wazuh XML** | ✅ | ✅ | ✅ | ✅ `negate`, level, multi-`Derive` all round-trip |
 | **Splunk SPL** | ✅ | ✅ | ✅ | ✅ 8/8 commands; `fillnull` refused by name |
-| Elastic EQL / Falcon CQL | ❌ | ❌ | ❌ | ❌ **not started — the real remaining gap** |
+| **Elastic EQL** | ✅ slice 1+2 | ✅ single event + `sequence` | ✅ | ✅ single event executes; sequences lower, render, and execute against Elastic's example shapes |
+| **CrowdStrike FQL** | ✅ flat filter | ✅ one `Filter` | ✅ | ✅ executes through the standard job path |
+
+### EQL AND FQL ARE SLICES, AND THE LABELS SAY SO
+
+The dialect table registers "Elastic EQL (single event + sequence)" and
+"CrowdStrike FQL (flat filter)", and tests assert those labels -- because a UI
+entry reading "Elastic EQL" for a dialect without `runs=`/`!`/per-step `by`/
+`sample`, or "CrowdStrike Falcon" for the flat API filter without the pipeline
+language, is the same false claim this project keeps deleting everywhere else.
+
+EQL slice 1: `[ category where condition ]` -> `Read` -> `Filter` -> `Emit`,
+with NOT > AND > OR precedence, parens, and quoted separators. Slice 2:
+`sequence [by ...] [with maxspan=...] steps... [until ...]` onto `Pattern`
+(stages, `within` from `maxspan`, `key` from `by`, `until` with
+`until_scope="between"`). Step categories are folded into stages as
+`event.category == ...` at lowering and read back at render, so the round trip
+is exact. Refused by name: `runs=`, `!`, per-step `by`, unbounded sequences
+(no `maxspan`), `sample`, `join`.
+
+FQL slice 1: `property:[operator]value` with `+`/`,`/`()` onto one `Filter`.
+CQL pipe/word-operator shapes are refused AS CQL with the confusion named --
+the two languages share a name and must never share a parser. `*` wildcards,
+`~` text-match, and >20 properties refused by name.
 
 ### SPL IS COMPLETE EXCEPT `fillnull`, AND THE REASON IS THE IR
 
@@ -319,71 +342,53 @@ Nine independent review rounds have now run. **Every one found real defects
 while the suite was green.** Treat the suite as necessary, never sufficient, and
 assume a fresh eye is cheaper than the next round's findings.
 
-### Open, from round 9, in severity order
+### Open, in severity order -- verified against the tree, not carried forward
 
-1. **`where` is fixed; these are not.** All below are `ok=True` with an empty
-   findings list unless stated.
-   - **`eventstats` renders as `stats`, command name discarded.** In Splunk
-     `eventstats` keeps one row per input event with stat columns appended;
-     `stats` collapses to one row per group. Different results. No test exists
-     for `eventstats` at all.
-   - **The `span=` refusal is gated `command.name == "stats"`**, so `eventstats`
-     and `tstats` skip it, and `_render_aggregate` never reads `node.frame` at
-     all (`git grep frame dialects/spl_render.py` -> zero matches). So
-     `eventstats count by ts span=1h host` renders with the hour-long bucket gone
-     — the same defect the `span` refusal was added for, on a sibling command.
-   - **The `_time`-without-`span` check has no `not stats.span` guard**, so
-     `tstats count by _time span=1h` is told it has no span when it does, and
-     **never reaches `TSTATS_NOT_EXECUTABLE_LOCALLY`** — contradicting the
-     comment above the span check, which says the most specific refusal wins.
-2. **`_expression_depth` has no `Not` arm**, so `MAX_EXPRESSION_DEPTH` never
-   applies to `Not`. `Not x2000` escapes `validate_graph` as a `RecursionError`,
-   and `jobs.py:424` turns it into `INPUT_TOO_DEEP` / "the pasted events are
-   nested too deeply" when no events were pasted at all. A `BoolOp` chain 101
-   deep *is* refused, so the hole is `Not` specifically.
-3. **The ReDoS walk's `name` arm is a hard dead end** — it walks `pattern`,
-   `left`, `right` and `return`s, so `SourceSelector.binding` and `.kind` are
-   never visited. Not a live hole today (`binding` is a datamodel name by
-   contract) and exactly the failure mode the round-8 comment says cannot recur.
-4. **The anti-drift test is weaker than its own docstring claims.** It covers
-   container TYPES via a hardcoded 16-name slot list, so it cannot catch a depth
-   cutoff (which is how round 9's C2 slipped through a test written to prove
-   totality) and it already misses `Package`, which holds regexes in two slots.
-   A new node named under any other field is silently uncovered.
-5. **The selector-hoist latch opens when the first filter has no selector**, so a
-   *later* filter's selectors get hoisted to search time, and an explicit
-   mid-pipeline `| where host="h"` is relocated because `host` is a selector
-   field. Semantically safe in the cases found (intersection is idempotent) but
-   the guard's comment is false, and **deleting the latch leaves 121 tests
-   green** — it is untested.
-6. **An undecidable timestamp mid-window is treated as "inside the window."**
-   `within=600`, stages A->B: B with no timestamp MATCHES, while A with no
-   timestamp is refused with `PATTERN_UNDECIDABLE_TIME`. The same undecidability
-   is fatal at one end of the window and free at the other, and an
-   un-timestamped `until` event cannot veto at all. A "within 10 minutes" rule
-   fires on a pair whose elapsed time cannot be established.
-7. **`SplStats.prestats` is parsed and dropped** — `stats prestats=t count by
-   host` renders identically to `stats count by host`. `SplCommand.bare_search`
-   is declared with a docstring and **never assigned anywhere**.
-8. **Low:** `mutation_check.py` has 1 of 15 mutations targeting the pre-refactor
-   `until` veto string; the harness honestly counts it as a failure but nothing
-   in pytest sees it. `| stats COUNT(x) as c` gets "'count' reads no field" for
-   an input that names field `x`. `_render_subpipeline` renders `rename`
-   backwards (dead path — `spl_ir.lower` has no `join` command).
+**Verified state: 761 passed, 4 skipped, 3 warnings, ruff clean.**
+
+Everything round 9 listed except the EQL/CQL gap is FIXED and committed, each
+mutation-verified: eventstats refused, 	stats-first ordering, the Not
+depth arm, the 
+ame-arm sweep, the anti-drift reflection over all fields with
+Package probed, the selector latch closing after the first filter, the
+undecidable mid-window timestamp, prestats/signed-count/are_search,
+COUNT(x), the backwards subpipeline 
+ename, and the M8 retargeting (all 15
+mutations caught). Then EQL slices 1+2 and FQL slice 1 landed on top. What
+remains:
+
+1. **EQL: with runs=N, ! missing-event, per-step y, sample.** Each
+   needs an IR decision, not just code: 
+uns needs a repeat count Pattern
+   does not have; ! needs a negative step plus its mandatory maxspan;
+   per-step y needs key to stop being global (do not fake it); sample
+   is ordered=False without until/maxspan. sequence without maxspan
+   is refused (no unbounded spelling). See docs/eql-design.md.
+2. **CQL pipeline stages.** FQL (flat filters) is done. The LogScale pipes --
+   | table, | sort, | rename, :=, | join with sub-search, aggregates,
+   in() -- map onto existing SPL-shaped nodes, but the renderer work must be
+   SHARED with the SPL stage builder, not written a third time. The two
+   existing copies already drifted twice. 
+ow() must be evaluated at lower
+   time, never frozen into a literal. See docs/cql-design.md.
+3. **Four POSIX assertions have never executed.** Permission-bit tests and the
+   directory sync, written on Windows. The Windows halves are exercised;
+   run the file on Linux before trusting that half at all.
+4. **Round 10 review.** Nine rounds, every one found real defects behind green.
+   The newest unreviewed code is dialects/eql*.py, dialects/fql*.py, and
+   the until_scope evaluator branch.
 
 ### Still the biggest functional gap
 
-**Elastic EQL**, then **Falcon CQL.** The IR is ready: `Pattern` has `stages`,
-`within`, `key`, `ordered`, `time_field`, and `until` with `until_scope` whose
-"between" mode implements EQL's rule (verified against Elastic's own worked
-example). Genuinely missing for EQL: `with runs=N`, the `!` missing-event clause
-with its mandatory `maxspan`, and per-step `by` (`key` is global today — do not
-fake it). See `docs/eql-design.md` for the construct-by-construct mapping.
+**EQL slices 3+ and the CQL pipes, items 1-2 above.** The IR is ready for both:
+Pattern implements EQL's until rule (verified against Elastic's own worked
+example), and the pipeline vocabulary already exists from SPL.
 
-**Sigma is not a target.** It is an interchange format with no execution
-semantics and its value here is as a test corpus. `requirements.txt` still pins
-`pysigma` and five backends that nothing imports — use them to read the corpus
-or drop the pins, but do not leave them implying a feature.
+**Sigma is not a target.** 
+equirements.txt no longer pins pysigma or any
+backend -- removed, since conversion is not coming back and the pins implied a
+feature. PyYAML stays for one reason: the public Sigma repositories the tool
+tests against are YAML, so the corpus reader needs a parser.
 
 ---
 
@@ -525,8 +530,11 @@ open work above.
   promise it "has not been overwritten". A torn final line is tolerated (costs
   the tail entry only) but only when a good entry precedes it, so a damaged file
   is still reported as damaged.
-- Elastic EQL and Falcon CQL are not started. **Sigma is not a target** — it is an
-  interchange format with no execution semantics, and counting it as missing work
-  inflated the scope for several rounds. Its value here is as a test corpus.
+- Elastic EQL slices 1+2 and CrowdStrike FQL slice 1 are IN (single events,
+  sequences with `by`/`maxspan`/`until`, flat FQL filters). What is not started:
+  EQL `runs=`/`!`/per-step `by`/`sample`, and the CQL pipeline stages. **Sigma
+  is not a target** — it is an interchange format with no execution semantics,
+  and counting it as missing work inflated the scope for several rounds. Its
+  value here is as a test corpus.
 - Nothing is blocked on the user. Everything is committed and pushed;
   `origin/master` is at the tip.
