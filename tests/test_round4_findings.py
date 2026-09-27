@@ -515,25 +515,30 @@ class NestingMustNotHideTheCheck(unittest.TestCase):
 
     def test_a_group_prefix_does_not_help(self):
         """`(?:` is the same wrapper spelled differently, and the prefix parsing
-        has to reach the same verdict through it.
+        has to reach the same verdict through it -- for every body in the table,
+        including the alternation ones.
 
-        KNOWN INCOMPLETE, AND THE INCOMPLETENESS IS DELIBERATELY NOT ASSERTED
-        AS PASSING. `(?:(?:a|aa))+$` and `(?:(?:aa|a))+$` are still ACCEPTED, and
-        they are genuinely exponential: measured 0.0003s at n=18 rising to
-        0.0778s at n=30, about 1.59x per character added, which extrapolates past
-        20s by n=42. The plain and single-wrapped forms are refused, so the gap
-        is specifically a `?:` wrapper COMBINED WITH a second layer of nesting in
-        the ALTERNATION path -- a different defect from the quantifier path fixed
-        in the same commit, and not fixed by it.
+        This assertion was DELIBERATELY ABSENT from the first version of this
+        class, with the gap written up in HANDOFF.md instead. `(?:(?:a|aa))+$`
+        and `(?:(?:aa|a))+$` were accepted and genuinely exponential, and I chose
+        not to write a test that passed by agreeing with a bug.
 
-        So the bodies asserted here are the ones without a bare alternation,
-        which is where this commit's fix applies. The alternation-through-`?:`
-        case is recorded in HANDOFF.md as an open finding with its measurement
-        rather than being written as a test that passes. A test asserting a known
-        bad state as expected is worse than no test: it institutionalises the bug
-        and turns red into green by agreement.
+        The cause was a THIRD copy of the group-prefix rules. `_all_group_bodies`
+        skipped a `?:`-style prefix inline and then appended from one character
+        past the `(`, so it collected the body as `?:a|aa`. The alternation split
+        produced the branches `?:a` and `aa`, which share no prefix, so the
+        overlap check reported no ambiguity. The plain `((a|aa))` form worked
+        because a plain group has no prefix to include -- which is exactly why
+        the plain and singly-wrapped forms were refused while the `?:` form was
+        not, and why nothing looked like an inconsistency.
+
+        The fix is to call the same `_body_start_after_prefix` the other two
+        callers use. That helper was extracted when the quantifier path was
+        fixed; this call site was never migrated to it. The second source of
+        truth arrived by OMISSION rather than by intent, which is the argument
+        for the shared helper existing.
         """
-        for body in ("a+", "a*", "a{1,}", "[a-z]+", "\\w+a"):
+        for body in self.BODIES:
             with self.subTest(body=body):
                 self.assertIsNotNone(
                     catastrophic_reason(f"(?:(?:{body}))+$"),

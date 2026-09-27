@@ -367,16 +367,6 @@ depth-scaling check.
 
 Still open, honestly:
 
-- **A THIRD ReDoS GAP, MEASURED AND NOT FIXED.** `(?:(?:a|aa))+$` and
-  `(?:(?:aa|a))+$` are ACCEPTED and are genuinely exponential: 0.0003s at n=18
-  rising to 0.0778s at n=30, about 1.59x per character added, which
-  extrapolates past 20s by n=42. The plain `(a|aa)+$` and the single-wrapped
-  `((a|aa))+$` are both refused, so the gap is specifically a `?:` prefix
-  COMBINED WITH a second layer of nesting, in the ALTERNATION path. It is a
-  different defect from the two fixed in the same commit and was not fixed by
-  them. Next step: find why the alternation body's scan does not see through two
-  prefixed wrappers, and assert the property "if `(X)+$` is refused then
-  `(?:(?:X))+$` is refused" the way the quantifier path now is.
 - **The SPL `head` sign convention is asserted, not verified.** The renderer
   emits `desc -> -field` and `asc -> +field`. That mapping came from my
   recollection of Splunk's `head` syntax, not from its documentation, and a

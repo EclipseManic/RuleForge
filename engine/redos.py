@@ -690,17 +690,32 @@ def _all_group_bodies(body: str) -> list[str]:
             index = (close + 1) if close > 0 else index + 1
             continue
         if char == "(":
-            stack.append(index)
+            # THE BODY START COMES FROM THE SHARED HELPER, NOT FROM A SECOND
+            # COPY OF THE PREFIX RULES.
+            #
+            # This function used to skip a `?:`-style prefix inline and then
+            # append `body[start + 1:index]` -- one character past the `(`. For
+            # `(?:a|aa)` that is `?:a|aa`, so the alternation was split into the
+            # branches `?:a` and `aa`, which share no prefix, and the overlap
+            # check reported no ambiguity. The plain `((a|aa))` form was fine
+            # because a plain group has no prefix to include, which is exactly
+            # why `(a|aa)+$` and `((a|aa))+$` were refused while
+            # `(?:(?:a|aa))+$` was accepted. Measured on the accepted one:
+            # 0.0003s at n=18 rising to 0.0778s at n=30, about 1.59x per
+            # character added, which extrapolates past 20s by n=42.
+            #
+            # `_body_start_after_prefix` was extracted for exactly this reason
+            # when the quantifier path was fixed, and this call site was simply
+            # never migrated to it. That is the second-source-of-truth defect
+            # arriving by omission rather than by intent, which is a good
+            # argument for the shared helper existing at all.
+            stack.append(_body_start_after_prefix(body, index))
             index += 1
-            if index < length and body[index] == "?":
-                while index < length and body[index] not in ":=!<":
-                    index += 1
-                index += 1
             continue
         if char == ")":
             start = stack.pop() if stack else None
             if start is not None:
-                out.append(body[start + 1:index])
+                out.append(body[start:index])
             index += 1
             continue
         index += 1
