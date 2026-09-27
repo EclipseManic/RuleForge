@@ -36,6 +36,12 @@ from dialects.eql import LANGUAGE as EQL_LANGUAGE
 from dialects.eql import parse_eql
 from dialects.eql_ir import lower as lower_eql
 from dialects.eql_render import render as render_eql
+from dialects.fql import DIALECT as FQL_DIALECT
+from dialects.fql import LANGUAGE as FQL_LANGUAGE
+from dialects.fql import parse_fql
+from dialects.fql_ir import MAX_PROPERTIES as FQL_MAX_PROPERTIES
+from dialects.fql_ir import lower as lower_fql
+from dialects.fql_render import render as render_fql
 from dialects.wazuh import DIALECT as WAZUH_DIALECT
 from dialects.wazuh import LANGUAGE as WAZUH_LANGUAGE
 from dialects.wazuh import parse_wazuh
@@ -57,6 +63,8 @@ __all__ = [
     "SPL_DIALECT", "SPL_LANGUAGE",
     "parse_eql", "lower_eql", "render_eql",
     "EQL_DIALECT", "EQL_LANGUAGE",
+    "parse_fql", "lower_fql", "render_fql",
+    "FQL_DIALECT", "FQL_LANGUAGE", "FQL_MAX_PROPERTIES",
     "TARGETS",
 ]
 

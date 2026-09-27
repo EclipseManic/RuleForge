@@ -33,26 +33,31 @@ from dialects import (
     KQL_DIALECT,
     SPL_DIALECT,
     EQL_DIALECT,
+    FQL_DIALECT,
     TARGETS,
     WAZUH_DIALECT,
     YARAL_DIALECT,
     lower_aql,
     lower_eql,
+    lower_fql,
     lower_kql,
     lower_spl,
     lower_wazuh,
     lower_yaral,
     parse_aql,
     parse_eql,
+    parse_fql,
     parse_kql,
     parse_wazuh,
     parse_yaral,
     render_aql,
+    render_eql,
+    render_fql,
     render_kql,
     render_spl,
-    render_eql,
     render_wazuh,
     render_yaral,
+
 )
 from engine import evaluate
 from engine.validate import validate_graph
@@ -136,6 +141,11 @@ def _lower_eql_text(text: str, rule_id: str, **_: Any):
     return lower_eql(parse_eql(text), rule_id)
 
 
+def _lower_fql_text(text: str, rule_id: str, **_: Any):
+    return lower_fql(parse_fql(text), rule_id)
+
+
+
 #: Re-exported so the web layer reads one module. `TARGETS` lists every syntax
 #: this project must eventually handle; `DIALECTS` is the subset that works
 #: today. The home page shows the difference rather than claiming parity.
@@ -163,8 +173,12 @@ DIALECTS: dict[str, dict[str, Any]] = {
         "lower_text": _lower_spl_text, "render": render_spl,
     },
     "elastic": {
-        "label": "Elastic EQL (single event)", "dialect": EQL_DIALECT,
+        "label": "Elastic EQL (single event + sequence)", "dialect": EQL_DIALECT,
         "lower_text": _lower_eql_text, "render": render_eql,
+    },
+    "falcon": {
+        "label": "CrowdStrike FQL (flat filter)", "dialect": FQL_DIALECT,
+        "lower_text": _lower_fql_text, "render": render_fql,
     },
 }
 
