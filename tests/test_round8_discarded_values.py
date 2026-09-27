@@ -49,12 +49,13 @@ class SortCountIsNotDiscarded(unittest.TestCase):
     def test_head_still_owns_its_own_count(self):
         """A second `limit = None` declaration was added while fixing the sort
         count, and it sat BELOW the one `head` uses -- silently resetting
-        `head`'s limit to None. `| head 5 -_time` rendered as a bare `sort` with
-        no `head` at all, and two tests caught it. So both are pinned here."""
+        `head`'s limit to None. `| head 5` rendered as a bare `sort` with no
+        `head` at all, and two tests caught it."""
         for source, expected in (
-            ("index=main | head 5 -_time", "index=main | sort -_time | head 5"),
-            ("index=main | head 3 host", "index=main | sort +host | head 3"),
-            ("index=main | head 2", "index=main | head 2"),
+            ("index=main | head 5", "index=main | head 5"),
+            ("index=main | sort 5 -_time", "index=main | sort -_time | head 5"),
+            ("index=main | sort 2 host | head 3",
+             "index=main | sort +host | head 2 | head 3"),
         ):
             with self.subTest(source=source):
                 self.assertEqual(jobs.author("splunk", source, "r1").rendered,

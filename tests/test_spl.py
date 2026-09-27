@@ -354,14 +354,52 @@ class PipelineCommandLoweringTests(unittest.TestCase):
                      "desc` would sort ASCENDING by count, then by a field "
                      "literally named `desc`.")
 
-    def test_head_becomes_sort_then_head(self):
-        self.assertEqual(self._round_trip("index=main | head 5 -_time"),
+    def test_head_takes_no_field_argument(self):
+        """`head` HAS NO FIELD, and every field that followed the count was being
+        reinterpreted as a sort.
+
+            | head 5 host   ->   | sort +host | head 5     ok=True, no finding
+
+        Splunk's documented syntax is `head [keeplast] [while "<expr>"] [<limit>]`
+        with no field and no sort-order argument -- which the renderer in this
+        package quotes at length, so the file contradicted itself about the same
+        syntax. And the reinterpretation is not a convenience: `head 5 host` and
+        `| sort host | head 5` return DIFFERENT EVENTS, so a mis-remembered
+        argument produced a plausible, deployable, differently-behaving rule with
+        nothing said.
+
+        The two-stage form is spelled with SORT, which is where it belongs.
+        """
+        for source in ("index=main | head 5 host",
+                       "index=main | head 5 -_time",
+                       "index=main | stats count by host | head 3 host"):
+            with self.subTest(source=source):
+                with self.assertRaises(SplParseError) as caught:
+                    lower(source)
+                self.assertEqual(caught.exception.code,
+                                 "SPL_HEAD_TAKES_NO_FIELD")
+
+    def test_the_two_stage_form_is_still_exactly_that(self):
+        """`sort` then `head` is the documented way to say "first N in this
+        order", and it must keep working -- the refusal is about `head`'s
+        arguments, not about ordering."""
+        self.assertEqual(self._round_trip("index=main | sort -_time | head 5"),
                          "index=main | sort -_time | head 5")
+        self.assertEqual(
+            self._round_trip("index=main | stats count by host | sort host | head 3"),
+            "index=main | stats count AS count by host | sort +host | head 3")
+
+    def test_head_alone_still_means_first_n_in_search_order(self):
+        """No invented sort where the analyst asked for none."""
+        self.assertEqual(self._round_trip("index=main | head 2"),
+                         "index=main | head 2")
 
     def test_head_after_stats_keeps_the_aggregate(self):
-        """The ordering case that motivated the renderer fix, end to end."""
+        """The ordering case that motivated the renderer fix, end to end -- now
+        written the way SPL actually spells it."""
         self.assertEqual(
-            self._round_trip("index=main | stats count by host | head 3 host"),
+            self._round_trip(
+                "index=main | stats count by host | sort host | head 3"),
             "index=main | stats count AS count by host | sort +host | head 3")
 
     def test_a_rename_is_followed_by_a_term_reading_the_new_name(self):

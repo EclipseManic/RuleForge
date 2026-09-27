@@ -185,6 +185,39 @@ def _parse_arrange_args(command: str, args: str, position: int,
                 f"`head {limit}` returns no events, so the rule could never "
                 f"fire. Refused rather than rendered.", dialect)
         index = 1
+        # `head` HAS NO FIELD ARGUMENT, AND EVERY ONE THAT FOLLOWED THE COUNT WAS
+        # BEING REINTERPRETED AS A SORT.
+        #
+        #     | head 5 host   ->   | sort +host | head 5     ok=True, no finding
+        #
+        # Splunk's documented syntax is `head [keeplast] [while "<expr>"]
+        # [<limit>]` -- no field, no sort-order argument, in SPL2 or in the older
+        # `head <count> (<boolean-expression>)` form. The renderer in this same
+        # package quotes that documentation at length, and a test asserted the
+        # OPPOSITE of it, so the file contradicted itself about the same syntax.
+        #
+        # Why the reinterpretation is not a convenience: `head 5 host` and
+        # `| sort host | head 5` return DIFFERENT EVENTS. The first takes the
+        # first five in search order; the second reorders by host first and takes
+        # five of those. A mistyped or mis-remembered argument would produce a
+        # plausible, deployable, differently-behaving rule with nothing said --
+        # which is the one outcome this project refuses everywhere else.
+        #
+        # So the two-stage form is spelled with SORT, which is where it belongs:
+        # `| sort host | head 5`. `| head 5` alone stays valid and means "the
+        # first 5 in search order", which is exactly what Splunk does with it.
+        if index < len(tokens):
+            raise SplParseError(
+                "SPL_HEAD_TAKES_NO_FIELD",
+                f"`head` takes a count and nothing else -- Splunk's syntax is "
+                f"`head [keeplast] [while \"<expr>\"] [<limit>]`, with no field "
+                f"and no sort-order argument. So `head {args}` is not valid SPL, "
+                f"and it is refused rather than read as an ordering: sorting by "
+                f"{tokens[index]} first and then taking {limit} returns "
+                f"DIFFERENT events than the first {limit} in search order. Write "
+                f"the two stages as `| sort {tokens[index]} | head {limit}`.",
+                dialect)
+
 
     order: list[tuple[FieldRef, str]] = []
 
