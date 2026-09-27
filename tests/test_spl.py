@@ -321,7 +321,10 @@ class PipelineCommandLoweringTests(unittest.TestCase):
         ascending, ascending is the default. CITED rather than remembered -- the
         previous version of this file asserted an SPL convention from memory."""
         self.assertEqual(self._round_trip("index=main | sort -count"),
-                         "index=main | sort count desc")
+                         "index=main | sort -count",
+                     "Splunk has NO desc keyword: direction is a sign. `sort count "
+                     "desc` would sort ASCENDING by count, then by a field "
+                     "literally named `desc`.")
 
     def test_head_becomes_sort_then_head(self):
         self.assertEqual(self._round_trip("index=main | head 5 -_time"),

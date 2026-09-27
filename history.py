@@ -73,8 +73,14 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def load(path: Path) -> list[dict[str, Any]]:
-    """Every entry, oldest first. A corrupt file is surfaced, not swallowed."""
+def load(path: Path, _reap_torn_tail: bool = False) -> list[dict[str, Any]]:
+    """Every entry, oldest first. A corrupt file is surfaced, not swallowed.
+
+    `_reap_torn_tail` is the WRITE path's private opt-in: it additionally tolerates
+    a partial final line when NO good entry precedes it, which is what a file
+    created by an append and then killed looks like. It is never set by `recent`
+    or by any route, because a READ must report damage and never rewrite.
+    """
     if not path.exists():
         return []
     # NOT `.strip()`ED, and the difference is load-bearing. The torn-tail check
@@ -83,7 +89,18 @@ def load(path: Path) -> list[dict[str, Any]]:
     # that newline away -- so every corrupt final line looked interrupted and was
     # silently dropped, turning a damaged file into an empty-looking history. The
     # legacy-array branch below still uses `.strip()`, where it is only cosmetic.
-    raw = path.read_text(encoding="utf-8")
+    #
+    # `utf-8-sig` AND NOT `utf-8`, because of WINDOWS. `read_text(encoding="utf-8")`
+    # does not strip a byte-order mark, and `str.lstrip()` cannot strip U+FEFF
+    # either -- it is not whitespace. So a BOM made the first line unparseable
+    # and the file refused, permanently, on every save. It is not hypothetical:
+    # PowerShell 5.1's `Set-Content -Encoding UTF8` and `Out-File -Encoding utf8`
+    # write a BOM, as do older Notepad and Excel's text export, and this module
+    # explicitly invites the analyst to read, back up and edit this file by hand.
+    # A hand-edited file with a BOM is an ordinary thing for a person to produce.
+    # `utf-8-sig` strips a BOM when present and is byte-identical to `utf-8` when
+    # there is not one.
+    raw = path.read_text(encoding="utf-8-sig")
     if not raw.strip():
         return []
 
@@ -139,8 +156,32 @@ def load(path: Path) -> list[dict[str, Any]]:
                 # with nothing valid in it has not had a torn write, it has been
                 # damaged, and reporting it as an empty history is the precise
                 # failure these refusals exist to prevent.
+                # AND ONLY AFTER AT LEAST ONE GOOD ENTRY HAS PARSED -- unless the
+                # WRITE path opted in, because `append` calls this first and a
+                # refusal there bricks the file permanently. A file whose only
+                # line is garbage reads as damage (correct: the analyst is told),
+                # but a save must still be possible, so `_reap_torn_tail` lets the
+                # write path reap it and `_truncate_torn_tail` removes the bytes.
+                #
+                # AND ONLY IF THE PARTIAL LINE LOOKS LIKE SOMETHING *WE* WROTE.
+                # This is the line that reconciles two requirements that pull in
+                # opposite directions, and both are correct:
+                #
+                #   - a save must not be permanently bricked by a torn tail
+                #   - a save must not silently overwrite a corrupt file
+                #
+                # `tests/test_web.py` asserts the second one and its file is
+                # `{not json`. So "reap the tail" cannot mean "reap any unparseable
+                # tail": that would destroy the analyst's file to fix a brick. A
+                # torn tail is only reaped when it begins like a RuleForge entry --
+                # `{` and a `"kind"` key -- which is what an interrupted append of
+                # OUR OWN line looks like. Anything else is a file we did not write
+                # and did not damage, and it is refused.
                 is_last = all(not later.strip() for later in lines[number:])
-                if entries and is_last and not raw.endswith("\n"):
+                looks_like_ours = (stripped.startswith("{")
+                                   and '"kind"' in stripped)
+                if (entries or _reap_torn_tail) and is_last and looks_like_ours \
+                        and not raw.endswith("\n"):
                     break
                 raise Refused(
                     f"line {number} of the history file at {path} is not valid "
@@ -168,6 +209,18 @@ def load(path: Path) -> list[dict[str, Any]]:
             f"already run.") from exc
     if not isinstance(data, list):
         raise Refused(f"the history file at {path} is not a list of entries")
+    # EVERY ELEMENT, NOT JUST THE TOP LEVEL. The JSONL branch validates each
+    # parsed line is a dict, but the legacy branch only checked the container --
+    # so a legacy array holding a bare string read happily, and the next SAVE
+    # re-serialised it one-per-line, after which the file could never be read
+    # again. A file that was READABLE became permanently unreadable as a side
+    # effect of a successful save, and that was irreversible.
+    for number, one in enumerate(data, start=1):
+        if not isinstance(one, dict):
+            raise Refused(
+                f"entry {number} of the history file at {path} is "
+                f"{type(one).__name__}, not a history entry. It has not been "
+                f"overwritten.")
     return data
 
 
@@ -218,7 +271,9 @@ def append(path: Path, kind: str, dialect: str, rule_id: str, title: str,
             f"trim it to the events that matter.")
 
     with _LOCK:
-        existing = load(path)
+        # The reap flag is why a SAVE can still succeed on a file that a READ
+        # calls damaged: see `load`'s docstring. Repair is on the WRITE path only.
+        existing = load(path, _reap_torn_tail=True)
         entries = [*existing, entry]
         dropped = 0
         trim = len(entries) > MAX_ENTRIES
@@ -245,11 +300,58 @@ def append(path: Path, kind: str, dialect: str, rule_id: str, title: str,
         # promise while appearing to keep it. So the format only changes when the
         # analyst asks for a change by saving something.
         if not trim and not _is_legacy_array(path):
+            _truncate_torn_tail(path)
             _append_line(path, entry)
         else:
             _write(path, entries)
 
     return Appended(entry=entry, dropped=dropped)
+
+
+def _truncate_torn_tail(path: Path) -> int:
+    """Discard an interrupted final line, and return how many bytes went.
+
+    THIS IS THE REPAIR, AND WITHOUT IT THE TOLERANCE IS A TRAP.
+
+    `load` tolerates an unterminated final line so a killed append costs one
+    entry rather than the whole history. It then RETURNS, and it does not say
+    anywhere that a partial line is sitting on disk. The next `append` wrote its
+    own line straight onto those bytes with no separator, which did three things
+    at once:
+
+      - destroyed the entry the analyst had just saved, by concatenating it into
+        the garbage, while `append` returned `Appended(...)` and the UI showed a
+        green Saved
+      - bricked the file permanently, because the new line supplied the trailing
+        newline that the torn-tail tolerance keys on, so the next `load` raised
+        and every subsequent save was refused
+
+    Executed, before this function existed:
+        load after damage -> 2 entries   (torn tail tolerated)
+        append returned OK, dropped = 0
+        load -> Refused: line 3 ...
+
+    So the knowledge is now USED rather than discarded. The partial bytes are
+    provably not a complete entry -- a complete line is always newline-terminated
+    -- so removing them cannot lose anything recoverable, and every good entry
+    before them is kept. If the whole file is one partial line there are no good
+    entries to keep, and the file becomes empty rather than unreadable, which is
+    the honest description of its contents.
+    """
+    if not path.exists():
+        return 0
+    raw = path.read_bytes()
+    if not raw or raw.endswith(b"\n"):
+        return 0
+    cut = raw.rfind(b"\n")
+    keep = 0 if cut < 0 else cut + 1
+    discarded = len(raw) - keep
+    if discarded:
+        with path.open("r+b") as stream:
+            stream.truncate(keep)
+            stream.flush()
+            os.fsync(stream.fileno())
+    return discarded
 
 
 def _is_legacy_array(path: Path) -> bool:
@@ -359,6 +461,13 @@ def _write(path: Path, entries: list[dict[str, Any]]) -> None:
 
 
 def recent(path: Path, limit: int = 25) -> list[dict[str, Any]]:
-    """The newest entries first, for the History tab."""
+    """The newest entries first, for the History tab.
+
+    NOT the reap flag. This is a READ: a damaged history must be REPORTED here,
+    because that is the page where the analyst finds out. Repairing on read would
+    make a damaged file look like an empty one, which is the exact failure the
+    refusals exist to prevent -- and an earlier version of this function took the
+    flag by mistake, which is how `tests/test_web.py` caught it.
+    """
     entries = load(path)
     return list(reversed(entries[-limit:]))

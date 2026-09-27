@@ -240,7 +240,7 @@ class ArrangeDirectionTests(unittest.TestCase):
         `head` is invented for it."""
         self.assertEqual(
             self._tail(((FieldRef(name="host"), "desc"),), None, stages=1),
-            "sort host desc")
+                         "sort -host")
 
     def test_a_dotted_field_keeps_its_path(self):
         self.assertEqual(

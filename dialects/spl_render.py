@@ -247,8 +247,30 @@ def render(ir: RuleIR) -> str:
                     stages.append(f"| sort {pairs}")
                 stages.append(f"| head {node.limit}")
             else:
-                pairs = ", ".join(f"{ref.full} {direction}"
-                                  for ref, direction in node.order_by)
+                # SPL HAS NO `asc` / `desc` KEYWORD. DIRECTION IS A SIGN.
+                #
+                # This branch emitted `| sort _time desc`, which Splunk parses as
+                # "sort ascending by `_time`, then by a field literally named
+                # `desc`". The direction was INVERTED and a bogus field added, on
+                # a rule that came back ok=True with no finding:
+                #
+                #     | sort -_time   ->  | sort _time desc
+                #     | sort +host    ->  | sort host asc
+                #
+                # The sign the lowerer computed reached this line and was thrown
+                # away. Root cause: `kql_render.py` has the identical
+                # `f"{ref} {direction}"` shape, and for KQL's `order by` that
+                # IS correct -- the keyword exists there. It was copied into SPL,
+                # where the keyword does not exist.
+                #
+                # The branch ABOVE, twenty lines up, already had this right. Two
+                # branches of one `if` disagreed about the same field's direction,
+                # and `test_sort_descending_uses_the_minus_sign` asserted the wrong
+                # one while its own docstring quoted the minus sign -- so the green
+                # suite was CERTIFYING the defect.
+                pairs = ", ".join(
+                    f"{'-' if direction == 'desc' else '+'}{ref.full}"
+                    for ref, direction in node.order_by)
                 stages.append(f"| sort {pairs}")
             continue
 
@@ -405,6 +427,27 @@ def _chain_from(node_id: str, by_id: dict[str, Any]) -> list[Any]:
 
 
 def _render_subpipeline(nodes: list[Any], by_id: dict[str, Any]) -> str:
+    """Render a join sub-search.
+
+    THE DUPLICATION IS THE ROOT CAUSE, AND IT ALREADY COST TWICE. This function
+    re-implemented the stage rendering that `render()` does, so the two drifted:
+
+      - `Emit` was `continue`d away here, which is EXACTLY the bug fixed in
+        `render()` a moment ago (`if kind == "Emit": continue` reached the node
+        and dropped the dedup). A sub-search silently lost its de-duplication.
+      - `Derive` was rendered as `eval` regardless of `kind`, which is exactly
+        the no-op-widening projection bug the main loop now refuses with
+        `SPL_RENDER_DERIVE_KIND_UNKNOWN`. A `fields` inside brackets became
+        `eval a=a`, changing the rule.
+      - `Arrange` had no arm at all, so `| sort -_time` inside a sub-search hit
+        the refusal below.
+
+    The commit that fixed the `Emit` dedup bug fixed it in `render()` only and
+    said the refused set was "now empty except fillnull" -- which was true of the
+    main loop and false of this one. Kept in step deliberately below, and the
+    arms mirror the main loop; a proper fix is to have both call one stage
+    builder, which is noted here so the next reader does not add a third copy.
+    """
     body: list[str] = []
     for node in nodes:
         kind = type(node).__name__
@@ -415,9 +458,39 @@ def _render_subpipeline(nodes: list[Any], by_id: dict[str, Any]) -> str:
         elif kind == "Aggregate":
             body.append(_render_aggregate(node))
         elif kind == "Derive":
-            body.append("eval " + ", ".join(
-                f"{alias}={render_expr(expr)}" for alias, expr in node.assignments))
+            if getattr(node, "kind", "") == "fields":
+                body.append("fields " + ", ".join(
+                    str(alias) for alias, _ in node.assignments))
+            elif getattr(node, "kind", "") == "rename":
+                body.append("rename " + ", ".join(
+                    f"{alias} AS {render_expr(expr)}"
+                    for alias, expr in node.assignments))
+            elif getattr(node, "kind", "") == "eval":
+                body.append("eval " + ", ".join(
+                    f"{alias}={render_expr(expr)}"
+                    for alias, expr in node.assignments))
+            else:
+                raise Refusal(
+                    "SPL_RENDER_DERIVE_KIND_UNKNOWN",
+                    f"a Derive with kind {getattr(node, 'kind', None)!r} has no "
+                    f"SPL spelling known here. Guessing `eval` would keep a field "
+                    f"the analyst removed, and keeping the opposite would invent "
+                    f"one.", DIALECT)
+        elif kind == "Arrange":
+            # The SAME sign-for-direction rule as the main loop. `sort _time
+            # desc` is not SPL: it sorts ascending by `_time` and then by a field
+            # named `desc`.
+            if node.order_by:
+                pairs = ", ".join(
+                    f"{'-' if d == 'desc' else '+'}{ref.full}"
+                    for ref, d in node.order_by)
+                body.append(f"sort {pairs}")
+            if node.limit is not None:
+                body.append(f"head {node.limit}")
         elif kind == "Emit":
+            if getattr(node, "dedupe_by", ()):
+                body.append("dedup " + ", ".join(
+                    ref.full for ref in node.dedupe_by))
             continue
         else:
             raise Refusal("SPL_RENDER_SUBSEARCH_NODE_UNSUPPORTED",
