@@ -172,13 +172,41 @@ class SpanTests(unittest.TestCase):
             lower("index=main | stats count BY _time")
         self.assertEqual(caught.exception.code, "SPL_TIME_BUCKET_WITHOUT_SPAN")
 
-    def test_grouping_by_time_with_a_span_lowers(self):
-        ir, diagnostics = lower("index=main | stats count BY _time span=1h")
-        aggregate = next(n for n in ir.nodes if isinstance(n, Aggregate))
-        self.assertEqual(aggregate.frame.kind, "tumbling")
-        self.assertEqual(aggregate.frame.size.seconds, 3600)
-        self.assertIn("SPL_TIME_BUCKET_SYNTHESISED",
-                      [d["code"] for d in diagnostics])
+    def test_grouping_by_time_with_a_span_is_refused(self):
+        """`span=` IS A `timechart` ARGUMENT, NOT A `stats` ONE, so this is not
+        valid SPL at all.
+
+        It used to lower, synthesise a `__bucket__` key, and emit an info finding
+        saying the window was "real rather than ignored" -- and then RENDER
+        WITHOUT the window, keeping a bogus `count AS __bucket__` column and
+        returning ok=True. The diagnostic asserted the opposite of what shipped,
+        which is worse than the bug: the artifact contradicted its own finding.
+        """
+        with self.assertRaises(SplParseError) as caught:
+            lower("index=main | stats count BY _time span=1h")
+        self.assertEqual(caught.exception.code, "SPL_STATS_SPAN_NOT_VALID")
+        self.assertIn("timechart", caught.exception.message,
+                      "the message must name the command that DOES bucket time")
+
+    def test_a_span_is_refused_even_without_a_time_key(self):
+        """The refusal is about the syntax, not about the grouping, so it must not
+        depend on `BY _time` being present."""
+        with self.assertRaises(SplParseError) as caught:
+            lower("index=main | stats count BY host span=1h")
+        self.assertEqual(caught.exception.code, "SPL_STATS_SPAN_NOT_VALID")
+
+    def test_the_false_synthesis_diagnostic_can_never_be_emitted(self):
+        """It claimed the window was preserved. There is no longer any code path
+        that produces it, so it cannot reappear in output."""
+        self.assertFalse(
+            hasattr(__import__("dialects.spl_ir", fromlist=["x"]),
+                    "SPL_TIME_BUCKET_SYNTHESISED"))
+        for source in ("index=main | stats count BY _time span=1h",
+                       "index=main | stats count BY _time span=30m host"):
+            with self.subTest(source=source):
+                with self.assertRaises(SplParseError) as caught:
+                    lower(source)
+                self.assertNotIn("SYNTHESISED", caught.exception.code)
 
 
 class OpaqueCommandTests(unittest.TestCase):

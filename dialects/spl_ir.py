@@ -187,6 +187,7 @@ def _parse_arrange_args(command: str, args: str, position: int,
         index = 1
 
     order: list[tuple[FieldRef, str]] = []
+
     while index < len(tokens):
         token = tokens[index]
         direction = "asc"
@@ -194,10 +195,28 @@ def _parse_arrange_args(command: str, args: str, position: int,
             direction, token = "desc", token[1:]
         elif token.startswith("+"):
             token = token[1:]
-        # `sort 0 -field` is a count, not a field: 0 means "no limit".
+        # `sort [<count>] <fields>` -- THE COUNT WAS BEING PARSED AND DISCARDED.
+        #
+        # Splunk's syntax is `sort [<count>] [-|+]<field> [...]`, and the count
+        # limits how many results come back. The digit branch below used to do
+        # `index += 1; continue` -- it walked past the token and never read it --
+        # so:
+        #
+        #     | sort 5 host   ->   Arrange(limit=None)   ->   | sort +host
+        #
+        # Five results requested, every result returned, `ok=True`, no finding.
+        # The comment only ever justified the `0` case ("0 means no limit"), and
+        # generalising it to non-zero counts is where the result set silently
+        # widened. Now it is read, and `0` keeps meaning "no limit" because
+        # Splunk says so.
         if token.isdigit():
+            # `0` IS SPLUNK'S "NO LIMIT", SO IT BECOMES `None` AND NOT A CAP OF
+            # ZERO. A cap of 0 would render as `head 0` and return nothing.
+            if limit is None and int(token) > 0:
+                limit = int(token)
             index += 1
             continue
+
         if not _FIELD_NAME.fullmatch(token):
             raise SplParseError(
                 "SPL_SORT_FIELD_NOT_A_NAME",
@@ -803,24 +822,54 @@ def _lower_aggregate(command: SplCommand, position: int, source: str,
     keys = tuple(_field_ref(k) for k in stats.keys)
 
     # `BY _time span=1h` IS A TIME BUCKET, AND span IS MANDATORY WITH IT. Without
+    # `span=` ON `stats` IS NOT VALID SPL AT ALL, AND ACCEPTING IT PRODUCED A
+    # RENDER THAT DISAGREED WITH THE DIAGNOSTIC BESIDE IT.
+    #
+    # `span` is a `timechart` argument. `stats` does not take one. The lowerer
+    # accepted `| stats count by _time span=1h host`, synthesised a `__bucket__`
+    # key, and emitted an INFO finding saying the window was "real rather than
+    # ignored". Then the renderer dropped `span=`, kept a bogus `count AS
+    # __bucket__` column, and returned ok=True:
+    #
+    #   in : index=main EventCode=4625 | stats count by _time span=1h host
+    #   out: index=main | search EventCode="4625"
+    #        | stats count AS count, count AS __bucket__ by _time, host
+    #
+    # One row per host instead of one row per host per hour, a column that means
+    # nothing, and a diagnostic asserting the opposite of what shipped. The
+    # renderer had no way to say so: `Frame` is in the IR, but there is no SPL
+    # `stats` spelling of a tumbling window to render it into.
+    #
+    # So the refusal is HERE, where the invalid syntax is read, rather than at
+    # render time. `timechart` is the command that buckets time; it also FILLS
+    # gaps with zero, which is not what `stats` does, so translating one into the
+    # other would silently change the report. Naming it is the honest answer.
+    # GATED ON `stats` SO `tstats` STILL GETS ITS OWN, MORE SPECIFIC REFUSAL.
+    # The `tstats` example in the docs carries `span=1h`, and `tstats` is
+    # refused at line 855 for the stronger reason that it reads index-time
+    # fields no sample can reproduce. Letting the span check fire first replaced
+    # that with a message about syntax, which is a worse answer to a worse
+    # question. The most specific true refusal wins.
+    if stats.span and command.name == "stats":
+        raise SplParseError(
+            "SPL_STATS_SPAN_NOT_VALID",
+            f"`span=` is a `timechart` argument, not a `stats` one, so this is "
+            f"not valid SPL. It is refused rather than approximated: the "
+            f"tumbling window it describes has no `stats` spelling, and "
+            f"`timechart` -- which does -- also fills gaps with zero, so "
+            f"translating would quietly change which rows come back. Write the "
+            f"bucketed query as `| timechart span={stats.span} count by ...`, or "
+            f"bucket the time field yourself before the `stats`.",
+            DIALECT)
     # a span every event lands in one bucket, which is a different report.
     if any(k.full == time_field for k in keys):
-        if not stats.span:
-            raise SplParseError(
-                "SPL_TIME_BUCKET_WITHOUT_SPAN",
-                f"the rule groups by {time_field} with no span=. Splunk requires "
-                f"a span when grouping by time, and without one every event "
-                f"collapses into a single bucket -- a different report from the "
-                f"one the author asked for.", DIALECT)
-        measures.append(Measure(name="__bucket__", function="count", field=None))
-        keys = keys + (FieldRef("__bucket__"),)
-        diagnostics.append({
-            "code": "SPL_TIME_BUCKET_SYNTHESISED",
-            "severity": "info",
-            "message": f"BY {time_field} span={stats.span} is a tumbling time "
-                       f"bucket, represented as a synthetic grouping key so the "
-                       f"window is real rather than ignored.",
-        })
+        raise SplParseError(
+            "SPL_TIME_BUCKET_WITHOUT_SPAN",
+            f"the rule groups by {time_field} with no span=. Splunk requires "
+            f"a span when grouping by time, and without one every event "
+            f"collapses into a single bucket -- a different report from the "
+            f"one the author asked for.", DIALECT)
+
 
     if stats.span:
         frame = Frame(kind="tumbling", size=Duration(_span_seconds(stats.span)),
@@ -841,7 +890,32 @@ def _lower_aggregate(command: SplCommand, position: int, source: str,
             f"locally rather than approximated as `stats`. To tune it, run it in "
             f"Splunk and bring the results back.", DIALECT)
 
+    if stats.from_clause:
+        # THE `stats` SPELLING OF THE SAME CONSTRUCT `tstats` IS REFUSED FOR.
+        #
+        #     index=main | stats count FROM my_datamodel
+        #     ->  index=main | stats count AS count          ok=True, findings=[]
+        #
+        # A data model is a saved query, not a table. RuleForge evaluates against
+        # the events it was given, so reading one is not reproducible from a
+        # sample -- which is the whole thesis of this module's docstring, and the
+        # reason `tstats` gets named at line 855. The `stats` spelling of the very
+        # same clause was accepted and dropped, so the rule silently ran against a
+        # different dataset than the analyst wrote.
+        #
+        # `from_clause` used to be read by the parser and then referenced ONLY
+        # inside the `tstats` error message. So the construct was understood well
+        # enough to explain it in one command and not in the other.
+        raise SplParseError(
+            "SPL_STATS_FROM_NOT_LOWERABLE",
+            f"a data model is a saved query, not a table, so `stats ... FROM "
+            f"{stats.from_clause}` cannot be evaluated against the events "
+            f"RuleForge was given -- the rule would run against a different "
+            f"dataset than the one written. Refused by name, the same way "
+            f"`tstats` is. Run it in Splunk, or point the rule at the underlying "
+            f"fields.", DIALECT)
     if stats.where:
+
         raise SplParseError(
             "SPL_STATS_WHERE_NOT_LOWERABLE",
             f"a WHERE clause inside {command.name} filters the aggregated table, "
