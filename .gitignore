@@ -29,15 +29,30 @@ Thumbs.db
 .env.*
 
 # RuleForge history: pasted detection rules and EVENT SAMPLES, which contain
-# hostnames, usernames, source IPs and destination IPs. Filesystem permissions
-# are 0600 and the server never transmits them, but git add -A from a repo
-# with a remote would publish them. This is the one file RuleForge writes.
+# hostnames, usernames, source IPs and destination IPs. The server never
+# transmits them, but git add -A from a repo with a remote would publish them.
+# This is the one file RuleForge writes.
 #
-# THE PATH IS NOW `data/`, NOT `ruleforge/data/`. The package was flattened, so
-# the directory moved up one level -- and an ignore rule that names a directory
-# that no longer exists matches nothing at all. That failure is silent: there is
-# no error, no warning, and `git add -A` simply starts offering the analyst's
-# pasted rules and their machine's hostnames for commit. `git check-ignore` is
-# the only thing that catches it, so it is worth running after any move.
+# THE PERMISSION CLAIM WAS FALSE ON WINDOWS AND IS NOW WRITTEN DOWN. This
+# comment used to say "filesystem permissions are 0600" as though that were
+# simply true everywhere. It is not:
+#
+#   POSIX   0600, set explicitly by `history._write` via `os.chmod` (and by
+#           `mkstemp` before it). The explicit call is there so the guarantee
+#           does not rest on a stdlib implementation detail.
+#   win32   `os.chmod` has ONE bit -- the read-only flag -- and does not model
+#           POSIX permission bits. The file is exactly as readable as the
+#           directory holding it. The real control there is the inherited ACL:
+#           `data/` sits under the analyst's own profile, whose default ACL
+#           grants that user, SYSTEM and Administrators, and not Everyone.
+#
+# That is a weaker and differently-shaped guarantee than 0600. It is still the
+# reason this rule matters, and `git check-ignore -v data/history.json` is the
+# only thing that confirms the rule still matches after any move.
+#
+# The path is `data/`, NOT `ruleforge/data/`. The package was flattened and an
+# ignore rule naming a directory that no longer exists matches NOTHING -- with no
+# error, no warning, while `git add -A` starts offering the analyst's pasted
+# rules and their machine's hostnames for commit.
 data/
 

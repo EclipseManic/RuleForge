@@ -160,6 +160,25 @@ def _write(path: Path, entries: list[dict[str, Any]]) -> None:
     TEMP FILE THEN RENAME. A plain write can be interrupted half way, and a
     truncated history is a lost audit trail. `os.replace` is atomic on the same
     filesystem, so a reader sees either the old file or the new one.
+
+    THE 0600 IS STATED HERE RATHER THAN INHERITED FROM `mkstemp`. `mkstemp`
+    already creates the file 0600 on POSIX, so the `os.chmod` below is a no-op
+    there -- and that is exactly why it is written down. A security property
+    that depends on a stdlib implementation detail nobody has read is not a
+    property, it is a coincidence, and it fails silently if that detail changes.
+    One line makes the intent explicit and testable.
+
+    ON WINDOWS THIS DOES NOT RESTRICT ANYBODY, AND THE COMMENT USED TO SAY IT
+    DID. `os.chmod` on Windows has one bit -- the read-only flag -- and does not
+    model POSIX permission bits at all. So on win32 the history file is as
+    readable as the directory it sits in, and the actual control there is the
+    inherited ACL: `data/` lives under the analyst's own profile, whose default
+    ACL grants that user, SYSTEM and Administrators, and not Everyone.
+
+    That is a weaker and differently-shaped guarantee than 0600, and saying
+    "0600" on Windows was simply false. The honest statement is in `.gitignore`
+    next to the ignore rule, because that is where someone reads about it
+    before running `git add -A`.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     handle, temporary = tempfile.mkstemp(dir=str(path.parent),
@@ -169,6 +188,14 @@ def _write(path: Path, entries: list[dict[str, Any]]) -> None:
             json.dump(entries, stream, ensure_ascii=False, indent=2)
             stream.flush()
             os.fsync(stream.fileno())
+        # Explicit, and deliberately tolerant of failure. On POSIX this asserts
+        # what mkstemp already did; on Windows it is a no-op that must not raise,
+        # because refusing to write the history over a permission call that the
+        # platform does not support would lose the audit trail to a non-problem.
+        try:
+            os.chmod(temporary, 0o600)
+        except (OSError, NotImplementedError):
+            pass
         os.replace(temporary, path)
     except BaseException:
         # Never leave a temp file behind on failure.

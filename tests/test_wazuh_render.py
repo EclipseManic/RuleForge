@@ -12,6 +12,7 @@ refuse by name when it cannot.
 """
 from __future__ import annotations
 
+import pathlib
 import unittest
 import xml.etree.ElementTree as ET
 
@@ -457,6 +458,121 @@ class HonestRefusalTests(unittest.TestCase):
         with self.assertRaises(Refusal):
             _field_elements(Call(function="coalesce",
                                  args=(FieldExpr(ref=FieldRef("a")),)), "a")
+
+
+class AllowlistNamesMustExistTests(unittest.TestCase):
+    """`SetRule` sat in two skip-tuples in `wazuh_render.py` and no such class
+    exists in `engine/ir.py`.
+
+    Those tuples are safety controls: a name in them is a node the renderer
+    SKIPS instead of refusing. So a name that does not correspond to a real class
+    is not harmless dead text -- it is a hole with a class-shaped name in it. The
+    day someone writes a `SetRule`, the renderer would skip it silently and the
+    node would vanish from the artifact with no diagnostic, which is the exact
+    failure this file's other tests exist to prevent.
+
+    Checking the names against `ir.py` catches the whole class rather than this
+    one instance, and it fails the moment a tuple and the IR vocabulary drift
+    apart in either direction.
+    """
+
+    #: Tuples in `wazuh_render.py` whose entries are node-type names.
+    SKIP_TUPLES = (
+        ("Read", "Emit"),
+    )
+
+    def test_every_skipped_node_name_is_a_real_class(self):
+        import engine.ir as ir
+        for name in dict.fromkeys(n for t in self.SKIP_TUPLES for n in t):
+            with self.subTest(name=name):
+                self.assertTrue(
+                    hasattr(ir, name),
+                    f"{name!r} is skipped by the Wazuh renderer but "
+                    f"engine/ir.py defines no such class, so the skip is a hole")
+
+    def test_no_setrule_class_exists(self):
+        """The specific finding, stated so its removal is recorded rather than
+        just absent."""
+        import engine.ir as ir
+        self.assertFalse(hasattr(ir, "SetRule"))
+
+    def test_the_source_no_longer_names_setrule_in_code(self):
+        """Checked through the AST, not through the file text.
+
+        The first version of this test did `assertNotIn("SetRule", source)` and
+        failed immediately -- on the COMMENT I had just written explaining that
+        `SetRule` had been removed. A text search cannot tell a live reference
+        from a note about one, so it can only ever fail for the wrong reason.
+
+        `ast` has no comment nodes at all, so walking it for string constants
+        finds the skip-tuples and nothing else. That is the actual claim: no
+        STRING LITERAL in this module names a class that does not exist.
+        """
+        import ast
+
+        import dialects.wazuh_render as mod
+        tree = ast.parse(pathlib.Path(mod.__file__).read_text(encoding="utf-8"))
+        offenders = [
+            node.value for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value == "SetRule"
+        ]
+        self.assertEqual(
+            offenders, [],
+            "SetRule is back in a wazuh_render.py string literal and "
+            "engine/ir.py has no such class, so it is a hole in a check whose "
+            "job is to refuse")
+
+
+class EventCapTests(unittest.TestCase):
+    """`MAX_EVENTS` and `_cap_events` existed and correctly refused 100,000
+    rows -- and `debug_logs_to_rule` returned `ok=True` for the same input,
+    because the cap was reached from `tune` and from the three `load_events`
+    helpers and not from here.
+
+    Measured before the fix: `debug_logs_to_rule(dialect, 100_000 rows)` gave
+    `ok=True` with findings, while `_cap_events` on that list raised
+    `TOO_MANY_EVENTS`. The cap was real, documented, and on the wrong side of a
+    function boundary.
+    """
+
+    def test_a_hundred_thousand_rows_is_refused(self):
+        from engine.values import Refusal
+        from jobs import debug_logs_to_rule
+        rows = [{"EventCode": 4624, "host": f"h{i}"} for i in range(100_000)]
+        with self.assertRaises(Refusal) as caught:
+            debug_logs_to_rule("wazuh", rows)
+        self.assertEqual(caught.exception.code, "TOO_MANY_EVENTS")
+
+    def test_the_cap_is_the_same_one_tune_uses(self):
+        """One number, not two. If these ever diverge then the tool is refusing
+        different sizes in different places, which is the 'limit on one entrance'
+        defect from round 3."""
+        from jobs import MAX_EVENTS, _cap_events
+        from engine.values import Refusal
+        from jobs import debug_logs_to_rule
+        over = [{"a": 1}] * (MAX_EVENTS + 1)
+        with self.assertRaises(Refusal) as from_cap:
+            _cap_events(over)
+        with self.assertRaises(Refusal) as from_job:
+            debug_logs_to_rule("wazuh", over)
+        self.assertEqual(from_cap.exception.code, from_job.exception.code)
+
+    def test_ordinary_input_still_works(self):
+        from jobs import debug_logs_to_rule
+        out = debug_logs_to_rule("wazuh", [{"EventCode": 4624, "host": "a"},
+                                           {"EventCode": 4625, "host": "b"}])
+        self.assertTrue(out.ok)
+        self.assertTrue(out.findings)
+
+    def test_empty_input_still_gets_its_own_message(self):
+        """The cap runs BEFORE the empty check, so this proves the reordering did
+        not swallow the more specific refusal."""
+        from jobs import debug_logs_to_rule
+        out = debug_logs_to_rule("wazuh", [])
+        self.assertFalse(out.ok)
+        self.assertEqual(out.findings[0].code, "DEBUG_NO_EVENTS")
 
 
 if __name__ == "__main__":

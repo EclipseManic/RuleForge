@@ -167,7 +167,7 @@ def render(ir: RuleIR) -> str:
 
     # INVERT THE DEFAULT. This function used to pick out the Filter, Package,
     # Derive and Aggregate nodes it knew about and say nothing about the rest, so
-    # a SetOp, Join, Pattern, Expand, Arrange, SetRule or a second Derive
+    # a SetOp, Join, Pattern, Expand, Arrange or a second Derive
     # VANISHED and every surviving Filter was joined together -- a union rendered
     # as an intersection. Latent for the Wazuh lowerer, which only emits Read,
     # Filter, Package and Emit, but `render_wazuh` is public and the IR is the
@@ -248,7 +248,18 @@ def render(ir: RuleIR) -> str:
     for node in ir.nodes:
         if isinstance(node, (Filter, Package, Derive, Aggregate)):
             continue
-        if type(node).__name__ in ("Read", "Emit", "SetRule"):
+        if type(node).__name__ in ("Read", "Emit"):
+            # `SetRule` WAS IN THIS TUPLE AND NO SUCH CLASS EXISTS. `engine/ir.py`
+            # has no `SetRule`, so the string named a node that cannot be built
+            # -- and it was naming it in a check whose whole job is to REFUSE
+            # nodes it cannot render. A name in that tuple is a hole: the day
+            # someone adds a `SetRule`, this would skip it silently instead of
+            # refusing it, and the node would vanish from the artifact with no
+            # diagnostic. Fail-closed is the whole point, so the entry is gone
+            # rather than left as a placeholder for a class nobody has written.
+            #
+            # `Read` and `Emit` stay because both are real: they are the graph's
+            # source and its output, neither of which a `<rule>` writes.
             continue
         raise Refusal(
             "WAZUH_NODE_NOT_RENDERABLE",
@@ -377,7 +388,7 @@ def _render_correlation(ir: RuleIR, package: Package, rule_id: str,
     # is this node the correlation, or something else that will not be written?
     orphans = [n for n in ir.nodes
                if n is not package
-               and type(n).__name__ not in ("Read", "Emit", "SetRule")]
+               and type(n).__name__ not in ("Read", "Emit")]
     if orphans:
         kinds = ", ".join(sorted({type(n).__name__ for n in orphans}))
         raise Refusal(

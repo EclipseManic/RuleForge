@@ -547,7 +547,23 @@ def debug_logs_to_rule(dialect: str, events: list[dict[str, Any]],
     successful ones are the same shape; the difference is what you were watching
     for. So this reports the FIELD VALUES that separate the rows from each other
     and states plainly that it does not know which separation you meant.
+
+    THE EVENT CAP IS APPLIED HERE, NOT ONLY IN `tune`. `MAX_EVENTS` and
+    `_cap_events` already existed and already refused 100,000 rows -- but they
+    were reached from `tune` and from the three `load_events` helpers, so a
+    DIRECT CALL to this function skipped them entirely. Measured before this
+    line existed: `debug_logs_to_rule` with 100,000 rows returned `ok=True`
+    with findings, while `_cap_events` on the same list refused. So the cap was
+    real, documented, and on the wrong side of a function boundary.
+
+    It is the FIRST statement, before the empty check, because a cap that sits
+    below an early return is a cap that does not run for the inputs that early
+    return catches -- and a future early return added above it would silently
+    reopen the hole. `_cap_events([])` passes an empty list through, so putting
+    it first costs nothing.
     """
+    events = _cap_events(events)
+
     findings: list[Finding] = []
     if not events:
         return Outcome(ok=False, findings=[Finding(
