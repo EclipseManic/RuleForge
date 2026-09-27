@@ -119,14 +119,40 @@ class WindowScopeIsYaralAndIsTheDefault(unittest.TestCase):
         self.assertTrue(_matched("window", _rows(("A", 0), ("B", 10))))
 
     def test_the_default_is_window(self):
-        """So every existing YARA-L rule is unaffected without anyone having to
-        say so, and a new node cannot silently pick the EQL rule."""
+        """So a new node cannot silently pick the EQL rule."""
         default = Pattern(id="p", input="r", stages=(A, B), within=Duration(600),
                           time_field="ts", until=C)
         self.assertEqual(default.until_scope, "window")
         self.assertFalse(
             _matched("window", _rows(("A", 0), ("B", 10), ("C", 20))),
             "the default and the explicit window scope must agree")
+
+    def test_nothing_in_the_dialects_sets_until_at_all(self):
+        """WHY the default is not a safety guarantee, stated as a fact that can
+        stop being true.
+
+        The field's comment used to claim the default "preserves every existing
+        YARA-L rule" and that changing it "would silently re-break the YARA-L bug
+        this node's until was written to fix". Both were vacuous: no lowerer sets
+        `until`, so `until` is unreachable from analyst text and no rule depends
+        on either scope. A comment that says "nothing depends on this" while
+        implying "everything does" is worse than no comment, so the fact is
+        asserted here instead -- and this test FAILS when a dialect starts
+        lowering `until`, which is the moment the default actually starts
+        mattering and someone has to think about it.
+        """
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parent.parent
+        offenders = []
+        for path in sorted(root.glob("dialects/*.py")):
+            if "until=" in path.read_text(encoding="utf-8"):
+                offenders.append(path.name)
+        self.assertEqual(offenders, [],
+                         f"{offenders} now lower `until`. The default scope is "
+                         f"no longer a free choice -- check whether 'window' is "
+                         f"right for each of them, and update this test and the "
+                         f"until_scope comment together.")
 
 
 class TheTwoScopesReallyDiffer(unittest.TestCase):

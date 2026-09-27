@@ -313,25 +313,77 @@ found by a dialect, not by a review — a review had not caught them.**
 
 ## 9. Next tasks, in order
 
-**Everything previously listed here is DONE** and the list was not updated. The
-real remaining work, in order:
+**Verified state: 680 passed, 4 skipped, 3 warnings, ruff clean, at `9c71e32`.**
 
-1. **Elastic EQL** — the largest remaining gap, and the hardest. EQL is *stateful
-   and sequential* (`sequence by host with maxspan=5m`, `sample`, transitions,
-   join events), which does **not** fit the flat relational vocabulary in
-   `engine/ir.py`. Lowering sequences into a flat filter graph would be exactly
-   the class of quiet-wrongness this project spent its whole history removing.
-   **Read the real EQL grammar first**; do not lower against a guessed one.
-2. **Falcon CQL** — smaller, same category of new work.
-3. **Sigma** — **not a target.** It is validation *material*: the public
-   repositories the user listed (SigmaHQ/sigma, ThreatClaw detection-rules-samples,
-   `Hatchepsoute/sigma-rules`, Sigma Rules Hub) are a corpus to test the existing
-   dialects against, not a sixth dialect to implement. `requirements.txt` still
-   pins `pysigma` and five backends that **nothing imports** — either use them to
-   read the corpus or drop the pins; do not leave them implying a feature that is
-   not there.
-4. `python-reviewer` **and** `security-reviewer` over anything landing from 1–3,
-   before its commit.
+Nine independent review rounds have now run. **Every one found real defects
+while the suite was green.** Treat the suite as necessary, never sufficient, and
+assume a fresh eye is cheaper than the next round's findings.
+
+### Open, from round 9, in severity order
+
+1. **`where` is fixed; these are not.** All below are `ok=True` with an empty
+   findings list unless stated.
+   - **`eventstats` renders as `stats`, command name discarded.** In Splunk
+     `eventstats` keeps one row per input event with stat columns appended;
+     `stats` collapses to one row per group. Different results. No test exists
+     for `eventstats` at all.
+   - **The `span=` refusal is gated `command.name == "stats"`**, so `eventstats`
+     and `tstats` skip it, and `_render_aggregate` never reads `node.frame` at
+     all (`git grep frame dialects/spl_render.py` -> zero matches). So
+     `eventstats count by ts span=1h host` renders with the hour-long bucket gone
+     — the same defect the `span` refusal was added for, on a sibling command.
+   - **The `_time`-without-`span` check has no `not stats.span` guard**, so
+     `tstats count by _time span=1h` is told it has no span when it does, and
+     **never reaches `TSTATS_NOT_EXECUTABLE_LOCALLY`** — contradicting the
+     comment above the span check, which says the most specific refusal wins.
+2. **`_expression_depth` has no `Not` arm**, so `MAX_EXPRESSION_DEPTH` never
+   applies to `Not`. `Not x2000` escapes `validate_graph` as a `RecursionError`,
+   and `jobs.py:424` turns it into `INPUT_TOO_DEEP` / "the pasted events are
+   nested too deeply" when no events were pasted at all. A `BoolOp` chain 101
+   deep *is* refused, so the hole is `Not` specifically.
+3. **The ReDoS walk's `name` arm is a hard dead end** — it walks `pattern`,
+   `left`, `right` and `return`s, so `SourceSelector.binding` and `.kind` are
+   never visited. Not a live hole today (`binding` is a datamodel name by
+   contract) and exactly the failure mode the round-8 comment says cannot recur.
+4. **The anti-drift test is weaker than its own docstring claims.** It covers
+   container TYPES via a hardcoded 16-name slot list, so it cannot catch a depth
+   cutoff (which is how round 9's C2 slipped through a test written to prove
+   totality) and it already misses `Package`, which holds regexes in two slots.
+   A new node named under any other field is silently uncovered.
+5. **The selector-hoist latch opens when the first filter has no selector**, so a
+   *later* filter's selectors get hoisted to search time, and an explicit
+   mid-pipeline `| where host="h"` is relocated because `host` is a selector
+   field. Semantically safe in the cases found (intersection is idempotent) but
+   the guard's comment is false, and **deleting the latch leaves 121 tests
+   green** — it is untested.
+6. **An undecidable timestamp mid-window is treated as "inside the window."**
+   `within=600`, stages A->B: B with no timestamp MATCHES, while A with no
+   timestamp is refused with `PATTERN_UNDECIDABLE_TIME`. The same undecidability
+   is fatal at one end of the window and free at the other, and an
+   un-timestamped `until` event cannot veto at all. A "within 10 minutes" rule
+   fires on a pair whose elapsed time cannot be established.
+7. **`SplStats.prestats` is parsed and dropped** — `stats prestats=t count by
+   host` renders identically to `stats count by host`. `SplCommand.bare_search`
+   is declared with a docstring and **never assigned anywhere**.
+8. **Low:** `mutation_check.py` has 1 of 15 mutations targeting the pre-refactor
+   `until` veto string; the harness honestly counts it as a failure but nothing
+   in pytest sees it. `| stats COUNT(x) as c` gets "'count' reads no field" for
+   an input that names field `x`. `_render_subpipeline` renders `rename`
+   backwards (dead path — `spl_ir.lower` has no `join` command).
+
+### Still the biggest functional gap
+
+**Elastic EQL**, then **Falcon CQL.** The IR is ready: `Pattern` has `stages`,
+`within`, `key`, `ordered`, `time_field`, and `until` with `until_scope` whose
+"between" mode implements EQL's rule (verified against Elastic's own worked
+example). Genuinely missing for EQL: `with runs=N`, the `!` missing-event clause
+with its mandatory `maxspan`, and per-step `by` (`key` is global today — do not
+fake it). See `docs/eql-design.md` for the construct-by-construct mapping.
+
+**Sigma is not a target.** It is an interchange format with no execution
+semantics and its value here is as a test corpus. `requirements.txt` still pins
+`pysigma` and five backends that nothing imports — use them to read the corpus
+or drop the pins, but do not leave them implying a feature.
 
 ---
 
@@ -432,12 +484,35 @@ defects were fixed and each fix is pinned by a test that fails without it:
 | history O(N^2), ~1 TB of writes at the caps | JSONL: 1.02 GB, 1000x less |
 | `.gitignore` claims 0600 on Windows | corrected; the real control is the ACL |
 
-**The recurring lesson, now with four instances of it:** a renderer carrying
-code for a shape it could not receive, silently discarding the part that
-mattered. Wazuh `negate=`, SPL `regex`, SPL `dedup` (`if kind == "Emit":
-continue` reached the node and dropped the dedup), and the Wazuh integer
-grammar. All four looked like working code. Grep for `continue` and for
-unreachable `if` branches before trusting any renderer branch.
+**The recurring lesson, now with SIX instances of it:** a guard that silently
+stops guarding. Wazuh `negate=`, SPL `regex`, SPL `dedup` (`if kind == "Emit":
+continue` reached the node and dropped the dedup), the Wazuh integer grammar,
+the ReDoS walk missing `BoolOp` and then `Not`, and the ReDoS walk's depth
+cutoff. All looked like working code. Grep for `continue`, for unreachable `if`
+branches, and for early `return`s inside walkers before trusting any of them.
+
+**The depth cutoff is the most instructive, because a test written to prevent
+exactly this was blind to it.** `test_a_new_container_type_must_be_screened`
+inspects container *types*; a depth cutoff is not a type. So "the walk must
+reach every node" was certified by the test written to check totality, and was
+false past 32 levels while `MAX_EXPRESSION_DEPTH` was 100. **A guard needs a
+test that fails if the guard is removed, and a test that reasons about the same
+axis the guard fails on.** That test is weaker than its docstring claims and is
+open work above.
+
+- **A false comment is worse than a missing one.** Four here, three written by me
+  and one committed and pushed before anyone checked:
+    - `docs/eql-design.md` said the IR had no node for ordered event series. It
+      had `Pattern` all along, with `stages`, `within`, `key` and `until`. I had
+      read the IR's class *list* instead of its *fields*.
+    - `until_scope`'s comment said the default "preserves every existing YARA-L
+      rule" and that changing it "would silently re-break the YARA-L bug". Both
+      vacuous: `git grep "until="` finds no lowerer that sets it, so no rule
+      depends on either scope. It is now asserted as a fact by a test that FAILS
+      when a dialect starts lowering `until`.
+    - `test_sort_descending_uses_the_minus_sign` asserted `sort count desc` while
+      its own docstring quoted the minus sign. The suite certified the bug.
+    - A 26-line comment explained a diagnostic inside an `elif` that cannot run.
 
 - **The last independent review was round 7**, and it predates every fix above.
   Every review round in this project's history found real criticals while the

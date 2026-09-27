@@ -893,13 +893,24 @@ class Pattern:
     #:
     #:   "window"   -- the whole window, from the first event of the candidate to
     #:                the end. An `until` ANYWHERE in there vetoes the match, even
-    #:                after the last stage matched. This is what YARA-L wants: "a
-    #:                credential access followed by no logout within 10 minutes"
-    #:                is violated by a logout at ANY point in those 10 minutes,
-    #:                including one after the logon. It is also the historical
-    #:                behaviour here, so it is the DEFAULT and changing it would
-    #:                silently re-break the YARA-L bug this node's `until` was
-    #:                written to fix.
+    #:                after the last stage matched. This is what a YARA-L rule for
+    #:                "a credential access followed by no logout within 10 minutes"
+    #:                means: a logout at ANY point in those 10 minutes violates it,
+    #:                including one after the logon. It is the DEFAULT because it is
+    #:                the behaviour that was here first.
+    #:
+    #:   A CORRECTION TO WHAT THIS COMMENT PREVIOUSLY CLAIMED. It said the default
+    #:   "preserves every existing YARA-L rule" and that changing it "would
+    #:   silently re-break the YARA-L bug this node's `until` was written to
+    #:   fix". Both were VACUOUS: `git grep "until="` finds NO lowerer that sets it
+    #:   -- not yaral_ir.py, not any dialect. `until` is unreachable from analyst
+    #:   text today; only tests construct it, by hand. So no rule depends on either
+    #:   scope, and the safety argument above was decoration on a default.
+    #:
+    #:   It matters because the field is now reachable in practice: EQL uses it,
+    #:   and EQL wants "between". Anyone wiring `until` into a YARA-L lowerer must
+    #:   check whether the default is the right answer for THAT rule, because
+    #:   nothing has pinned it from the outside yet.
     #:
     #:   "between"  -- only events BETWEEN the first and last matched stages
     #:                veto. An `until` occurring AFTER the sequence completed
