@@ -8,7 +8,9 @@ exact mistake the Wazuh work made twice: a fixture I wrote is correct by
 construction, so it proves nothing about the parser.
 
 So the search below is the reference SPL from this project's own
-`docs/advanced-rule-corpus.md`, and it is labelled as such. It is still a real
+`docs/advanced-rule-corpus.md`, which the old tool owned and which no longer
+exists; the search below is inlined here for that reason and is labelled as such.
+It is still a real
 search -- it uses Splunk's documented syntax -- and the tstats cases come
 verbatim from Splunk's official SearchReference, which is where the constraints
 that actually shape this lowering are written down.

@@ -1,69 +1,89 @@
-# RuleForge — Multi-SIEM Rule Generator
+# RuleForge
 
-RuleForge creates review-ready detection-rule starting points in Sigma YAML and native query languages for Splunk Enterprise Security (SPL), Microsoft Sentinel (KQL), Elastic Security (EQL), IBM QRadar (AQL), Google SecOps (YARA-L 2.0), CrowdStrike Falcon LogScale (CQL), and Wazuh (Ruleset XML).
+Paste a detection rule, find out what it actually does, and see whether the
+engine you'd deploy it to would agree with you.
 
-## Workbench capabilities
+Five SIEM dialects: **QRadar AQL**, **Splunk SPL**, **Microsoft Sentinel KQL**,
+**Wazuh Ruleset XML**, and **Google SecOps YARA-L 2.0**.
 
-- Native-field mappings for common canonical fields such as `process.command_line`, `user.name`, `host.name`, and source/destination IPs.
-- Sigma as a vendor-neutral detection layer with metadata, logsource, detection selections, conditions, filters, tags, and false-positive context.
-- Explicit import fidelity (`exact`, `partial`, or `unsupported`) and compile contracts so a normalized draft is never presented as an equivalent native rule.
-- Structured preservation of event sequences, joins, aggregations, lookups, native sections, and Wazuh XML correlation metadata.
-- Quality gates that flag broad data sources, unmapped custom fields, and potential single-event noise before a rule is saved.
-- A persistent local SQLite history of every generated and analyzed rule.
-- Reproducible JSON rule packages containing the rule definition, quality-gate findings, mappings, and every rendered SIEM artifact.
+## Run it
 
-This is a local detection-engineering workbench. It intentionally does **not** connect to SIEMs or deploy changes. A true multi-user enterprise deployment still requires SSO/RBAC, an audited managed database, a secrets manager, CI validation against vendor APIs, and approved deployment pipelines.
-
-## Run locally
-
-```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
+```
 pip install -r requirements.txt
-python run.py
+python ruleforge\run.py
 ```
 
-Then visit `http://127.0.0.1:5000`.
+That opens the tool in your browser. No arguments, no environment variables, no
+configuration. If port 5001 is busy it takes the next free one and tells you
+which.
 
-## Important usage note
+## What it is for
 
-The tool produces normalized-field templates, not production-approved rules. Map fields to your telemetry schema, confirm required log sources and event IDs, test with representative data, tune allowlists, and follow your organization’s change-control process before enabling an alert.
+You have a rule — yours, or one from a vendor, or one an LLM wrote — and you
+want to know three things before you deploy it:
 
-## Verification status — read this before trusting an output
+1. **What does it match?** Paste a handful of events, see exactly which ones
+   the rule selects, and get a reason for every row it rejected.
+2. **Does this dialect's engine agree with the author?** Several rules are
+   written in a *different* dialect than the one you will deploy them to. The
+   tool lowers them into a common model and refuses the round trip when the two
+   genuinely disagree, rather than producing something that looks like your rule.
+3. **What did the tool refuse, and why?** It is built to say "I cannot honestly
+   represent this" far more often than a normal tool would. Every refusal names
+   the construct and the reason.
 
-Be precise about what "validated" means here, because the difference matters when a rule silently never fires.
+### The part that matters most
 
-**What is actually verified**
+`ABSENT`, `NULL` and `""` are three different things, and this tool keeps them
+different. A great deal of real-world detection breakage is a rule quietly
+treating a missing field as an empty string. Here, a condition that cannot be
+decided is `UNDECIDABLE` — never silently `False`.
 
-- Generated SPL, KQL, EQL, AQL, CQL, YARA-L, Wazuh XML, and Sigma are passed through structural parsers that check clause order, delimiters, balanced expressions, and required sections. A `validated: structure-parsed` tag means that check passed.
-- When `pySigma` and a matching backend package are installed, genuine Sigma YAML is converted by the **vendor-authored backend** and tagged authoritative.
-- A cross-product render sweep compiles every catalogued pattern against every target.
+The corollary is that **an empty answer is not a safe answer.** When a rule
+cannot be executed faithfully, the tool refuses. It will not hand you a rule
+that matches every event while telling you it worked.
 
-**What is NOT verified**
+## Layout
 
-- **No live SIEM.** No rule here has been executed against a running Splunk, Sentinel, Elastic, QRadar, SecOps, Falcon, or Wazuh instance. A structural parse cannot tell you that a column exists, that a table is joined, or that your data source name is right.
-- **Wazuh and QRadar field names are inferred.** Neither publishes a fixed field schema, so those mappings are conventions, not verified columns. They are labelled `inferred` in the UI for this reason.
-- **Advanced constructs are mostly not portable.** EQL is the only supported target with a native sequence operator. For `sequence`, `join`, `aggregation`, and `absence`, the other targets receive a labelled `partial` projection or an explicit "rebuild this by hand" note. Treat a `partial` output as a drafting aid, not an equivalent rule.
-- **A pass in CI is not a live-engine result.** The test suite proves internal consistency and grammar conformance. It cannot prove a rule fires in your environment.
+```
+ruleforge/
+  run.py            the launcher — this is what you run
+  engine/           the dialect-neutral rule model and evaluator
+    ir.py           typed nodes; three-valued values
+    evaluate.py     expression evaluation, field resolution
+    run.py          graph execution, windows, joins, packages
+    regex.py        regex dialects; only what can honestly be executed
+    redos.py        catastrophic-backtracking analysis
+    validate.py     graph validation, and the deploy-path regex screen
+  dialects/         parse -> lower -> render, one package per vendor
+  jobs.py           the five jobs the UI calls
+  history.py        append-only local history
+  web.py            Flask routes
+  tests/            the suite
+```
 
-Field translations are drawn from published schemas where they exist. See [Mappings and their sources](docs/readiness-assessment.md) for per-target provenance.
+## Boundaries
 
-## References used for the design
+- **Local only.** It binds `127.0.0.1`. There is no login, and pasted rules and
+  event samples are stored on disk, so it is not exposed to your network.
+- **No AI, no cloud, no field mapping, no SIEM credentials.** It never sends
+  anything anywhere.
+- **Where it cannot run a pattern faithfully, it refuses rather than
+  approximating.** YARA-L is PCRE and this engine is not, so a local run of a
+  YARA-L regex says so instead of guessing with Python's `re`. Splunk `tstats`
+  reads index-time fields and is likewise refused locally. Both still parse,
+  lower, and render correctly.
+- **History is local, append-only, and has no delete path.** That is deliberate
+  — an audit trail you can quietly edit is not an audit trail.
 
-- [Splunk correlation search overview](https://help.splunk.com/en/splunk-enterprise-security-7/administer/7.3/correlation-searches/correlation-search-overview-for-splunk-enterprise-security) — SPL searches can aggregate data and drive adaptive response actions.
-- [Microsoft Sentinel scheduled analytics rules](https://learn.microsoft.com/en-us/azure/sentinel/scheduled-rules-overview) and [rule-as-code schema](https://learn.microsoft.com/en-us/azure/sentinel/sentinel-analytic-rules-creation) — KQL queries, lookback periods, thresholds, and MITRE mappings inform the Sentinel template.
-- [Elastic EQL rules](https://www.elastic.co/docs/solutions/security/detect-and-alert/eql) — event categories and ordered correlation; threshold rules are deliberately identified for aggregation use cases.
-- [IBM QRadar AQL examples](https://www.ibm.com/docs/en/qradar-on-cloud?topic=searches-advanced-search-options) — AQL `SELECT`, `WHERE`, and `GROUP BY` structure.
-- [Google SecOps YARA-L 2.0 introduction](https://docs.cloud.google.com/chronicle/docs/yara-l/getting-started) — required rule sections, UDM, grouping, and outcomes.
-- [Wazuh custom rules](https://documentation.wazuh.com/current/user-manual/ruleset/rules/custom.html) and [Ruleset XML syntax](https://documentation.wazuh.com/current/user-manual/ruleset/ruleset-xml-syntax/rules.html) — custom ID range, XML rule elements, frequency/timeframe correlation, groups, and MITRE mappings.
-- [Sigma rule specification](https://sigmahq.io/docs/basics/rules.html) and [pySigma](https://github.com/SigmaHQ/pySigma) — vendor-neutral metadata, logsource, detection selections, conditions, filters, pipelines, and separate backend conversion.
+## Tests
 
-SIEM dialects, parsers, and data models vary by product version. Generated queries are intentionally transparent, editable starting points.
+```
+python -m pytest ruleforge\tests -q
+ruff check ruleforge
+python ruleforge\mutation_check.py
+```
 
-### Wazuh deployment workflow
-
-The Wazuh output is a local custom-rule template. Choose an unused ID between `100000` and `120000`, map its `<field>` name to the field emitted by your installed decoder, and add an optional parent rule ID only when you are extending a confirmed existing rule. Save the reviewed XML under `/var/ossec/etc/rules/`, test it with `wazuh-logtest`, and restart the Wazuh manager only after it passes.
-
-Wazuh caps `frequency` at 9999 matches and `timeframe` at 99999 seconds. If a request exceeds either, RuleForge refuses the Wazuh target by itself and says why, rather than emitting a rule the manager would reject. Your other selected targets are still produced. Neither attribute appears at all when you turn the count off, so a long window on its own does not limit Wazuh.
-
-The window is a query lookback and, with a count, the window the count is measured over. It is not a schedule: a rule with no count fires on every matching event as soon as it is ingested.
+The mutation harness exists because a green suite in this project has repeatedly
+meant nothing on its own: a control can be in the code, exercised by its own
+tests, and still not be on the path the product actually uses.
