@@ -58,55 +58,109 @@ wildcard-match operator `:`, `like` (`*` and `?` globs), `in (...)`, and
 `stringContains`, `startsWith`, and so on. `[ network where true ]` is a legal
 bare item, i.e. "any event of this category".
 
-## Why this does not fit the current IR
+## The IR ALREADY HAS THE NODE. An earlier version of this file said it did not.
 
-`engine/ir.py` is a flat relational vocabulary: `Read`, `Filter`, `Derive`,
-`Aggregate`, `Arrange`, `SetOp`, `Join`, `Expand`, `Pattern`, `Emit`. It has
-`Frame`, `Duration` and `TimeRef`, which is enough for a windowed aggregate, but
-there is **no node that matches an ordered series of steps against a stream**.
+The first draft of this document claimed the vocabulary could not express an
+ordered series of steps, and recommended refusing `sequence` until a
+`Sequence`/`SequenceMachine` node existed. **That was wrong, and it was checked
+by reading the IR rather than by reading it.** `engine/ir.py` has had
+`class Pattern` all along, and `engine/nodes.py` has an evaluator for it:
 
-A `sequence` is a state machine over event time. It needs, at minimum:
-
-- ordered steps, each with its own condition **and its own join keys**
-- partial-match state carried between events, keyed by the join values
-- an expiry (`maxspan` measured from the *first* event, `until`, and the
-  "expires only if `until` falls between matching events" rule)
-- `runs=<n>` as a repeat count
-- `!` as a negative step, which is only legal under a mandatory `maxspan`
-
-Fitting that into `Filter` + `Join` would be a plausible-looking lowering that
-silently means something else — which is precisely the failure class this project
-has spent its history removing. **So `sequence` and `sample` must be refused by
-name until the IR has a real node for them**, not approximated.
-
-The independent IR design review reached the same conclusion independently and
-proposed `Sequence` / `SequenceMachine` nodes in a versioned RuleIR v2.
-
-## Recommended first slice
-
-A **single-event** EQL query is genuinely just a filter, and lowers honestly onto
-nodes that already exist:
-
-```
-[ process where process.name == "regsvr32.exe" ]
+```python
+class Pattern:
+    stages                # tuple of conditions, matched in order
+    within                # Duration -- the window, measured from the start row
+    key                   # tuple[FieldRef, ...] -- join keys
+    until                 # a condition -- an EXPIRATION event, checked as a veto
+    ordered               # bool
+    time_field            # FieldRef -- which field orders events
+    max_matches_per_key   # cap, default 100
 ```
 
-That is a complete, verifiable, non-approximating first commit: parse it, lower
-to `Read` → `Filter` → `Emit`, execute it, and render it back. It is the same
-shape as the SPL work that had to land `fields`/`sort`/`head` before the
-`head` renderer was reachable at all.
+`eval_pattern` groups rows by `key`, sorts by `time_field`, walks forward
+matching `stages` in order within `within` of the start row, and treats `until`
+as a veto. `Pattern.__post_init__` already enforces two of the invariants EQL
+needs: `PATTERN_NEEDS_TWO_STAGES` ("a pattern describes a sequence; with one
+stage it is a filter") and `PATTERN_REQUIRES_TIME_FIELD` (an ordered pattern must
+name the field that orders events, because guessing one from a column that looks
+like a timestamp could order by the wrong field and produce a different sequence).
 
-Then, in order:
+YARA-L already uses it for cross-event rules (`dialects/yaral_ir.py:239`).
 
-1. `sequence` with no `by`, no `maxspan`, no `until`, no `!` — only valid if a
-   real step node exists; otherwise refuse.
-2. Join keys, then `maxspan`, then `until`, then `!`, then `runs`, then `sample`.
-   Each step is its own commit with its own refusal test for the step below it.
+## So the mapping is mostly already there
 
-## The trap to avoid
+| EQL | `Pattern` | Status |
+|---|---|---|
+| `[a where c1] [b where c2]` ordered | `stages` | have it |
+| `with maxspan=15m` | `within` | have it |
+| `by user.name` | `key` | have it |
+| `until [c where c3]` — expires only if it falls BETWEEN matches | `until` as a veto | **present but DIVERGES — see below** |
+| `with runs=3` — N consecutive repeats | — | **missing** |
+| `![ c where cond ]` — missing event, `maxspan` mandatory | — | **missing** |
+| `sample` — unordered, no `maxspan`/`until`/`runs` | `ordered=False` + no `until` | nearly: `ordered=False` is all `sample` needs |
+| per-step `by` (different fields per step) | `key` is global | **missing** |
+| `?` optional join key (allow null) | — | **missing** |
 
-The single-event slice is easy to mistake for "EQL support". It is not. The value
-of EQL is overwhelmingly the sequences — every real detection written in it is a
-`sequence` or a `sample` — and a tool that parses `[ x where y ]` while refusing
-`sequence` has the easy 5% and none of the rest. Whatever ships must say plainly
-which of these are supported.
+That is a much shorter gap than "no node exists". The honest first slice is
+therefore bigger than a single-event query, and the previous recommendation to
+start there was based on a false premise.
+
+### `until` DIVERGES FROM EQL, AND IT MUST BE FIXED BEFORE LOWERING `sequence`
+
+This is the one place the existing node is *close but wrong*, and it is exactly
+the shape of bug this project keeps finding: a plausible mapping that means
+something else.
+
+EQL, from Elastic's documentation: "If this expiration event occurs **between**
+matching events in a sequence, the sequence expires and is not considered a
+match. If the expiration event occurs **after** matching events in a sequence,
+the sequence is still considered a match."
+
+`eval_pattern` does not do that. It walks the stages, and if they all matched it
+then calls:
+
+```python
+if node.until is not None and _window_satisfies(
+        node.until, group, times, start_index, window_end, ctx):
+    continue
+```
+
+and `_window_satisfies` scans from `start_index` to `window_end` — the WHOLE
+window, from the first event of the candidate to the end of the window, not the
+span *between* the matched events.
+
+So for `A, B, C` where `C` is the `until` condition and all three are inside the
+window:
+
+| | result |
+|---|---|
+| EQL | `A, B` **matches** (C comes after the matching events) |
+| `Pattern` today | `A, B` is **discarded** (C satisfies somewhere in the window) |
+
+EQL's own worked example is exactly this shape — the dataset contains `A, B`,
+`A, B, C` and `A, C, B`, and the query must match the first two and reject the
+third. `Pattern` would match only `A, B, C` and reject `A, B`.
+
+For YARA-L, where `until` is the negative twin of a two-stage rule and the
+comment above the code says the intent explicitly, the current behaviour is
+defensible. For EQL it is wrong, and it is a divergence to fix in
+`eval_pattern` (scan from the LAST MATCHED event, not from `start_index`) before
+EQL `until` can be lowered onto it. Do not paper over it in the lowerer.
+
+## Recommended order
+
+1. A single-event query (`[ process where process.name == "regsvr32.exe" ]`),
+   which really is just a filter. Cheap, and it proves the EQL front end.
+2. `sequence` with no `by`, no `maxspan`, no `until`, no `!` — lower onto
+   `Pattern` with `within=None`. This is where the mapping gets tested against
+   the real grammar rather than against my reading of it.
+3. Join keys (`key`), then `maxspan` (`within`), then `until` (veto semantics
+   above), then `!`, then `runs`, then `sample` via `ordered=False`.
+4. Per-step `by` needs a `Pattern` change -- `key` is global today, and EQL allows
+   different fields per step. Do not fake it with a global key.
+
+## The trap, unchanged
+
+A single-event query is easy to mistake for "EQL support". It is not. What
+whatever ships says plainly which of these are supported, and refuses the rest by
+name.
