@@ -12,34 +12,30 @@ PyYAML>=6.0.3,<7.0
 # this replaces and would do it invisibly.
 defusedxml>=0.7,<1.0
 
-# THE SIGMA BLOCK BELOW IS NOT USED BY THIS TOOL, AND THE COMMENT THAT USED TO
-# BE HERE WAS FALSE.
+# THE SIGMA CONVERSION PINS ARE GONE, AND THIS IS WHY.
 #
-# It said: "Authoritative Sigma conversion (optional at runtime, verified
-# present here). Installed and probed on every request: pysigma_status() reports
-# what actually imports, and the built-in renderer stays the fallback so the tool
-# works offline either way."
+# This block used to pin `pysigma` and five backends (splunk, elasticsearch,
+# qradar, crowdstrike, azure), with a comment saying they were "left in place
+# deliberately, because removing them is a decision about whether Sigma
+# conversion comes back, and that is not mine to make."
 #
-# There is no `pysigma_status()`. It is not in any .py, .js or .html file, and
-# `git log -S pysigma_status` finds it only in commits that were DELETED in
-# 114550e, when the old SIEM tool was removed. It did not survive. Nor does any
-# Sigma conversion: the tool's own code imports exactly one package from this
-# file, Flask. `yaml` and all seven `pysigma` packages have zero import
-# statements in it.
+# The decision is now made, on three grounds that are all verified rather than
+# asserted:
 #
-# The old tool DID have working Sigma conversion -- d805719 is titled "fix: a
-# pasted Sigma rule never reached the backend that exists to convert it", and
-# 6777eb3 is about disclosing Sigma field provenance. So this is not a stray
-# dependency; it is the dependency list of a feature that was removed with the
-# rest of that tool, and these lines are all that survived.
+#   1. Sigma is not a target. It is an interchange format with no execution
+#      semantics, and its value here is as a TEST CORPUS -- public
+#      repositories of rules to test the existing dialects against, not a
+#      sixth dialect to implement or a conversion feature to rebuild.
+#   2. Nothing imports any of them. `git grep pysigma` finds zero import
+#      statements in .py, .js, .html or tests. They install six packages to
+#      satisfy nothing.
+#   3. Leaving them implies the feature. A dependency list is a claim about
+#      what the tool does, and these lines claimed conversion that does not
+#      exist -- the same class of false claim as the comments this project
+#      keeps deleting.
 #
-# THEY ARE LEFT IN PLACE DELIBERATELY, because removing them is a decision about
-# whether Sigma conversion comes back, and that is not mine to make. If it does
-# not, delete this block and PyYAML. If it does, these are the right pins and
-# the feature needs rebuilding against them.
-pysigma>=1.5,<2.0
-pysigma-backend-splunk>=2.1,<3.0
-pysigma-backend-elasticsearch>=2.1,<3.0
-pysigma-backend-qradar>=0.3,<1.0
-pysigma-backend-crowdstrike>=3.0,<4.0
-pysigma-backend-azure>=0.1,<1.0
+# PyYAML STAYS, and for one reason only: reading that corpus needs a YAML
+# parser, and the public Sigma repositories the tool tests against are YAML.
+# It is the corpus reader's dependency, not conversion's. If no corpus reader
+# is ever built, it goes too.
+PyYAML>=6.0.3,<7.0
