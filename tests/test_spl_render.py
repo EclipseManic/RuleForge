@@ -19,7 +19,8 @@ import unittest
 from dialects.spl import parse_spl
 from dialects.spl_ir import lower
 from dialects.spl_render import render, _as_selector
-from engine.ir import BoolOp, Comparison, FieldExpr, FieldRef, Literal
+from engine.ir import (Arrange, BoolOp, Comparison, Emit, FieldExpr, FieldRef,
+                      Literal, RuleIR)
 from tests.test_spl import CORPUS_SPL
 
 
@@ -159,6 +160,91 @@ class HonestRefusalTests(unittest.TestCase):
             _render_aggregate(aggregate)
         self.assertEqual(getattr(caught.exception, "code", ""),
                          "SPL_MEASURE_NOT_RENDERABLE")
+
+
+class ArrangeDirectionTests(unittest.TestCase):
+    """`head` encodes sort direction as a SIGN ON THE FIELD, and a bare field is
+    not neutral.
+
+    This whole path had NO test at all -- `test_spl_render.py` never built an
+    `Arrange`, so `head` and `sort` were rendered by nothing and checked by
+    nothing. Measured before the fix, on a real lowered corpus rule with an
+    `Arrange` appended:
+
+        head, field _time, direction desc  ->  head 5 _time
+        head, field _time, direction asc   ->  head 5 _time     <- IDENTICAL
+        head, fields host asc + _time desc ->  head 3 host      <- second GONE
+
+    Splunk reads a bare field in `head` as reverse order, so the `asc` case was
+    not merely unexpressed -- it was INVERTED, and the tool reported the
+    analyst's rule back to them as their own. The second field vanishing is the
+    same failure this project keeps finding: a complete-looking artifact with
+    part of the request missing.
+    """
+
+    def _with_arrange(self, order_by, limit):
+        base = lower(CORPUS_SPL)[0]
+        last = base.nodes[-2]
+        arrange = Arrange(id="arr", input=last.id, order_by=order_by,
+                          limit=limit)
+        return RuleIR(
+            rule_id="r",
+            nodes=(*base.nodes, arrange, Emit(id="o2", input="arr")),
+            output="o2")
+
+    def _tail(self, order_by, limit):
+        rendered = render(self._with_arrange(order_by, limit))
+        return rendered.split("|")[-1].strip()
+
+    def test_head_descending_carries_a_minus(self):
+        self.assertEqual(
+            self._tail(((FieldRef(name="_time"), "desc"),), 5), "head 5 -_time")
+
+    def test_head_ascending_carries_a_plus(self):
+        """The inverted case. Without the `+`, Splunk reads this as reverse
+        order and the analyst gets the opposite of what they asked for."""
+        self.assertEqual(
+            self._tail(((FieldRef(name="_time"), "asc"),), 5), "head 5 +_time")
+
+    def test_ascending_and_descending_do_not_render_the_same(self):
+        """Stated as its own test, because "both render as `head 5 _time`" was
+        the bug and an assertion on each value separately would not have made
+        that visible."""
+        asc = self._tail(((FieldRef(name="_time"), "asc"),), 5)
+        desc = self._tail(((FieldRef(name="_time"), "desc"),), 5)
+        self.assertNotEqual(asc, desc)
+
+    def test_every_ordering_field_survives(self):
+        self.assertEqual(
+            self._tail(((FieldRef(name="host"), "asc"),
+                        (FieldRef(name="_time"), "desc")), 3),
+            "head 3 +host -_time")
+
+    def test_sort_keeps_its_explicit_keywords(self):
+        """`sort` was always correct and must stay correct -- it spells the
+        direction as a word, so it never needed a sign. Asserted so a future
+        'make head and sort consistent' change has to notice this."""
+        self.assertEqual(
+            self._tail(((FieldRef(name="host"), "desc"),), None),
+            "sort host desc")
+        self.assertEqual(
+            self._tail(((FieldRef(name="host"), "asc"),), None),
+            "sort host asc")
+
+    def test_a_dotted_field_keeps_its_path(self):
+        """`-win.eventdata.targetImage`, not `-win` -- the sign attaches to the
+        whole field name."""
+        self.assertEqual(
+            self._tail(((FieldRef(name="win.eventdata.targetImage"), "desc"),),
+                       2),
+            "head 2 -win.eventdata.targetImage")
+
+    def test_head_with_no_ordering_field_is_still_refused(self):
+        from engine.values import Refusal
+        with self.assertRaises(Refusal) as caught:
+            render(self._with_arrange((), 5))
+        self.assertEqual(caught.exception.code,
+                         "SPL_RENDER_HEAD_WITH_NO_ORDER")
 
 
 if __name__ == "__main__":

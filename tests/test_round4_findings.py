@@ -8,7 +8,7 @@ hang on 55 characters. Every finding here has the measured number next to it.
 import time
 import unittest
 
-from engine.redos import catastrophic_reason
+from engine.redos import catastrophic_reason, _quantified_bodies
 from engine.regex import compile_pattern, Refusal
 from dialects import kql_render
 
@@ -59,6 +59,100 @@ class CatastrophicMustBeRefused(unittest.TestCase):
         for pattern in ("(a+)+$", "(a|aa)+$", "((a|aa))+$", "([a-z]+)*$",
                         "(a|a)*b", "(x+x+)+y", "(foo|foobar)+$", "(.*)*b",
                         "(a*)*(b*)*", "((a|ab)*)+$"):
+            with self.subTest(pattern=pattern):
+                self.assertIsNotNone(catastrophic_reason(pattern))
+
+
+class GroupPrefixesMustNotHideTheBody(unittest.TestCase):
+    """`(?:a|aa)+$` was ACCEPTED while `(a|aa)+$` was refused.
+
+    Same language, different verdict, and the difference was a two-character
+    group prefix. `_quantified_bodies` sliced each body as
+    `pattern[start + 1:...]` where `start` was the index of `(`, so for EVERY
+    prefixed group the slice began at the `?` and the real body was never looked
+    at. For `(?:a|aa)+` the "body" was the single character `?` -- no
+    alternation, therefore nothing to catch. It measured 0.6-1.0s at n=32.
+
+    A named group was wrong for a second reason: the prefix scan stopped at the
+    `<` of `(?P<` and landed ON the name, so the slice began inside the
+    identifier.
+
+    These are stated as a table because the point is that the VERDICT must not
+    depend on the prefix. If someone reintroduces prefix-blind slicing, the
+    first test in this class fails.
+    """
+
+    #: Prefixes that must make no difference to the verdict. All of these are
+    #: real Python `re` constructs. `?a` and `:` are deliberately NOT here: `(?a`
+    #: is not a group prefix in Python at all, and `(:a|aa)` is an ordinary group
+    #: whose body genuinely starts with a colon, so neither says anything about
+    #: prefix handling.
+    PREFIXES = ("", "?:", "?P<w>", "?P<name>", "(?i:")
+
+    def test_the_verdict_does_not_depend_on_the_group_prefix(self):
+        for prefix in self.PREFIXES:
+            pattern = f"({prefix}a|aa)+$"
+            with self.subTest(pattern=pattern):
+                reason = catastrophic_reason(pattern)
+                self.assertIsNotNone(
+                    reason,
+                    f"{pattern} was accepted; the same alternation without a "
+                    f"prefix is refused, so the prefix is hiding the body")
+                # And refused for the RIGHT reason, not by some unrelated
+                # control that happens to fire.
+                self.assertIn("alternatives", reason)
+
+    def test_the_extracted_body_is_the_body_not_the_prefix(self):
+        """Asserted on the extractor, because the verdict alone does not say
+        WHY it changed."""
+        for prefix, expected in (("?:", "a|aa"), ("?P<w>", "a|aa"),
+                                 ("?P<name>", "a|aa"), ("", "a|aa"),
+                                 ("(?i:", "a|aa")):
+            with self.subTest(prefix=prefix):
+                bodies = _quantified_bodies(f"({prefix}a|aa)+")
+                self.assertEqual([b for _, b, _ in bodies], [expected])
+
+    def test_a_lookbehind_is_not_a_quantified_body(self):
+        """`(?<=a|b)` has alternatives and is not quantified, so it must not be
+        reported as a quantified body -- that would refuse ordinary patterns."""
+        self.assertEqual(_quantified_bodies("(?<=a|b)foo"), [])
+        self.assertIsNone(catastrophic_reason("(?<=abc)def"))
+
+    def test_inline_flags_do_not_shift_the_body(self):
+        """`(?i:...)` is a scoped flag group. The body after it is still the
+        body."""
+        self.assertEqual([b for _, b, _ in _quantified_bodies("(?i:ab|cd)+")],
+                         ["ab|cd"])
+
+    def test_a_comment_group_contains_no_pattern(self):
+        """`(?#...)` is a comment. Its text is not a pattern, so a `|` inside it
+        must not be read as an alternation."""
+        self.assertEqual(_quantified_bodies("(?#a|aa)x+"), [])
+
+    def test_ordinary_prefixed_groups_are_still_accepted(self):
+        """The other direction. A guard that refuses every parenthesised group
+        because prefixes are now parsed would be worse than the bypass.
+
+        `(?:[a-z]+)+` and `(?:\\d{4})+` are deliberately NOT in this list. The
+        first is a quantified group whose body is itself quantified -- the
+        nested-quantifier case, catastrophic whatever the prefix. The second
+        trips the quantifier-count control because a `+` and a `{4}` are two
+        unbounded-ish quantifiers in one body. Neither says anything about
+        whether prefixes are parsed, and listing them here would have been me
+        asserting the guard should stay broken.
+        """
+        for pattern in ("(?:abc)+", "(?:foo|bar)+", "(?P<w>abc)+",
+                        "(?:a-z)+", "(?i:abc)+"):
+            with self.subTest(pattern=pattern):
+                self.assertIsNone(catastrophic_reason(pattern),
+                                  f"{pattern} is an ordinary pattern and must "
+                                  f"not be refused")
+
+    def test_a_nested_quantifier_is_refused_through_a_prefix_too(self):
+        """The bypass could have been closed in the wrong direction -- by
+        refusing everything prefixed. This pins that the prefixed nested case is
+        still caught, so the fix was 'read the body', not 'distrust prefixes'."""
+        for pattern in ("(?:[a-z]+)+", "(?:a+)+$", "(?P<w>a+)+$"):
             with self.subTest(pattern=pattern):
                 self.assertIsNotNone(catastrophic_reason(pattern))
 

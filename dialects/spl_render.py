@@ -134,11 +134,26 @@ def render(ir: RuleIR) -> str:
 
         if kind == "Arrange":
             if node.limit is not None:
-                ordering = next(iter(node.order_by), None)
-                if ordering is None:
+                if not node.order_by:
                     raise Refusal("SPL_RENDER_HEAD_WITH_NO_ORDER",
                                   "`head` needs a field to order by", DIALECT)
-                stages.append(f"| head {node.limit} {ordering[0].full}")
+                # SPLUNK SPELLS DIRECTION AS A SIGN ON THE FIELD, AND A BARE
+                # FIELD IS NOT NEUTRAL. `head 5 _time` means reverse order --
+                # newest first -- so emitting the field name alone silently
+                # INVERTS every ascending request. Measured before this fix:
+                # an `asc` and a `desc` on the same field both rendered as
+                # `head 5 _time`, byte for byte.
+                #
+                # It ALSO DROPPED EVERY FIELD BUT THE FIRST. `ordering[0].full`
+                # took one field and threw the rest away, so `head 3 host
+                # -_time` came back as `head 3 host` -- a different ordering,
+                # presented as a faithful round trip. The `sort` branch below
+                # was always correct; only `head` was wrong, because only
+                # `head` encodes direction in the field name.
+                stages.append(
+                    f"| head {node.limit} "
+                    + " ".join(f"{'-' if direction == 'desc' else '+'}{ref.full}"
+                               for ref, direction in node.order_by))
             else:
                 pairs = ", ".join(f"{ref.full} {direction}"
                                   for ref, direction in node.order_by)

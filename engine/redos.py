@@ -137,9 +137,72 @@ def _char_shape(branch: str) -> list[set[str]] | None:
     return out or None
 
 
+def _group_body_start(pattern: str, paren: int) -> int:
+    """Index of the first character INSIDE the group opened at `paren`.
+
+    THE BUG THIS FIXES IS A WHOLE CLASS OF BYPASS, NOT ONE PATTERN.
+
+    The old code scanned forward from `(` looking for one of `:=!<` and then
+    skipped exactly one more character, on the assumption that a group prefix is
+    two characters. That is true for `(?:` and false for everything else:
+
+        (?:a|aa)+      body read as "?"      -> no alternation seen -> ACCEPTED
+        (?P<w>a|aa)+   body read as "?P<"    -> no alternation seen -> ACCEPTED
+        (?<=a|aa)      correct by luck, because < is in the stop set
+
+    And then the body was sliced as `pattern[start + 1:...]` where `start` was
+    the index of `(` -- so for EVERY prefixed group the slice began at the `?`
+    and the real body was never examined at all. `(?:` is a non-capturing group:
+    its body is `a|aa`, two prefix-overlapping alternatives under a `+`, which is
+    the exact shape the alternation check exists to catch. It measured 0.6-1.0s
+    at n=32 and was accepted, while the identical `(a|aa)+$` was refused. Same
+    language, different verdict, decided by a prefix nobody thought about.
+
+    So the prefix is now parsed rather than guessed. Every construct Python's
+    `re` allows after `(` is listed, and an unknown one returns `paren + 1` --
+    the old behaviour -- rather than something clever that could be wrong in a
+    new way. A group whose prefix is not understood is measured as if it had no
+    prefix, which is the same shape the bypass had, so that case is refused
+    rather than waved through: an unparsed prefix is a reason to be suspicious,
+    not a reason to assume the body is clean.
+    """
+    length = len(pattern)
+    after = paren + 1
+    if after >= length or pattern[after] != "?":
+        return after
+
+    marker = pattern[after + 1:after + 2]
+    if marker == "P" and pattern[after + 2:after + 3] == "<":
+        # (?P<name>  -- a NAMED capture. The name ends at '>', so the body starts
+        # after it. The old code stopped at the '<' and landed ON the name, so
+        # the slice began inside the identifier.
+        close = pattern.find(">", after + 3)
+        return (close + 1) if close != -1 else after + 1
+    if marker == "<":
+        # (?<= (?<!  -- lookbehind. Two characters after the '?'.
+        return after + 3
+    if marker in (":", "=", "!"):
+        # (?:  (?=  (?!  -- non-capturing and lookahead. One character after.
+        return after + 2
+    if marker == "#":
+        # (?#...)  -- a comment group, which contains no body at all. The
+        # comment text is not a pattern, so nothing inside it can be catastrophic.
+        close = pattern.find(")", after + 2)
+        return len(pattern) if close == -1 else close + 1
+    # (?imsx)  or  (?imsx:...)  -- inline flags, with or without a group. Walk
+    # to the ')' or ':' and, in the ':' case, step past it.
+    index = after + 1
+    while index < length and pattern[index] not in "):":
+        index += 1
+    return (index + 1) if index < length and pattern[index] == ":" else index
+
+
 def _quantified_bodies(pattern: str) -> list[tuple[int, str, str]]:
     """Every group body that is quantified, as (position, body, quantifier)."""
     out: list[tuple[int, str]] = []
+    #: The index where each open group's BODY begins -- not where its `(` is.
+    #: Those differ for every prefixed group, and using the paren index is what
+    #: let `(?:a|aa)+` through. See `_group_body_start`.
     open_at: list[int] = []
     index = 0
     length = len(pattern)
@@ -154,17 +217,13 @@ def _quantified_bodies(pattern: str) -> list[tuple[int, str, str]]:
             index = (close + 1) if close > 0 else index + 1
             continue
         if char == "(":
-            open_at.append(index)
+            open_at.append(_group_body_start(pattern, index))
             index += 1
-            if index < length and pattern[index] == "?":
-                while index < length and pattern[index] not in ":=!<":
-                    index += 1
-                index += 1
             continue
         if char == ")":
-            start = open_at.pop() if open_at else None
+            body_start = open_at.pop() if open_at else None
             index += 1
-            if start is None:
+            if body_start is None:
                 continue
             quantifier = None
             probe = index
@@ -175,7 +234,7 @@ def _quantified_bodies(pattern: str) -> list[tuple[int, str, str]]:
             elif probe < length and pattern[probe] == "{":
                 quantifier = "{"
             if quantifier is not None:
-                out.append((index, pattern[start + 1:index - 1], quantifier))
+                out.append((index, pattern[body_start:index - 1], quantifier))
             continue
         index += 1
     return out
