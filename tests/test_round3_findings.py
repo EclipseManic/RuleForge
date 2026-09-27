@@ -14,7 +14,7 @@ import unittest
 import jobs
 from dialects.wazuh import WazuhParseError, parse_wazuh
 from dialects.wazuh_ir import lower as lower_wazuh
-from engine.regex import _nested_quantifier, compile_pattern
+from engine.regex import compile_pattern
 from engine.redos import catastrophic_reason
 from engine.values import Refusal
 
@@ -110,8 +110,17 @@ class RedosBypassTests(unittest.TestCase):
         self.assertIsNone(catastrophic_reason(r"[0-9]+(\.[0-9]+)?"))
 
     def test_a_lookaround_is_not_a_nested_quantifier(self):
+        """Retargeted from `regex._nested_quantifier`, which had no production
+        caller. The property is real -- a `?` after `(` is a group modifier, not
+        a quantifier -- but asserting it about dead code made it read as coverage
+        of a control that never runs. The sibling test in
+        `test_review_findings.py` says the same thing at more length; this one
+        keeps the round-3 record honest rather than leaving it pointing at a
+        function that is gone.
+        """
         for pattern in ("(?i)abc", "(?=x)y", "(?<=a)b", "(?:x)y"):
-            self.assertIsNone(_nested_quantifier(pattern))
+            self.assertIsNone(catastrophic_reason(pattern))
+
 
 
 class EventCapTests(unittest.TestCase):

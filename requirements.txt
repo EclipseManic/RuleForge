@@ -1,9 +1,31 @@
 Flask>=3.0,<4.0
 PyYAML>=6.0.3,<7.0
 
-# Authoritative Sigma conversion (optional at runtime, verified present here).
-# Installed and probed on every request: pysigma_status() reports what actually imports,
-# and the built-in renderer stays the fallback so the tool works offline either way.
+# THE SIGMA BLOCK BELOW IS NOT USED BY THIS TOOL, AND THE COMMENT THAT USED TO
+# BE HERE WAS FALSE.
+#
+# It said: "Authoritative Sigma conversion (optional at runtime, verified
+# present here). Installed and probed on every request: pysigma_status() reports
+# what actually imports, and the built-in renderer stays the fallback so the tool
+# works offline either way."
+#
+# There is no `pysigma_status()`. It is not in any .py, .js or .html file, and
+# `git log -S pysigma_status` finds it only in commits that were DELETED in
+# 114550e, when the old SIEM tool was removed. It did not survive. Nor does any
+# Sigma conversion: the tool's own code imports exactly one package from this
+# file, Flask. `yaml` and all seven `pysigma` packages have zero import
+# statements in it.
+#
+# The old tool DID have working Sigma conversion -- d805719 is titled "fix: a
+# pasted Sigma rule never reached the backend that exists to convert it", and
+# 6777eb3 is about disclosing Sigma field provenance. So this is not a stray
+# dependency; it is the dependency list of a feature that was removed with the
+# rest of that tool, and these lines are all that survived.
+#
+# THEY ARE LEFT IN PLACE DELIBERATELY, because removing them is a decision about
+# whether Sigma conversion comes back, and that is not mine to make. If it does
+# not, delete this block and PyYAML. If it does, these are the right pins and
+# the feature needs rebuilding against them.
 pysigma>=1.5,<2.0
 pysigma-backend-splunk>=2.1,<3.0
 pysigma-backend-elasticsearch>=2.1,<3.0

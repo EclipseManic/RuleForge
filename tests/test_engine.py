@@ -634,6 +634,103 @@ class StandaloneTests(unittest.TestCase):
                         f"or an undeclared dependency.")
         self.assertGreater(checked, 40, "the scan found suspiciously little")
 
+    def test_no_test_depends_on_a_function_nothing_calls(self):
+        """A TEST THAT EXERCISES UNREACHABLE CODE IS NOT COVERAGE.
+
+        `engine/regex.py::_nested_quantifier` was 121 lines with no production
+        caller, and SEVEN test call sites across three files asserted on it --
+        including two tests whose entire purpose was to prove it did NOT produce
+        false positives. So the suite carried what read like a ReDoS control's
+        regression tests for a control that was not on the execution path, and
+        every one of them would have kept passing if the live screen had started
+        refusing ordinary patterns.
+
+        The worst part is that such a test is worse than no test. It is a green
+        tick on the wall next to a security property, and it stays green when the
+        property breaks somewhere else.
+
+        So: a private function may not be referenced from a test unless something
+        in PRODUCTION references it too. That is checkable mechanically, it
+        caught the instance on the way in, and it is the difference between
+        fixing this finding and filing it.
+
+        Public names are exempt. A test importing `compile_pattern` or
+        `catastrophic_reason` is testing the product. The rule is about private
+        helpers, which is exactly where a superseded implementation goes to die.
+        """
+        import ast
+
+        root = _repo_root()
+        production = {p for p in self._package_files()
+                      if "tests" not in p.relative_to(root).parts}
+        suite = [p for p in self._package_files()
+                 if "tests" in p.relative_to(root).parts]
+
+        def private_names(paths):
+            """Every PRIVATE top-level name a module defines.
+
+            Not just functions. The first version of this collected
+            `FunctionDef` only, and immediately flagged `_ArielCall` and
+            `_Names` -- both real, both private CLASSES in `aql.py` and
+            `kql_render.py` that tests legitimately import. A guard that cries
+            wolf on two known-good names gets deleted, so the definition set has
+            to be complete: functions, classes, plain assignments and annotated
+            assignments.
+            """
+            found = set()
+            for path in paths:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+                for node in tree.body:
+                    targets: list[str] = []
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                         ast.ClassDef)):
+                        targets.append(node.name)
+                    elif isinstance(node, ast.Assign):
+                        targets.extend(t.id for t in node.targets
+                                       if isinstance(t, ast.Name))
+                    elif isinstance(node, ast.AnnAssign) and isinstance(
+                            node.target, ast.Name):
+                        targets.append(node.target.id)
+                    for name in targets:
+                        if name.startswith("_") and not name.startswith("__"):
+                            found.add(name)
+            return found
+
+        production_private = private_names(production)
+
+        offenders: list[str] = []
+        for path in suite:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            # IMPORTS ONLY, NOT ATTRIBUTE ACCESS. The first version of this test
+            # also collected `ast.Attribute`, and immediately flagged a dozen
+            # `self._helper()` calls -- a test class's own methods, which are
+            # none of this test's business. An import is the only way one module
+            # actually depends on another module's private name, so that is the
+            # only thing that counts.
+            referenced: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    for alias in node.names:
+                        if alias.name.startswith("_") and not alias.name.startswith(
+                                "__"):
+                            referenced.add(alias.name)
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        leaf = alias.name.rsplit(".", 1)[-1]
+                        if leaf.startswith("_") and not leaf.startswith("__"):
+                            referenced.add(leaf)
+            for name in sorted(referenced - production_private):
+                offenders.append(
+                    f"{path.relative_to(root)} imports {name!r}, "
+                    f"which no production module defines")
+
+        self.assertEqual(
+            offenders, [],
+            "tests import private names that nothing in production defines:\n  "
+            + "\n  ".join(offenders)
+            + "\nEither the function is dead and the test should be retargeted at "
+              "the live path, or the function is needed and has no caller.")
+
     def test_every_module_in_the_package_is_covered(self):
         """A guard that quietly stops covering new code is worse than none."""
         files = self._package_files()

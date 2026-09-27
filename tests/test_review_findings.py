@@ -279,11 +279,25 @@ class RegexHonestyTests(unittest.TestCase):
                              f"{pattern} was refused for the wrong reason")
 
     def test_a_lookaround_is_not_mistaken_for_a_nested_quantifier(self):
-        """`(?` is a group modifier. A `?` there must not read as a quantifier."""
-        from engine.regex import _nested_quantifier
+        """`(?` is a group modifier. A `?` there must not read as a quantifier.
+
+        THIS USED TO ASSERT IT ABOUT `regex._nested_quantifier`, WHICH HAD NO
+        PRODUCTION CALLER AND IS NOW DELETED. The property was real and the test
+        was pointed at dead code, so it read as coverage of a control that was
+        not on the execution path -- and it would have kept passing if the live
+        screen had started flagging every lookaround as a nested quantifier.
+
+        It now asserts the same property against `catastrophic_reason`, which is
+        the screen that actually runs, and
+        `test_no_test_depends_on_a_function_nothing_calls` is what stops it
+        being pointed at dead code again. That control caught this exact
+        regression within minutes of being written, when a `git checkout` of
+        this file put the old import back.
+        """
+        from engine.redos import catastrophic_reason
         for pattern in ("(?i)abc", "(?=x)y", "(?<=a)b", "(?:x)y", "(?P<n>a)"):
-            self.assertIsNone(_nested_quantifier(pattern),
-                              f"{pattern} was read as a nested quantifier")
+            self.assertIsNone(catastrophic_reason(pattern),
+                              f"{pattern} was refused as a nested quantifier")
 
     def test_a_backslash_escape_is_refused_rather_than_evaluated(self):
         from engine.regex import compile_pattern

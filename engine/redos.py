@@ -42,7 +42,12 @@ _MAX_ALT_LEN = 24
 # denial-of-service vector wearing the costume of a security control.
 _MAX_ANALYSIS_DEPTH = 64
 
-_ATOM = re.compile(r"\((?!\?)|\[|\^|\$|\\.|[^()[\]\\^$.*+?|]")
+# `_ATOM` USED TO BE DEFINED HERE AND WAS CALLED BY NOTHING. It was an atom
+# pattern for a tokeniser this module no longer has -- `catastrophic_reason`
+# works on quantifier counts, prefix overlap and alternation structure, not on a
+# token stream. It had zero references in the whole tree, so it was not a
+# fallback or a re-export; it was the remains of the round-3 control that this
+# module replaced.
 
 
 def _alternatives_overlap(body: str) -> bool:
@@ -636,15 +641,3 @@ def unbounded_in(body: str) -> int:
             total += 1
         index += 1
     return total
-
-
-def _group_contains_quantifier(body: str) -> bool:
-    """Is there a quantifier inside a NESTED group in `body`?
-
-    A quantifier directly on a top-level atom -- `(a+)` -- is linear, so it is
-    not this. `([a-z]+)+` is.
-    """
-    for _, inner in _quantified_bodies(body):
-        if unbounded_in(inner):
-            return True
-    return False
