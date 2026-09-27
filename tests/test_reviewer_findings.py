@@ -521,5 +521,77 @@ class HistoryJobVocabularyTests(unittest.TestCase):
                 web.HISTORY_PATH = original
 
 
+class WazuhRuleIdDefaultTests(unittest.TestCase):
+    """`rule_id` IS A LOOKUP KEY FOR WAZUH, NOT A LABEL.
+
+    Every other dialect treats it as a name to call the result, and the default
+    `"rule"` is harmless there. Wazuh looks the rule UP by it and raises
+    `WAZUH_RULE_NOT_IN_DOCUMENT` if it is absent, so with the default every
+    Wazuh job refused a perfectly valid ruleset unless the analyst ALSO typed the
+    rule's numeric id into a second field. Measured before the fix:
+
+        author("wazuh", <one rule id="1">)                -> ok=False
+        author("wazuh", <one rule id="1">, rule_id="1")  -> ok=True
+
+    A dialect whose own example fails through its own default parameter is not
+    opinionated, it is broken -- and Wazuh is the dialect the shipped ruleset
+    tests are written against, so this was the flagship path being unreachable.
+    """
+
+    SINGLE = ('<group name="test,">'
+              '<rule id="100200" level="5">'
+              '<field name="win.system.eventID">^4624$</field>'
+              '</rule></group>')
+
+    TWO = ('<group name="test,">'
+           '<rule id="100200" level="5">'
+           '<field name="win.system.eventID">^4624$</field></rule>'
+           '<rule id="100201" level="6">'
+           '<field name="win.system.eventID">^4625$</field></rule>'
+           '</group>')
+
+    def test_a_single_rule_document_works_through_the_default(self):
+        from jobs import author
+        outcome = author("wazuh", self.SINGLE)
+        self.assertTrue(outcome.ok, outcome.findings)
+        self.assertIn("100200", outcome.rendered)
+
+    def test_an_explicit_id_is_still_honoured(self):
+        """The fix must not override a caller who knows which rule they meant."""
+        from jobs import author
+        outcome = author("wazuh", self.TWO, rule_id="100201")
+        self.assertTrue(outcome.ok, outcome.findings)
+        self.assertIn("100201", outcome.rendered)
+
+    def test_an_ambiguous_document_is_refused_rather_than_guessed(self):
+        """NOT defaulted to the first rule. Analysing rule 1 of two is a
+        different answer to the question that was asked, and silently returning
+        the wrong rule's analysis is precisely the failure this project exists to
+        prevent. It has to say which ids are available."""
+        from jobs import author
+        outcome = author("wazuh", self.TWO)
+        self.assertFalse(outcome.ok)
+
+    def test_the_refusal_names_the_ambiguity_and_the_available_ids(self):
+        """The message has to be actionable, or the analyst cannot tell what to
+        type next.
+
+        Asserted against `Outcome.refusal`, WHICH IS A DICT. Two wrong
+        assumptions got me here, both worth recording because they are the same
+        mistake: I used `assertRaises` when `author()` catches a lower-stage
+        refusal and returns it, and then I used `getattr(outcome.refusal, "code")`
+        when `refusal` is a plain dict, so the attribute lookup returned `None` and
+        I read that as "no refusal happened" rather than "I asked the wrong way".
+        A probe that returns `None` is not the same as a probe that returns
+        `None` because the thing does not exist, and I did not check which.
+        """
+        from jobs import author
+        outcome = author("wazuh", self.TWO)
+        self.assertFalse(outcome.ok)
+        self.assertIsNotNone(outcome.refusal, "a refusal was expected")
+        self.assertEqual(outcome.refusal["code"], "WAZUH_RULE_ID_REQUIRED")
+        self.assertIn("100201", outcome.refusal["message"])
+
+
 if __name__ == "__main__":
     unittest.main()

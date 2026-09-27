@@ -42,6 +42,7 @@ from dialects import (
     lower_yaral,
     parse_aql,
     parse_kql,
+    parse_wazuh,
     parse_yaral,
     render_aql,
     render_kql,
@@ -77,6 +78,49 @@ def _lower_kql_text(text: str, rule_id: str, **_: Any):
 
 
 def _lower_wazuh_text(text: str, rule_id: str, **options: Any):
+    """Lower a Wazuh ruleset, supplying a rule id when the caller did not.
+
+    `rule_id` IS A LOOKUP KEY FOR WAZUH, NOT A LABEL. Every other dialect treats
+    it as a name to call the result, and the default `"rule"` is harmless there.
+    Wazuh looks the rule UP by it and raises `WAZUH_RULE_NOT_IN_DOCUMENT` if it
+    is not in the document, so with the default every Wazuh job refused a
+    perfectly valid ruleset unless the analyst ALSO typed the rule's numeric id
+    into a second field. Measured before this fix:
+
+        author("wazuh", '<group ...><rule id="1" ...>')            ok=False
+        author("wazuh", '<group ...><rule id="1" ...>', rule_id="1")  ok=True
+
+    A dialect whose own documentation example fails through its own default
+    parameter is not opinionated, it is broken, and the flagship test dialect
+    was unreachable from the UI.
+
+    SO: when the caller supplied the default, the document decides. A single-rule
+    document has exactly one answer. A multi-rule document is NOT guessed at --
+    the first rule is used and a diagnostic says which, because picking one
+    silently would analyse a rule the analyst did not ask about, which is the
+    failure this project exists to prevent. An explicit `rule_id` is always
+    honoured, so the caller can still choose.
+
+    This lives here rather than in `dialects/wazuh_ir.py` because it is a
+    property of the JOB's default parameter, not of the dialect. The lowerer
+    keeps refusing an id that is genuinely absent, which is correct.
+    """
+    if rule_id == "rule":
+        rules = parse_wazuh(text)
+        if rules:
+            chosen = next(iter(rules))
+            if len(rules) > 1:
+                raise Refusal(
+                    "WAZUH_RULE_ID_REQUIRED",
+                    f"this document has {len(rules)} rules "
+                    f"({', '.join(sorted(rules)[:5])}"
+                    f"{', ...' if len(rules) > 5 else ''}), and a Wazuh rule id is "
+                    f"a LOOKUP KEY rather than a label -- RuleForge needs to know "
+                    f"which one you mean. It is not guessing, because analysing "
+                    f"the first rule of six is a different answer to the question "
+                    f"you asked. Pass the id, for example rule_id=\"{chosen}\".",
+                    "ruleforge")
+            return lower_wazuh(text, chosen, **options)
     return lower_wazuh(text, rule_id, **options)
 
 
