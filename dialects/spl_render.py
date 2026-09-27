@@ -470,8 +470,16 @@ def _render_subpipeline(nodes: list[Any], by_id: dict[str, Any]) -> str:
                 body.append("fields " + ", ".join(
                     str(alias) for alias, _ in node.assignments))
             elif getattr(node, "kind", "") == "rename":
+                # SAME ORDER AS THE MAIN LOOP: `rename <old> as <new>`. This had
+                # `f"{alias} AS {render_expr(expr)}"`, which is backwards --
+                # `rename account AS user` renames account TO user, the opposite
+                # direction. Third copy of this renderer to drift, in the
+                # function whose comment already says the duplication "cost
+                # twice". Currently a dead path (`spl_ir.lower` has no `join`
+                # command), but a dead path with the wrong direction in it
+                # becomes a live bug the day a join lowering exists.
                 body.append("rename " + ", ".join(
-                    f"{alias} AS {render_expr(expr)}"
+                    f"{expr.ref.full} as {alias}"
                     for alias, expr in node.assignments))
             elif getattr(node, "kind", "") == "eval":
                 body.append("eval " + ", ".join(

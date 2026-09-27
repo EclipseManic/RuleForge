@@ -923,7 +923,24 @@ def _lower_aggregate(command: SplCommand, position: int, source: str,
         if spec.function in ("count", "c") and not spec.field:
             measures.append(Measure(name=name, function="count", field=None))
             continue
+        # `count(x)` IS NOT `count` WITH EXTRA INFORMATION. In Splunk bare
+        # `count` counts events and `count(x)` counts NON-NULL values of `x` --
+        # different numbers on any column with empties in it. The IR's `count`
+        # takes no field, so letting this fall through to the generic map
+        # produced MEASURE_FIELD_NOT_APPLICABLE / "'count' reads no field" for
+        # an input that names field `x`: a message contradicting the rule it
+        # was given. Named here, with the distinction, rather than approximated
+        # as a bare count.
+        if spec.function in ("count", "c") and spec.field:
+            raise SplParseError(
+                "SPL_COUNT_FIELD_NOT_LOWERABLE",
+                f"`count({spec.field})` counts non-null values of "
+                f"`{spec.field}`, which is not the same number as bare `count` "
+                f"on any column with empties in it. The IR's `count` takes no "
+                f"field, so this is refused rather than rendered as a bare "
+                f"count that would silently change the number.", DIALECT)
         mapped = _MEASURE_FUNCTIONS.get(spec.function)
+
         if mapped is None:
             raise SplParseError(
                 "SPL_MEASURE_NOT_LOWERABLE",

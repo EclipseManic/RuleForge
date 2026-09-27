@@ -61,8 +61,8 @@ MUTATIONS = [
      "                    if False:"),
 
     ("M8  Pattern until ignores the window", "engine/nodes.py",
-     "            if node.until is not None and _window_satisfies(",
-     "            if False and node.until is not None and _window_satisfies("),
+     "            if node.until is not None:",
+     "            if False and node.until is not None:"),
 
     ("M9  BoolOp treats non-bool as True", "engine/evaluate.py",
      "    for operand, value in zip(expr.operands, values):\n"
