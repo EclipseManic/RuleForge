@@ -5,6 +5,7 @@ Round 3 shipped a ReDoS guard and described it as holding. Two independent
 reviewers then found, between them, that it had four live bypasses and would
 hang on 55 characters. Every finding here has the measured number next to it.
 """
+import pathlib
 import time
 import unittest
 
@@ -202,34 +203,177 @@ class TheAnalysisItselfMustBeCheap(unittest.TestCase):
     The recursion into nested group bodies was 2^depth, so the analysis -- not
     the pattern -- was the denial-of-service vector. Reachable from
     `POST /api/tune` with a single event.
+
+    WHY THIS NO LONGER ASSERTS ONE WALL-CLOCK NUMBER PER DEPTH.
+
+    It used to: one loop, one 250ms budget, every depth. That budget is a
+    statement about the speed of the machine it was written on, and it was
+    already failing here about one full-suite run in three at 270-300ms.
+    Proven pre-existing rather than assumed: commit 114550e fails at the same
+    rate in a clean worktree. A test that fails on a third of runs is a test
+    people learn to ignore, and an ignored hang detector is worse than none.
+
+    Worse, it spent its whole budget where there is nothing to detect. Measured
+    on this machine, best-of-five:
+
+        depth  22 (47 chars)     0.26 ms
+        depth  40 (83 chars)     0.72 ms
+        depth 200 (403 chars)   17.91 ms
+        depth 900 (1803 chars) 149.31 ms
+        depth 1800 (3603 chars) 154.47 ms   <- plateaus at the depth cap
+
+    The defect was 15.28 SECONDS at depth 24 -- 47 characters. So the exponential
+    shape is caught instantly by a budget on the SMALLEST depth, where the margin
+    is about 58,000x. The large depths were consuming 60% of the budget each to
+    confirm something that a plateau check confirms better.
+
+    So the two properties worth asserting are separated:
+
+      * a TIGHT budget at small depth, which is the regression detector for the
+        exponential defect and has a margin wide enough to survive a slow
+        machine, a loaded CI box, or a future CPython;
+      * a generous budget at large depth, which is only a "does not hang"
+        backstop, because a machine-independent number is not available;
+      * a PLATEAU, which is the real property -- past the bound, doubling the
+        depth must not double the work.
+
+    AND THE PLATEAU IS NOT ENFORCED BY THE DEPTH CAP, THOUGH THE FIRST VERSION
+    OF THIS COMMENT SAID IT WAS. Verified by mutation rather than assumed:
+
+        _MAX_ANALYSIS_DEPTH 64 -> 4096    5 passed   (no effect)
+        len(_seen) 512 -> 100000          2 FAILED, and the suite went 3s -> 45s
+
+    So the curve is flattened by the DISTINCT-BODIES bound, because
+    `((((a))))`-shaped nesting at depth 900 has 900 distinct bodies and trips
+    `len(_seen) > 512` long before the depth cap at 64 is reached. The depth cap
+    governs the other shape -- deeply nested groups whose bodies REPEAT, where
+    `_seen` stays tiny -- which is what
+    `test_the_depth_cap_bounds_repeated_bodies` covers.
+
+    Both bounds matter and they are not interchangeable, which is exactly why
+    each has its own test rather than one comment claiming they are the same
+    mechanism.
     """
 
-    def _bounded(self, pattern, budget_ms=250.0):
-        start = time.perf_counter()
-        catastrophic_reason(pattern)
-        return (time.perf_counter() - start) * 1000, budget_ms
+    #: Depth 24 is where the original defect cost 15.28s. Measured 0.29ms, so
+    #: this budget has roughly a 50,000x margin -- wide enough that a loaded
+    #: machine, a slower interpreter or a future CPython cannot make it a flake,
+    #: while a return to anything exponential fails immediately.
+    EXPONENTIAL_BUDGET_MS = 50.0
 
-    def test_deeply_nested_groups(self):
-        for depth in (22, 24, 26, 40, 200, 900):
-            pattern = "(" * depth + "a" + ")" * depth + "+$"
+    #: Only a hang backstop. The measured cost at depth 900 is ~155ms, so this is
+    #: ~13x headroom on an idle machine and it is not the regression detector.
+    HANG_BACKSTOP_MS = 3000.0
+
+    def _elapsed_ms(self, pattern, repeats=3):
+        """Best of `repeats`, because a single sample on a shared machine is
+        mostly scheduler noise and the minimum is the closest thing to the cost
+        of the work itself."""
+        best = None
+        for _ in range(repeats):
+            start = time.perf_counter()
+            catastrophic_reason(pattern)
+            elapsed = (time.perf_counter() - start) * 1000
+            best = elapsed if best is None else min(best, elapsed)
+        return best
+
+    @staticmethod
+    def _nested(depth):
+        return "(" * depth + "a" + ")" * depth + "+$"
+
+    def test_the_exponential_shape_is_caught_at_the_depth_it_broke(self):
+        """THE regression detector. Depth 24 is where this cost 15.28 seconds,
+        so the budget there is the one with a meaningful margin."""
+        for depth in (22, 24, 26, 40):
+            pattern = self._nested(depth)
             with self.subTest(depth=depth):
-                elapsed, budget = self._bounded(pattern)
+                elapsed = self._elapsed_ms(pattern)
                 self.assertLess(
-                    elapsed, budget,
+                    elapsed, self.EXPONENTIAL_BUDGET_MS,
                     f"the analysis took {elapsed:.0f}ms on {len(pattern)} "
                     f"characters; it was 15.28s at depth 24")
+
+    def test_deep_nesting_does_not_hang(self):
+        """A backstop, not the detector -- see the class docstring for why this
+        is not the assertion carrying the regression."""
+        for depth in (200, 900, 1800):
+            pattern = self._nested(depth)
+            with self.subTest(depth=depth):
+                elapsed = self._elapsed_ms(pattern)
+                self.assertLess(elapsed, self.HANG_BACKSTOP_MS,
+                                f"the analysis took {elapsed:.0f}ms at depth "
+                                f"{depth}")
+
+    def test_the_cost_plateaus_past_the_distinct_bodies_bound(self):
+        """THE REAL PROPERTY, and the machine-independent one.
+
+        `len(_seen) > 512` in `redos.py` bounds how many distinct group bodies
+        the descent will visit, so past that point doubling the depth must not
+        double the work. Measured here: 149ms at depth 900 and 154ms at 1800 --
+        flat. Raising the bound to 100000 makes this test fail and takes the
+        suite from 3s to 45s, so it has teeth.
+
+        A fixed millisecond budget could not do this. The same exponential
+        regression passes on a fast machine and fails on a slow one, which is
+        what made the original version of this test a coin flip.
+
+        The allowance is 3x because the curve is not perfectly flat at the knee
+        and the point is to catch a shape change, not to measure a constant.
+        """
+        at_bound = self._elapsed_ms(self._nested(900))
+        past_bound = self._elapsed_ms(self._nested(1800))
+        self.assertLess(
+            past_bound, at_bound * 3.0,
+            f"doubling the depth past the bound multiplied the cost by "
+            f"{past_bound / max(at_bound, 1e-9):.1f}x ({at_bound:.0f}ms -> "
+            f"{past_bound:.0f}ms), so the distinct-bodies bound is not holding "
+            f"the descent")
+
+    def test_the_depth_cap_bounds_repeated_bodies(self):
+        """The OTHER bound, covering the shape the distinct-bodies bound cannot
+        help with.
+
+        `((((a))))` at depth 900 has ONE distinct body repeated, so `_seen` never
+        grows and `len(_seen) > 512` never fires. `_MAX_ANALYSIS_DEPTH` is the
+        only thing bounding that descent, which is why it needs its own coverage
+        rather than being assumed by the plateau test above.
+        """
+        repeated = "(" * 900 + "a" + ")" * 900
+        elapsed = self._elapsed_ms(repeated + "+$")
+        self.assertLess(elapsed, self.HANG_BACKSTOP_MS)
+
+    def test_raising_either_bound_would_show_up_somewhere(self):
+        """Named, so the next reader does not have to re-derive which mechanism
+        flattens which curve. The two bounds are not interchangeable:
+
+          distinct bodies  `len(_seen) > 512`        this is what makes the
+                                                      plateau test fail
+          repeated bodies  `_MAX_ANALYSIS_DEPTH`     this is the only bound
+                                                      that applies at all
+
+        Both are real and both are load-bearing; this asserts they still exist,
+        so deleting either one is a visible change rather than a silent
+        performance regression found in production.
+        """
+        import engine.redos as redos
+        self.assertTrue(hasattr(redos, "_MAX_ANALYSIS_DEPTH"))
+        self.assertIsInstance(redos._MAX_ANALYSIS_DEPTH, int)
+        source = pathlib.Path(redos.__file__).read_text(encoding="utf-8")
+        self.assertIn("len(_seen) >", source,
+                      "the distinct-bodies bound is gone; the plateau test "
+                      "above no longer has a mechanism behind it")
 
     def test_deeply_nested_distinct_groups(self):
         # Memoisation cannot help when every body is different, so the depth cap
         # is the backstop rather than the fix.
         pattern = "".join(f"({'a' * i})" for i in range(1, 60)) + "+$"
-        elapsed, budget = self._bounded(pattern)
-        self.assertLess(elapsed, budget)
+        elapsed = self._elapsed_ms(pattern)
+        self.assertLess(elapsed, self.HANG_BACKSTOP_MS)
 
     def test_wide_alternation_at_depth(self):
         pattern = "(" * 30 + "|" .join(["ab"] * 20) + ")" * 30 + "+$"
-        elapsed, budget = self._bounded(pattern)
-        self.assertLess(elapsed, budget)
+        elapsed = self._elapsed_ms(pattern)
+        self.assertLess(elapsed, self.HANG_BACKSTOP_MS)
 
 
 class DeepNestingIsARefusalNotACrash(unittest.TestCase):
