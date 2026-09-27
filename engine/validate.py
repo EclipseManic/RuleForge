@@ -88,6 +88,28 @@ def _expression_depth(expr: Any, depth: int = 0) -> int:
     if isinstance(expr, BoolOp):
         return 1 + max((_expression_depth(c, depth + 1) for c in expr.operands),
                        default=0)
+    # `Not` WAS MISSING, AND THAT IS THE SAME BUG AS THE ONES ABOVE.
+    #
+    # A `Not` has no arm here, so it fell through to `return 0` -- depth zero,
+    # whatever the nesting. Which means `MAX_EXPRESSION_DEPTH` never applied to
+    # it at all:
+    #
+    #     BoolOp chain x101  ->  REFUSED: EXPRESSION_TOO_DEEP
+    #     Not x5000          ->  _expression_depth = 0
+    #
+    # And then the recursion that this function exists to stop happened anyway:
+    # `validate_graph(Not x2000)` was ACCEPTED, and `Not x2000` escaped as a
+    # RecursionError from `jobs.py`, which `web.py` turned into
+    # INPUT_TOO_DEEP / "the pasted events are nested too deeply to read" --
+    # when no events had been pasted. AQL builds genuinely nested `NOT` chains
+    # (`NOT x40` is Not at depth 40), so this was reachable from a rule.
+    #
+    # The docstring above promises "a RecursionError escaping as an opaque crash
+    # tells the analyst nothing. Here it is a named refusal at a known depth."
+    # For `Not` that was not true, and the promise is now the test.
+    if isinstance(expr, Not):
+        return 1 + _expression_depth(expr.operand, depth + 1)
+
     if isinstance(expr, Arith):
         return 1 + max((_expression_depth(c, depth + 1) for c in expr.operands),
                        default=0)
@@ -337,6 +359,30 @@ def _screen_regexes(node: Any) -> None:
             walk(getattr(value, "pattern", None), depth + 1)
             walk(getattr(value, "left", None), depth + 1)
             walk(getattr(value, "right", None), depth + 1)
+            # AND THEN THE REST OF THE NODE, WHICH THE `return` WAS DISCARDING.
+            #
+            # A `SourceSelector` has `name`, so it entered this arm -- and then the
+            # three walks above found nothing, because a selector has no
+            # `pattern`, `left` or `right`, and the bare `return` ended the visit.
+            # `binding` and `kind` were never looked at. Executed:
+            #
+            #     Read(selector=SourceSelector(name="e", binding="(a|aa)+$"))
+            #       -> the walk finishes without screening it
+            #
+            # Not a live hole today, because `binding` is a datamodel name by
+            # contract and `kind` is a node class name. That is a CONTRACT, not a
+            # guarantee, and the round-8 comment says this walk "must reach EVERY
+            # node in the tree" precisely so that a new attribute cannot be a new
+            # hole. It is the same shape as the `Emit` dedup drop and the `Not`
+            # node miss: the walk stopped and said nothing.
+            #
+            # Mirrors the attribute sweep at the top of this function, so a node
+            # with attributes nobody thought to name here is still visited.
+            for attribute in dir(value):
+                if attribute.startswith("_") or attribute in ("pattern",
+                                                              "left", "right"):
+                    continue
+                walk(getattr(value, attribute, None), depth + 1)
             return
         if isinstance(value, str):
             check(value)
