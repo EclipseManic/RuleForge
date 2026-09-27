@@ -10,7 +10,7 @@ Five SIEM dialects: **QRadar AQL**, **Splunk SPL**, **Microsoft Sentinel KQL**,
 
 ```
 pip install -r requirements.txt
-python ruleforge\run.py
+python run.py
 ```
 
 That opens the tool in your browser. No arguments, no environment variables, no
@@ -46,21 +46,25 @@ that matches every event while telling you it worked.
 ## Layout
 
 ```
-ruleforge/
-  run.py            the launcher — this is what you run
-  engine/           the dialect-neutral rule model and evaluator
-    ir.py           typed nodes; three-valued values
-    evaluate.py     expression evaluation, field resolution
-    run.py          graph execution, windows, joins, packages
-    regex.py        regex dialects; only what can honestly be executed
-    redos.py        catastrophic-backtracking analysis
-    validate.py     graph validation, and the deploy-path regex screen
-  dialects/         parse -> lower -> render, one package per vendor
-  jobs.py           the five jobs the UI calls
-  history.py        append-only local history
-  web.py            Flask routes
-  tests/            the suite
+run.py            the launcher - this is what you run
+engine/           the dialect-neutral rule model and evaluator
+  ir.py           typed nodes; three-valued values
+  evaluate.py     expression evaluation, field resolution
+  run.py          graph execution, windows, joins, packages
+  regex.py        regex dialects; only what can honestly be executed
+  redos.py        catastrophic-backtracking analysis
+  validate.py     graph validation, and the deploy-path regex screen
+dialects/         parse -> lower -> render, one module per vendor
+jobs.py           the five jobs the UI calls
+history.py        append-only local history
+web.py            Flask routes
+tests/            the suite
 ```
+
+Everything is flat: `run.py` sits beside the code it launches, so Python puts
+the whole tool on `sys.path` by itself and the launcher has no import
+arrangement to get wrong. There is no package to install and no `PYTHONPATH` to
+set.
 
 ## Boundaries
 
@@ -79,9 +83,9 @@ ruleforge/
 ## Tests
 
 ```
-python -m pytest ruleforge\tests -q
-ruff check ruleforge
-python ruleforge\mutation_check.py
+python -m pytest tests -q
+ruff check .
+python mutation_check.py
 ```
 
 The mutation harness exists because a green suite in this project has repeatedly

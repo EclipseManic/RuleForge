@@ -32,4 +32,12 @@ Thumbs.db
 # hostnames, usernames, source IPs and destination IPs. Filesystem permissions
 # are 0600 and the server never transmits them, but git add -A from a repo
 # with a remote would publish them. This is the one file RuleForge writes.
-ruleforge/data/
+#
+# THE PATH IS NOW `data/`, NOT `ruleforge/data/`. The package was flattened, so
+# the directory moved up one level -- and an ignore rule that names a directory
+# that no longer exists matches nothing at all. That failure is silent: there is
+# no error, no warning, and `git add -A` simply starts offering the analyst's
+# pasted rules and their machine's hostnames for commit. `git check-ignore` is
+# the only thing that catches it, so it is worth running after any move.
+data/
+
