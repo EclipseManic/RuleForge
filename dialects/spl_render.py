@@ -134,26 +134,44 @@ def render(ir: RuleIR) -> str:
 
         if kind == "Arrange":
             if node.limit is not None:
-                if not node.order_by:
-                    raise Refusal("SPL_RENDER_HEAD_WITH_NO_ORDER",
-                                  "`head` needs a field to order by", DIALECT)
-                # SPLUNK SPELLS DIRECTION AS A SIGN ON THE FIELD, AND A BARE
-                # FIELD IS NOT NEUTRAL. `head 5 _time` means reverse order --
-                # newest first -- so emitting the field name alone silently
-                # INVERTS every ascending request. Measured before this fix:
-                # an `asc` and a `desc` on the same field both rendered as
-                # `head 5 _time`, byte for byte.
+                # `head` HAS NO FIELD LIST. THE SIGNS WERE INVENTED, AND SO WAS
+                # THE WHOLE SHAPE.
                 #
-                # It ALSO DROPPED EVERY FIELD BUT THE FIRST. `ordering[0].full`
-                # took one field and threw the rest away, so `head 3 host
-                # -_time` came back as `head 3 host` -- a different ordering,
-                # presented as a faithful round trip. The `sort` branch below
-                # was always correct; only `head` was wrong, because only
-                # `head` encodes direction in the field name.
-                stages.append(
-                    f"| head {node.limit} "
-                    + " ".join(f"{'-' if direction == 'desc' else '+'}{ref.full}"
-                               for ref, direction in node.order_by))
+                # This branch used to emit `head 5 -_time`, on the reasoning --
+                # which I asserted from memory and a reviewer then challenged --
+                # that `head` spells direction as a sign on the field. Splunk's
+                # own documentation says otherwise, and the answer is not that
+                # the sign is inverted. The syntax does not exist:
+                #
+                #   head [keeplast = (true | false)] [while "<expr>"] [<limit>]
+                #
+                # Required arguments: none. Optional: keeplast, limit, while.
+                # There is no field argument and no sort-order argument, in SPL2
+                # or in the older `head <count> (<boolean-expression>)` form. And
+                # the docs are explicit about the actual way to do it:
+                #
+                #   "If you want to return the top 4 results based on the `count`
+                #    field, you must first sort the results by that field before
+                #    you run the `head` command.  ...| sort count | head 4"
+                #
+                # So the honest rendering of "take the first N in this order" is
+                # TWO stages, not one, and that is what `sort` already emits
+                # correctly below. A `head` carrying an ordering is therefore
+                # rendered as `sort` followed by `head`, which is both valid and
+                # what the analyst would have written by hand.
+                #
+                # WITHOUT the ordering, `head N` alone is valid -- `head` returns
+                # the first results in SEARCH order -- so no sort is invented
+                # where the analyst asked for none. The previous version refused
+                # that case with SPL_RENDER_HEAD_WITH_NO_ORDER on the grounds that
+                # `head` "needs a field to order by", which is a claim about
+                # syntax that does not hold. It is removed, not kept.
+                if node.order_by:
+                    pairs = ", ".join(
+                        f"{'-' if direction == 'desc' else '+'}{ref.full}"
+                        for ref, direction in node.order_by)
+                    stages.append(f"| sort {pairs}")
+                stages.append(f"| head {node.limit}")
             else:
                 pairs = ", ".join(f"{ref.full} {direction}"
                                   for ref, direction in node.order_by)

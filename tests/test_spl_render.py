@@ -163,23 +163,22 @@ class HonestRefusalTests(unittest.TestCase):
 
 
 class ArrangeDirectionTests(unittest.TestCase):
-    """`head` encodes sort direction as a SIGN ON THE FIELD, and a bare field is
-    not neutral.
+    """`head` TAKES NO FIELDS. THE EARLIER VERSION OF THIS FILE TESTED A SYNTAX
+    THAT DOES NOT EXIST.
 
-    This whole path had NO test at all -- `test_spl_render.py` never built an
-    `Arrange`, so `head` and `sort` were rendered by nothing and checked by
-    nothing. Measured before the fix, on a real lowered corpus rule with an
-    `Arrange` appended:
+    It asserted `head 5 -_time` for descending and `head 5 +_time` for
+    ascending. I chose that from memory, a reviewer challenged it, and Splunk's
+    documentation settles it: the answer is not that the sign is inverted, it is
+    that there is no sign.
 
-        head, field _time, direction desc  ->  head 5 _time
-        head, field _time, direction asc   ->  head 5 _time     <- IDENTICAL
-        head, fields host asc + _time desc ->  head 3 host      <- second GONE
+        head [keeplast = (true | false)] [while "<boolean-expression>"] [<limit>]
 
-    Splunk reads a bare field in `head` as reverse order, so the `asc` case was
-    not merely unexpressed -- it was INVERTED, and the tool reported the
-    analyst's rule back to them as their own. The second field vanishing is the
-    same failure this project keeps finding: a complete-looking artifact with
-    part of the request missing.
+    Required arguments: none. There is no field argument and no sort-order
+    argument, in SPL2 or in the older `head <count> (<expr>)` form. The docs give
+    the actual way to order before limiting: "...| sort count | head 4".
+
+    So the correct rendering of "first N in this order" is TWO stages, and these
+    tests now assert that shape -- the pipeline, not a string I liked the look of.
     """
 
     def _with_arrange(self, order_by, limit):
@@ -192,59 +191,62 @@ class ArrangeDirectionTests(unittest.TestCase):
             nodes=(*base.nodes, arrange, Emit(id="o2", input="arr")),
             output="o2")
 
-    def _tail(self, order_by, limit):
-        rendered = render(self._with_arrange(order_by, limit))
-        return rendered.split("|")[-1].strip()
+    def _tail(self, order_by, limit, stages=2):
+        """The last `stages` pipeline stages, joined.
 
-    def test_head_descending_carries_a_minus(self):
+        Slicing the raw string on `|` gave the wrong answer twice while writing
+        this file, because a `search` stage contains a parenthesised condition
+        and the count of `|` characters is not the count of stages. Splitting and
+        dropping the empties is the honest way to ask for "the end of the
+        pipeline".
+        """
+        parts = [p.strip() for p in render(self._with_arrange(order_by, limit)
+                                           ).split("|") if p.strip()]
+        return " | ".join(parts[-stages:])
+
+    def test_head_with_an_ordering_becomes_sort_then_head(self):
+        """The shape Splunk actually documents."""
         self.assertEqual(
-            self._tail(((FieldRef(name="_time"), "desc"),), 5), "head 5 -_time")
+            self._tail(((FieldRef(name="_time"), "desc"),), 5),
+            "sort -_time | head 5")
 
-    def test_head_ascending_carries_a_plus(self):
-        """The inverted case. Without the `+`, Splunk reads this as reverse
-        order and the analyst gets the opposite of what they asked for."""
-        self.assertEqual(
-            self._tail(((FieldRef(name="_time"), "asc"),), 5), "head 5 +_time")
-
-    def test_ascending_and_descending_do_not_render_the_same(self):
-        """Stated as its own test, because "both render as `head 5 _time`" was
-        the bug and an assertion on each value separately would not have made
-        that visible."""
+    def test_ascending_and_descending_still_differ(self):
+        """Kept, because it was the right instinct: the two directions must not
+        render the same. It just now shows up in the `sort` stage."""
         asc = self._tail(((FieldRef(name="_time"), "asc"),), 5)
         desc = self._tail(((FieldRef(name="_time"), "desc"),), 5)
         self.assertNotEqual(asc, desc)
+        self.assertEqual(asc, "sort +_time | head 5")
+        self.assertEqual(desc, "sort -_time | head 5")
 
     def test_every_ordering_field_survives(self):
         self.assertEqual(
             self._tail(((FieldRef(name="host"), "asc"),
                         (FieldRef(name="_time"), "desc")), 3),
-            "head 3 +host -_time")
+            "sort +host, -_time | head 3")
 
-    def test_sort_keeps_its_explicit_keywords(self):
-        """`sort` was always correct and must stay correct -- it spells the
-        direction as a word, so it never needed a sign. Asserted so a future
-        'make head and sort consistent' change has to notice this."""
+    def test_head_with_no_ordering_is_head_alone(self):
+        """NOT a refusal, and not a sort either. `head` returns the first results
+        in SEARCH order, so with no ordering asked for, inventing a sort would
+        change which rows come back. The previous version refused this with
+        SPL_RENDER_HEAD_WITH_NO_ORDER on the grounds that `head` "needs a field
+        to order by" -- a claim about syntax that does not hold."""
+        rendered = render(self._with_arrange((), 5))
+        self.assertTrue(rendered.rstrip().endswith("| head 5"), rendered)
+        self.assertNotIn("sort", rendered)
+
+    def test_sort_alone_is_unchanged(self):
+        """A bare ordering with no limit is still one `sort` stage, and no
+        `head` is invented for it."""
         self.assertEqual(
-            self._tail(((FieldRef(name="host"), "desc"),), None),
+            self._tail(((FieldRef(name="host"), "desc"),), None, stages=1),
             "sort host desc")
-        self.assertEqual(
-            self._tail(((FieldRef(name="host"), "asc"),), None),
-            "sort host asc")
 
     def test_a_dotted_field_keeps_its_path(self):
-        """`-win.eventdata.targetImage`, not `-win` -- the sign attaches to the
-        whole field name."""
         self.assertEqual(
             self._tail(((FieldRef(name="win.eventdata.targetImage"), "desc"),),
                        2),
-            "head 2 -win.eventdata.targetImage")
-
-    def test_head_with_no_ordering_field_is_still_refused(self):
-        from engine.values import Refusal
-        with self.assertRaises(Refusal) as caught:
-            render(self._with_arrange((), 5))
-        self.assertEqual(caught.exception.code,
-                         "SPL_RENDER_HEAD_WITH_NO_ORDER")
+            "sort -win.eventdata.targetImage | head 2")
 
 
 if __name__ == "__main__":

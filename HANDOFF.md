@@ -367,14 +367,16 @@ depth-scaling check.
 
 Still open, honestly:
 
-- **The SPL `head` sign convention is asserted, not verified.** The renderer
-  emits `desc -> -field` and `asc -> +field`. That mapping came from my
-  recollection of Splunk's `head` syntax, not from its documentation, and a
-  reviewer reports it may be INVERTED. Three tests pin the possibly-wrong
-  strings, so CI would not notice either way. This needs Splunk's documented
-  convention before anything else touches it. Compounding it: the SPL lowerer
-  refuses every pipeline command, so `head` is unreachable from a pasted rule and
-  no end-to-end test can currently catch the error.
+- **SPL `head` is fixed but UNREACHABLE, and the lowerer is the blocker.** The
+  renderer had no test at all, then a wrong fix, then a correct one. `head` takes
+  no fields: Splunk's documented syntax is
+  `head [keeplast] [while "<expr>"] [<limit>]`, with no field and no sort-order
+  argument, and the docs say to `sort` first. So "first N in this order" is two
+  stages, `| sort <ordering> | head <N>`. But the SPL lowerer refuses every
+  pipeline command with `SPL_COMMAND_NOT_LOWERABLE`, so no pasted rule reaches
+  the renderer and no end-to-end test can catch a regression in it. **Lowering
+  `head` and `sort` is what would make this real.** Until then the renderer
+  tests are the only thing standing behind that code.
 - **A Wazuh rule with `negate="yes"` parses and then cannot be rendered.** The
   lowerer emits `Not(Comparison(...))`; `_flatten` returns the `Not` unchanged
   and `_field` has no branch for it, so the renderer refuses with a message
