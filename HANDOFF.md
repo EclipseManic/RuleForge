@@ -97,22 +97,39 @@ found was in the nodes feeding it — which is the lesson worth carrying.
 |---|---|---|---|---|
 | **QRadar AQL** | ✅ | ✅ | ✅ | partial — `QIDNAME` unevaluable (correct: appliance-side) |
 | **YARA-L 2.0** | ✅ | ✅ | ✅ | partial — PCRE declared, not executable (correct) |
-| **Sentinel KQL** | ✅ | ✅ | ❌ | ✅ two bugs fixed |
-| **Wazuh XML** | ✅ | ✅ | ❌ | ✅ |
-| **Splunk SPL** | ✅ | ✅ | ❌ | ✅ `stats`; `tstats` refused by name |
-| Elastic EQL / Falcon CQL / Sigma | ❌ | ❌ | ❌ | ❌ not started |
+| **Sentinel KQL** | ✅ | ✅ | ✅ | ✅ |
+| **Wazuh XML** | ✅ | ✅ | ✅ | ✅ `negate`, level, multi-`Derive` all round-trip |
+| **Splunk SPL** | ✅ | ✅ | ✅ | ✅ 8/8 commands; `fillnull` refused by name |
+| Elastic EQL / Falcon CQL | ❌ | ❌ | ❌ | ❌ **not started — the real remaining gap** |
+
+### SPL IS COMPLETE EXCEPT `fillnull`, AND THE REASON IS THE IR
+
+All 8 pipeline commands lower and round-trip: `fields`, `rename`, `sort`, `head`,
+`eval`, `regex`, `stats`, `dedup`. `fillnull` is the only refusal left, and it is
+refused because `engine/ir.py` has **no node for "fill an empty value"** — not
+because the parser cannot read it. It is also not safe to ignore, because filling
+an empty field makes a LATER `where` match rows it otherwise would not, so
+dropping it would quietly **widen** the rule. The refusal message says so and
+suggests the `coalesce(...)` rewrite that does work.
+
+`dedup` rides on `Emit.dedupe_by` and **must be the last stage** — `Emit` is the
+graph's terminal, so there is nowhere to put a de-duplicating node mid-chain. A
+mid-pipeline `dedup` is refused, not relocated, because collapsing rows at a
+different point in the pipeline returns a different set of events.
 
 ### THE FOUR OF FIVE USER RULES ARE VERBATIM IN THE TESTS
 
 `test_aql.py`, `test_yaral.py`, `test_kql.py`, `test_wazuh.py` hold the user's own
-rules. `test_spl.py` does **NOT** — the user's SPL rule is nowhere in the repo, so
-those tests use this project's own `docs/advanced-rule-corpus.md` reference search
-and say so. **Getting the real SPL rule is an open task.**
+rules. `test_spl.py` does **NOT** — the user has confirmed they have no verbatim
+SPL rule to supply, so those tests use this project's own
+`docs/advanced-rule-corpus.md` reference search and **say so in the test
+docstring**. This is no longer an open task; do not keep asking for the rule.
 
 `test_wazuh.py` uses the **real shipped Wazuh ruleset** (60000/60001 from
 `0575-win-base_rules.xml`, 60102/60104/60107/60203/60205/60206 from
 `0580-win-security_rules.xml`), because the child's meaning lives entirely behind
 `if_matched_sid` and a fixture I wrote would have proved nothing.
+
 
 ---
 
@@ -296,17 +313,25 @@ found by a dialect, not by a review — a review had not caught them.**
 
 ## 9. Next tasks, in order
 
-1. **Get the user's verbatim SPL rule** and add it as an acceptance test. It is the
-   one input the tool claims to handle that is not actually verified.
-2. **KQL renderer.** Must invert the Join's column map to recover the bare KQL
-   name. **NEVER strip the prefix by string match** — `l_Process` is a legal KQL
-   field name, so a blind strip silently corrupts it. The IR does not yet carry the
-   column map, so that has to be added to `Join` first.
-3. **Wazuh and SPL renderers**, for the round-trip.
-4. **Web app** — home page + workshop, 4 tabs, append-only History JSON.
-5. **The four jobs** wired to the engine, then the full 5-rule acceptance suite.
+**Everything previously listed here is DONE** and the list was not updated. The
+real remaining work, in order:
 
-Final gate: `python-reviewer` **and** `security-reviewer` over the whole tool.
+1. **Elastic EQL** — the largest remaining gap, and the hardest. EQL is *stateful
+   and sequential* (`sequence by host with maxspan=5m`, `sample`, transitions,
+   join events), which does **not** fit the flat relational vocabulary in
+   `engine/ir.py`. Lowering sequences into a flat filter graph would be exactly
+   the class of quiet-wrongness this project spent its whole history removing.
+   **Read the real EQL grammar first**; do not lower against a guessed one.
+2. **Falcon CQL** — smaller, same category of new work.
+3. **Sigma** — **not a target.** It is validation *material*: the public
+   repositories the user listed (SigmaHQ/sigma, ThreatClaw detection-rules-samples,
+   `Hatchepsoute/sigma-rules`, Sigma Rules Hub) are a corpus to test the existing
+   dialects against, not a sixth dialect to implement. `requirements.txt` still
+   pins `pysigma` and five backends that **nothing imports** — either use them to
+   read the corpus or drop the pins; do not leave them implying a feature that is
+   not there.
+4. `python-reviewer` **and** `security-reviewer` over anything landing from 1–3,
+   before its commit.
 
 ---
 
@@ -365,24 +390,22 @@ caused by the flattening. The 250ms budget has almost no headroom on this
 hardware and the assertion should be given real margin or dropped in favour of a
 depth-scaling check.
 
-Still open, honestly:
+**"Still open, honestly" was also obsolete** — every item in it was fixed. They
+are listed in the table above with the fix that closed them. The two that were
+most worth keeping the history of:
 
-- **SPL `head` is fixed but UNREACHABLE, and the lowerer is the blocker.** The
-  renderer had no test at all, then a wrong fix, then a correct one. `head` takes
-  no fields: Splunk's documented syntax is
-  `head [keeplast] [while "<expr>"] [<limit>]`, with no field and no sort-order
-  argument, and the docs say to `sort` first. So "first N in this order" is two
-  stages, `| sort <ordering> | head <N>`. But the SPL lowerer refuses every
-  pipeline command with `SPL_COMMAND_NOT_LOWERABLE`, so no pasted rule reaches
-  the renderer and no end-to-end test can catch a regression in it. **Lowering
-  `head` and `sort` is what would make this real.** Until then the renderer
-  tests are the only thing standing behind that code.
-- **A Wazuh rule with `negate="yes"` parses and then cannot be rendered.** The
-  lowerer emits `Not(Comparison(...))`; `_flatten` returns the `Not` unchanged
-  and `_field` has no branch for it, so the renderer refuses with a message
-  blaming an "arithmetic or aggregate expression" — false for a negation. That
-  also makes `_field_elements`' `negate=` branch unreachable. Reported by
-  reading, not executed; confirm with one `author()` call before fixing.
+- **SPL `head` was correct in the renderer and UNREACHABLE**, because the lowerer
+  refused every pipeline command, so no pasted rule could reach the renderer and
+  no end-to-end test could catch a regression in it. `head` takes no fields:
+  Splunk's documented syntax is `head [keeplast] [while "<expr>"] [<limit>]`
+  with no field and no sort-order argument, and the docs say to `sort` first. So
+  "first N in this order" is two stages, `| sort <ordering> | head <N>`.
+  **The fix was to lower the commands, not to keep hardening the renderer.** A
+  renderer branch that nothing can reach is not tested, however correct it looks.
+- **Wazuh `negate="yes"` was reported by reading, not executed.** It needed one
+  `author()` call to confirm, and the real cause was the same unreachable-branch
+  pattern: the lowerer emitted `Not(Comparison(...))`, `_flatten` passed the
+  `Not` through, and `_field` had no branch for it.
 - **`rule_id` defaults to `"rule"`, but Wazuh looks the rule UP by id.** So
   every Wazuh job refuses a valid ruleset with `WAZUH_RULE_NOT_IN_DOCUMENT`
   unless the analyst also types the rule's numeric id into a second field.
@@ -390,24 +413,45 @@ Still open, honestly:
   becomes a *finding*, so `outcome.ok` stays `True` and `web.py` writes the entry
   and reports `saved: true` for an artifact that was never produced.
 
-- **The last independent review was round 7.** Each round has found real
-  criticals. Treat the current state as unverified against a fresh eye.
-- **11 known defects remain** from round 7. Highest is Wazuh `level`
-  unvalidated: `'abc'`, `'10.5'` and `'99999'` reach the artifact, and a rule
-  pasted with no level is emitted as `level=0` silently — a detection deployed at
-  level 0 with nothing said. The rest are listed in the session transcript; they
-  are two false comments in `yaral_ir.py`, a vanishing second `Derive` in
-  `wazuh_render`, SPL `head` dropping sort direction, a ReDoS screen that
-  accepts `(?:a|aa)+$` while refusing `(a|aa)+$`, a dead `SetRule` in a safety
-  allowlist, uncapped `debug_logs_to_rule`, and dead code in `regex.py`/`redos.py`.
-- History is 0600 on POSIX via `mkstemp`; on Windows `os.chmod` does not model
-  POSIX bits, so the `.gitignore` comment claiming 0600 is false there.
-- `history.py` rewrites the whole file per append: O(N^2*S), ~1 TB of writes at
-  the caps.
-- XML entity expansion is bounded by libexpat's amplification limit, which is a
-  platform accident rather than a stated invariant. `defusedxml` would fix it.
+**The defect list this section used to carry is OBSOLETE.** All 11 round-7
+defects were fixed and each fix is pinned by a test that fails without it:
+
+| Was listed as a defect | Now |
+|---|---|
+| Wazuh `level` unvalidated (`'abc'`, `'10.5'`, `'99999'`, missing→`0`) | 4 named refusals; range 0–16; explicit `0` valid |
+| Wazuh `negate` drops, `_field` blames arithmetic | renders; tests cover it |
+| Wazuh second `Derive` vanishes | `WAZUH_TWO_DERIVES_NOT_RENDERABLE` |
+| Wazuh `rule_id` defaulting to `"rule"` | single-rule docs infer; multi-rule refuse |
+| SPL `head` drops sort direction | documented two-stage `sort` \| `head` |
+| ReDoS accepts `(?:a\|aa)+$` | fixed, plus nested groups and `\w` escapes |
+| dead `SetRule` in an allowlist | removed |
+| uncapped `debug_logs_to_rule` | capped |
+| dead code in `regex.py` / `redos.py` | removed |
+| XML entity expansion a platform accident | `defusedxml`, `forbid_dtd=True` |
+| a REFUSED rule still saved as `saved: true` | `Outcome(ok=False, rendered="", refusal=...)` |
+| history O(N^2), ~1 TB of writes at the caps | JSONL: 1.02 GB, 1000x less |
+| `.gitignore` claims 0600 on Windows | corrected; the real control is the ACL |
+
+**The recurring lesson, now with four instances of it:** a renderer carrying
+code for a shape it could not receive, silently discarding the part that
+mattered. Wazuh `negate=`, SPL `regex`, SPL `dedup` (`if kind == "Emit":
+continue` reached the node and dropped the dedup), and the Wazuh integer
+grammar. All four looked like working code. Grep for `continue` and for
+unreachable `if` branches before trusting any renderer branch.
+
+- **The last independent review was round 7**, and it predates every fix above.
+  Every review round in this project's history found real criticals while the
+  suite was green. **Treat the current state as unverified against a fresh eye**
+  — in particular the `dialects/spl_*.py` changes and the `history.py` format
+  change have had no independent review.
+- `history.py` is now **JSON lines**, and the **old JSON array is still read**.
+  An existing history is upgraded by the next *save*, never by a *read* — a
+  reader must never rewrite the analyst's file, because the corruption refusals
+  promise it "has not been overwritten". A torn final line is tolerated (costs
+  the tail entry only) but only when a good entry precedes it, so a damaged file
+  is still reported as damaged.
 - Elastic EQL and Falcon CQL are not started. **Sigma is not a target** — it is an
   interchange format with no execution semantics, and counting it as missing work
-  inflated the scope for several rounds.
-- **Blocked on the user:** their verbatim SPL rule is not in the repository, and
-  three commits are unpushed.
+  inflated the scope for several rounds. Its value here is as a test corpus.
+- Nothing is blocked on the user. Everything is committed and pushed;
+  `origin/master` is at the tip.
