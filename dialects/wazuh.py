@@ -384,7 +384,42 @@ def correlation_child(rules: dict[str, WazuhRule], rule_id: str) -> WazuhRule:
 
 
 def as_int(value: str, rule_id: str, what: str) -> int:
-    """Read a frequency/timeframe, refusing an unexpanded `$VAR` by name."""
+    """Read a frequency/timeframe, refusing an unexpanded `$VAR` by name.
+
+    `int()` IS MORE PERMISSIVE THAN XML'S INTEGER GRAMMAR, AND THE GAP IS NOT
+    COSMETIC. Measured on this interpreter:
+
+        int("1_2")   == 12        <- an analyst who wrote frequency="1_2"
+        int("+12")   == 12           got TWELVE, with nothing said anywhere
+        int("١٢")    == 12        <- Arabic-Indic digits, also twelve
+        int("012")   == 12
+
+    So a typo became a different number and the tool reported the analyst's rule
+    back to them as if it were what they wrote. `_2` is not a quantity; refusing
+    it by name is the only honest answer, and "it is not a number" is a far more
+    useful sentence than a rendered correlation that fires on the twelfth event
+    of something that was written `1_2`.
+
+    The test is `isascii() and isdigit()` for the same reason as the `level`
+    guard in `wazuh_render`: `isdigit()` is true for `'²'`, which `int()` then
+    rejects with a ValueError, and for Arabic-Indic digits, which `int()`
+    accepts. Requiring ASCII first makes the accepted set exactly `'0'`-`'9'`,
+    which `int()` always parses, so nothing below can raise or silently
+    re-interpret.
+
+    THERE IS DELIBERATELY NO UPPER BOUND, and a round-7 finding asked for one.
+    Refusing it was considered and declined. A Wazuh `frequency` has no vendor
+    maximum -- any positive integer is legal -- so any cap would be a number I
+    invented, and inventing one means refusing rules that are perfectly valid.
+    A frequency of ten million describes a rule that will not fire in any real
+    window, and the evaluator already says so honestly: it counts the child rows
+    and reports no match, spending from the same budget as everything else. A
+    rule that never fires, reported as never firing, is not a silent wrongness.
+    Refusing it would be a refusal of correct input, which costs more than the
+    thing it prevents. `level` IS bounded, because Wazuh documents that range;
+    this is not the same situation and copying the guard here would be cargo
+    cult.
+    """
     text = (value or "").strip()
     if not text:
         raise WazuhParseError(
@@ -400,13 +435,14 @@ def as_int(value: str, rule_id: str, what: str) -> int:
             f"and not present in the rule file. This is not a number the rule "
             f"declares, so it is not one RuleForge will invent -- supply the "
             f"value from your ossec.conf.", "wazuh")
-    try:
-        parsed = int(text)
-    except ValueError as exc:
+    if not (text.isascii() and text.isdigit()):
         raise WazuhParseError(
             f"WAZUH_{what.upper()}_NOT_AN_INTEGER",
-            f"rule {rule_id} sets {what}=\"{text}\", which is not an integer",
-            "wazuh") from exc
+            f"rule {rule_id} sets {what}=\"{text}\", which is not a plain "
+            f"whole number of digits. Underscores, a leading sign, and non-ASCII "
+            f"digits are not quantities: Python would read \"1_2\" as twelve and "
+            f"report that back as the rule you wrote.", "wazuh")
+    parsed = int(text)
     if parsed <= 0:
         raise WazuhParseError(
             f"WAZUH_{what.upper()}_NOT_POSITIVE",

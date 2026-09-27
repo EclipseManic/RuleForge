@@ -403,5 +403,72 @@ class ConstructionRefusalTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "WAZUH_TIMEFRAME_NOT_AN_INTEGER")
 
 
+class IntegerGrammarTests(unittest.TestCase):
+    """`int()` reads MORE than XML's integer grammar does, and the difference
+    was silent rather than loud.
+
+    Measured on this interpreter before writing the guard:
+
+        int("1_2") == 12      int("+12") == 12
+        int("١٢")  == 12      int("012") == 12
+
+    So `frequency="1_2"` produced a correlation that fires on the twelfth event
+    and the tool reported it back to the analyst as their own rule. Every value
+    in the refusal list below really did parse to something, or really did raise.
+
+    THERE IS NO UPPER-BOUND TEST, DELIBERATELY. A round-7 finding asked for a
+    ceiling on `frequency` and it was declined: Wazuh documents no maximum, so any
+    cap would be invented, and a rule that never fires is reported as never
+    firing. Refusing valid input costs more than the thing it prevents. The
+    argument is written out in `as_int` so the next reader does not re-add it
+    without reading why.
+    """
+
+    def test_an_underscore_separated_number_would_have_been_twelve(self):
+        """The specific silent misreading. Asserted on `int()` directly so the
+        test states the hazard rather than only the guard."""
+        self.assertEqual(int("1_2"), 12,
+                         "if this ever becomes false the guard below is stale, "
+                         "not the guard being unnecessary")
+
+    def test_each_misreadable_value_is_refused_by_name(self):
+        for bad in ("1_2", "1_0", "+12", "١٢", "１２",
+                    "1.0", "12abc", "0x0c", "1e3", " 1 2 "):
+            with self.subTest(value=bad):
+                with self.assertRaises(WazuhParseError) as caught:
+                    as_int(bad, "60205", "frequency")
+                self.assertEqual(caught.exception.code,
+                                 "WAZUH_FREQUENCY_NOT_AN_INTEGER")
+
+    def test_the_same_grammar_applies_to_timeframe(self):
+        """Both go through one function, so both are covered -- but a guard that
+        only protected frequency would be a guard with a hole in it, and this is
+        the test that says so."""
+        with self.assertRaises(WazuhParseError) as caught:
+            as_int("1_2", "60205", "timeframe")
+        self.assertEqual(caught.exception.code, "WAZUH_TIMEFRAME_NOT_AN_INTEGER")
+
+    def test_ordinary_values_still_parse_to_themselves(self):
+        for good, expected in (("2", 2), ("5", 5), ("12", 12),
+                               ("240", 240), ("012", 12), (" 7 ", 7)):
+            with self.subTest(value=good):
+                self.assertEqual(as_int(good, "60205", "frequency"), expected)
+
+    def test_a_large_frequency_is_still_accepted_on_purpose(self):
+        """The declined ceiling, pinned as a test so it cannot be re-added by
+        accident. A rule that cannot fire is honest input: the evaluator counts
+        the rows, reports no match, and spends from the same budget as
+        everything else. Refusing it would be refusing a legal Wazuh rule."""
+        self.assertEqual(as_int("10000000", "60205", "frequency"), 10_000_000)
+
+    def test_the_ossec_variable_refusal_still_comes_first(self):
+        """A `$VAR` is not a number, but it is a DIFFERENT problem, and the
+        message that explains it is worth more than "not an integer"."""
+        with self.assertRaises(WazuhParseError) as caught:
+            as_int("$MS_FREQ", "60205", "frequency")
+        self.assertEqual(caught.exception.code,
+                         "WAZUH_FREQUENCY_IS_OSCONF_VARIABLE")
+
+
 if __name__ == "__main__":
     unittest.main()

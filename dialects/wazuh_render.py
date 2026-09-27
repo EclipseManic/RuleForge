@@ -59,15 +59,110 @@ def _attr(value: str) -> str:
 #: be a regex that matches the wrong strings.
 _COMPARISON = {"=": "eq", "!=": "ne", "<": "lt", "<=": "le", ">": "gt", ">=": "ge"}
 
+#: Wazuh's documented range for `<rule level>`.
+#:
+#: ZERO IS A REAL, LEGAL LEVEL. The shipped ruleset uses it, and this guard does
+#: NOT reject it. A guard written as "level must be positive" would refuse a
+#: correct vendor rule, and a guard that fires on the wrong input is worse than
+#: no guard -- it teaches the analyst that the tool objects to valid rules.
+LEVEL_MIN = 0
+LEVEL_MAX = 16
+
+
+def _validated_level(raw: object, from_wazuh: bool) -> str:
+    """Return a level that is safe to put in a Wazuh artifact, or refuse.
+
+    FOUR THINGS WERE WRONG, AND ONLY THE FIRST IS THE ONE PEOPLE NOTICE.
+
+    A WAZUH RULE WITH NO SEVERITY BECAME `0`. `wazuh.py` records a missing
+    `level` attribute as `""`, and this used to read
+    `ir.metadata.get("level") or "0"` -- so a rule pasted with no `level` at all
+    rendered as `level="0"`, silently. Wazuh's own default is also 0, so the
+    artifact is not *wrong*; it is UNSPEAKABLE. The analyst never wrote a
+    severity, the artifact claims they did, and a level-0 alert is not displayed
+    by default. A detection deployed that way looks healthy and matches nothing
+    anyone is looking at.
+
+    A RULE THAT WAS NEVER WAZUH AT ALL ALSO HIT THAT LINE, AND THAT IS A
+    DIFFERENT MISTAKE. Rendering a Sentinel or SPL rule as Wazuh is a thing this
+    tool is for, and such a graph carries no `level` key -- there was never a
+    severity to carry, because the source dialect has no such concept. `or "0"`
+    invented one. So the two cases are told apart by `from_wazuh` and get
+    separate codes: one says "your Wazuh rule has no severity", the other says
+    "this was not written for Wazuh and RuleForge will not pick a severity for
+    you". Neither defaults. Both fail closed.
+
+    A NON-INTEGER reached the artifact. `'abc'`, `'10.5'`, `'-1'`, `'1e3'` and
+    `'+5'` all passed straight through to `level="..."`, and `_attr` escapes XML
+    metacharacters but has no reason to question a number. Wazuh would reject
+    the file, or coerce it to something the analyst did not write.
+
+    AN OUT-OF-RANGE INTEGER reached the artifact. `'99999'` is a syntactically
+    fine integer and semantically meaningless.
+
+    THE INTEGER TEST IS `isascii() AND isdigit()`, NOT `isdigit()`. `isdigit()`
+    is true for `'²'` -- and `int('²')` then raises `ValueError`, so a crash
+    rather than a refusal. It is also true for Arabic-Indic and full-width
+    digits, which `int()` parses happily into a number the analyst never typed
+    and which Wazuh would not read. Requiring ASCII first makes the set exactly
+    `'0'`-`'9'`, which `int()` always accepts, so the parse below cannot throw.
+    """
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        if from_wazuh:
+            raise Refusal(
+                "WAZUH_LEVEL_ABSENT",
+                f"this Wazuh rule has no `level` attribute, so its severity was "
+                f"never stated. Wazuh would default it to 0, and a level-0 alert "
+                f"is not shown by default -- the rule would look deployed and be "
+                f"invisible. RuleForge will not choose a severity for you. Add an "
+                f"explicit level, for example level=\"{LEVEL_MAX}\", and it will "
+                f"render.", DIALECT)
+        raise Refusal(
+            "WAZUH_NO_LEVEL_TO_CARRY",
+            f"this rule was not written for Wazuh, so it has no severity to "
+            f"carry across, and Wazuh's `level` has no equivalent in "
+            f"{'its source dialect'}. Inventing one would put a number in the "
+            f"artifact that nobody chose -- and a level-0 alert is not displayed "
+            f"by default, so the rule would look deployed and be invisible. Say "
+            f"what severity you want and it will render.", DIALECT)
+
+    text = str(raw).strip()
+    if not (text.isascii() and text.isdigit()):
+        raise Refusal(
+            "WAZUH_LEVEL_NOT_AN_INTEGER",
+            f"level={text!r} is not a whole number. Wazuh's `level` is an "
+            f"integer from {LEVEL_MIN} to {LEVEL_MAX}; rendering this unchanged "
+            f"would produce a rule file the agent rejects. If you meant a "
+            f"severity threshold, that is a different attribute and this tool "
+            f"will not guess which one you meant.", DIALECT)
+
+    value = int(text)
+    if not (LEVEL_MIN <= value <= LEVEL_MAX):
+        raise Refusal(
+            "WAZUH_LEVEL_OUT_OF_RANGE",
+            f"level={value} is outside Wazuh's range of {LEVEL_MIN} to "
+            f"{LEVEL_MAX}. A number that large is not a severity, and emitting "
+            f"it would put a value in the artifact that the agent cannot act on.",
+            DIALECT)
+    return text
+
 
 def render(ir: RuleIR) -> str:
     """Render a RuleIR back to Wazuh ruleset XML."""
     rule_id = ir.metadata.get("wazuh_id") or ir.rule_id
-    level = ir.metadata.get("level") or "0"
 
     filters = [n for n in ir.nodes if isinstance(n, Filter)]
     package = next((n for n in ir.nodes if isinstance(n, Package)), None)
-    derive = next((n for n in ir.nodes if isinstance(n, Derive)), None)
+    # EVERY Derive, NOT THE FIRST ONE. This was `next((n for n in ir.nodes if
+    # isinstance(n, Derive)), None)`, which stops at the first match and says
+    # nothing about a second -- and the node check below `continue`s on Derive,
+    # so a second one was not caught there either. It vanished. The comment this
+    # function carried for three rounds claimed a second Derive was covered; it
+    # was covered by nothing. Collecting the whole list is what makes the
+    # "no silent drop" promise true, and the count is checked where the
+    # derivation is consumed.
+    derives = [n for n in ir.nodes if isinstance(n, Derive)]
+    derive = derives[0] if derives else None
     aggregate = next((n for n in ir.nodes if isinstance(n, Aggregate)), None)
 
     # INVERT THE DEFAULT. This function used to pick out the Filter, Package,
@@ -103,8 +198,52 @@ def render(ir: RuleIR) -> str:
     # rule tests event fields, not computed columns"; the generic node check
     # would say "SetOp is not renderable" about some other node in the same
     # graph, which is true and useless.
+    # TWO Derive NODES, AND WAZUH HAS NOWHERE TO PUT THE SECOND. A projection
+    # and a rename both lower to `Derive`, and `<rule>` has no second slot, so
+    # the honest answer is to refuse rather than render one of them. It used to
+    # be `next((n for n in ir.nodes if isinstance(n, Derive)), None)`, which
+    # stops at the first and says nothing about the second -- and the node check
+    # below `continue`s on `Derive`, so a second one was caught by NOTHING. The
+    # comment this function carried for three rounds claimed it was covered.
+    #
+    # IT SITS BELOW THE AGGREGATE RETURN ON PURPOSE, which is where it was NOT
+    # when first written. The user's own Sentinel rule lowers to a KQL graph
+    # that has BOTH two Derives and an Aggregate, and this guard fired first and
+    # reported the two-derive problem -- true, but not the reason that explains
+    # the output. "a Wazuh rule tests event fields, not computed columns" is the
+    # useful sentence when a summarise is present. Putting this above the
+    # aggregate return is also SAFE to move, because `_render_plain` refuses
+    # unconditionally when an Aggregate is present, so that path can never reach
+    # an artifact and needs no Derive guard of its own.
+    if len(derives) > 1 and aggregate is None:
+        raise Refusal(
+            "WAZUH_TWO_DERIVES_NOT_RENDERABLE",
+            f"this rule has {len(derives)} Derive nodes -- a projection and a "
+            f"rename, most likely. A Wazuh rule has no second place to put one: "
+            f"one of them was being dropped, which is how a rename stops "
+            f"happening and the rule matches on a column name the analyst never "
+            f"wrote. Render it with the dialect that supports both.", DIALECT)
+
     if aggregate is not None:
-        return _render_plain(ir, filters, derive, aggregate, rule_id, level)
+        # THE LEVEL IS DELIBERATELY NOT VALIDATED ON THIS PATH. `_render_plain`
+        # refuses unconditionally the moment an Aggregate is present, before it
+        # writes anything, so a level can never reach an artifact by this route
+        # -- there is nothing to guard.
+        #
+        # Validating anyway was the bug. It made a level complaint outrank the
+        # aggregate complaint, so the user's own Sentinel rule -- a graph with
+        # both an Aggregate and no Wazuh level -- was told its level was missing
+        # instead of being told that a Wazuh rule tests event fields rather than
+        # computed columns. Both are refusals and both fail closed; only the
+        # sentence the analyst reads changes, and the aggregate sentence is the
+        # one that explains the output.
+        #
+        # `str(... or "0")` is a placeholder that is never written anywhere. It
+        # is here because the call signature takes a level, and passing a value
+        # that provably cannot be used is better than widening the signature or
+        # duplicating the refusal.
+        return _render_plain(ir, filters, derive, aggregate, rule_id,
+                             str(ir.metadata.get("level") or "0"))
 
     for node in ir.nodes:
         if isinstance(node, (Filter, Package, Derive, Aggregate)):
@@ -119,6 +258,17 @@ def render(ir: RuleIR) -> str:
             f"intersection and a correlation lost its own condition -- a rule "
             f"matching a different set of events than the one you asked about. "
             f"Render it with the dialect that supports it.", DIALECT)
+
+    # THE LEVEL IS VALIDATED HERE, AND THE POSITION IS FORCED BY THE SHAPE OF
+    # THE FUNCTION. Both returns that CAN write a level -- correlation and plain
+    # -- are below here, so both are covered, and the aggregate return above is
+    # already an unconditional refusal. Nothing reaches `_wrap` unvalidated.
+    #
+    # `wazuh.py` records a missing `level` as `""`, so a Wazuh rule with no
+    # severity arrives as an empty STRING, while a rule that was never written
+    # for Wazuh at all arrives as a MISSING KEY. Those are different mistakes
+    # and they get different refusals -- see `_validated_level`.
+    level = _validated_level(ir.metadata.get("level"), "level" in ir.metadata)
 
     if package is not None:
         return _render_correlation(ir, package, rule_id, level)
