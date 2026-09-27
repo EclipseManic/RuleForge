@@ -220,6 +220,27 @@ def create_app() -> Flask:
             except history.Refused as exc:
                 outcome.findings.append(jobs.Finding(
                     "HISTORY_NOT_SAVED", "caution", str(exc)))
+            except OSError as exc:
+                # A LOCKED FILE IS NOT A BUG, IT IS A LOCKED FILE. `Refused` alone
+                # was too narrow: on Windows, `os.replace` over a file another
+                # process holds open fails with PermissionError, because CPython
+                # does not open with FILE_SHARE_DELETE and Notepad-class handles
+                # deny share-write too. That escaped as a bare 500 from a route
+                # whose entire job is to tell the analyst what happened to their
+                # save, and the generic `except Exception` that would have caught
+                # it lives in a DIFFERENT try block that ended at line 190.
+                #
+                # The trigger is the workflow this tool documents: read, back up
+                # and edit the history file yourself. So a save failing because
+                # the analyst has it open in an editor is EXPECTED, and it is
+                # reported as a caution with the OS's own words rather than as a
+                # server fault.
+                outcome.findings.append(jobs.Finding(
+                    "HISTORY_NOT_SAVED", "caution",
+                    f"the history file could not be written: {exc}. If you have "
+                    f"it open in an editor or another copy of RuleForge is "
+                    f"running, close it and save again. The rule itself is "
+                    f"unaffected."))
 
         body = outcome.to_dict()
         body["saved"] = saved is not None

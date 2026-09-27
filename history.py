@@ -387,7 +387,19 @@ def _append_line(path: Path, entry: dict[str, Any]) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(entry, ensure_ascii=False)
-    with path.open("a", encoding="utf-8", newline="\n") as stream:
+    # CREATED 0600 FROM BIRTH, NOT CHMOD-ed AFTERWARDS. `path.open("a")` creates
+    # the file at the process umask -- 0644 on a typical POSIX box -- and the
+    # `os.chmod` below used to narrow it only after the write and the close. So
+    # there was a real window in which a file the `.gitignore` comment describes
+    # as holding "pasted detection rules and EVENT SAMPLES, which contain
+    # hostnames, usernames, source IPs and destination IPs" was world-readable.
+    #
+    # `os.open` takes the mode at creation, so the file is never briefly
+    # readable by anyone else. The rewrite path already had this for free:
+    # `mkstemp` creates 0600. The two paths were not equal, and the comment on the
+    # chmod claimed they were.
+    handle = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
         stream.write(line + "\n")
         stream.flush()
         os.fsync(stream.fileno())
