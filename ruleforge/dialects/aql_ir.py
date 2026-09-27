@@ -388,26 +388,32 @@ def render(ir: RuleIR) -> str:
                 "computed column has no AQL form. Rendering the rest would hand "
                 "you a query with the derivation missing from it.",
                 "AQL")
-        elif name in ("Join", "SetOp", "Pattern", "Package", "Expand"):
-            # NO SILENT `else`, AND THAT IS THE POINT. This loop used to fall
-            # through for every node type it did not name, so a graph containing
-            # a `Package` -- a parent/child correlation, whose ENTIRE detection
-            # lives in that node -- rendered as `SELECT * FROM events`. No
-            # refusal, no diagnostic, and the artifact still carried the
-            # "NOT a deployable QRadar rule" header, so it read as finished.
-            # `wazuh_render.py` calls that "the most dangerous output this tool
-            # can produce", and it was true here too.
+        elif name == "Emit":
+            # The one node that produces no AQL text of its own.
+            pass
+        else:
+            # THE TERMINAL `else`, WHICH THE COMMENT ABOVE CLAIMED AND DID NOT
+            # HAVE. The `raise` in that branch was the body of
+            # `elif name in ("Join", "SetOp", "Pattern", "Package", "Expand")` --
+            # a list of kinds someone remembered to forbid. Anything NOT on that
+            # list fell through the chain in silence, so the day a node type was
+            # added to the IR, this renderer would drop it without a word. Today
+            # the only kind that lands here is `Emit`, which is harmless, which is
+            # exactly why the gap survived: a missing `else` whose only current
+            # victim is the one node that does not matter.
             #
-            # AQL has no parent/child correlation, no multi-event pattern and no
-            # unnest. Naming that is the correct output; emitting the rest of the
-            # query as though this node were not there is not.
+            # This now enumerates what is RENDERABLE rather than what is not,
+            # which is the same inversion that closed the AQL node-dropping
+            # round in one pass and the Wazuh correlation drop in another. A new
+            # node type is refused on arrival until someone teaches AQL to write
+            # it, instead of being silently omitted.
             raise Refusal(
                 "AQL_NODE_NOT_RENDERABLE",
-                f"this rule contains a {name} node. AQL has no equivalent -- a "
-                f"correlation, a sequence and an unnest are all things an AQL "
-                f"search cannot express -- so rendering the rest of the graph "
-                f"would hand you a query with the detection missing from it. "
-                f"The rule is fully understood; it simply has no AQL form.",
+                f"this rule contains a {name} node, and no branch of this "
+                f"renderer knows how to write it. Rendering the rest of the "
+                f"graph would hand you a query with that node missing from it, "
+                f"silently. A new node type is refused here on purpose, until "
+                f"there is a branch for it above.",
                 "AQL")
 
     if not select_items:
@@ -436,14 +442,44 @@ def render(ir: RuleIR) -> str:
 
 
 def _is_post_aggregate(ir: RuleIR, node: Any) -> bool:
-    """A Filter downstream of an Aggregate is HAVING, not WHERE.
+    """Is this Filter downstream of an Aggregate? Then it is HAVING, not WHERE.
 
     Getting this backwards moves the threshold before the grouping, so COUNT
     sees rows the rule never meant to consider and the numbers change.
+
+    IT WALKS THE CHAIN BACK, NOT JUST ONE EDGE. The test used to be
+    `candidate.id == node.input` -- the DIRECT parent only -- so
+
+        Read -> Aggregate(g) -> Filter(f1) -> Filter(f2)
+
+    classified f1 as HAVING and f2 as WHERE, and rendered
+
+        SELECT COUNT(*) AS c
+        FROM events
+        WHERE c = '9'      <- f2, before GROUP BY, on a column that does not
+        HAVING c = '5'      <- exist until the aggregate has run
+
+    which is not a query a QRadar console will accept, and is a threshold
+    applied to the wrong set even if it were. The two clauses also came out in
+    reverse pipeline order, because HAVING is appended after GROUP BY
+    unconditionally regardless of which filter came first.
+
+    Walking back means a filter is post-aggregate if ANY ancestor is an Aggregate
+    -- not just the nearest -- because once a graph has aggregated, every
+    downstream row is a group, and every condition from there on is a condition
+    on groups.
     """
-    for candidate in ir.nodes:
-        if type(candidate).__name__ == "Aggregate" and candidate.id == node.input:
+    by_id = {node.id: node for node in ir.nodes}
+    seen: set[str] = set()
+    current = getattr(node, "input", None)
+    while isinstance(current, str) and current not in seen:
+        seen.add(current)
+        parent = by_id.get(current)
+        if parent is None:
+            return False
+        if type(parent).__name__ == "Aggregate":
             return True
+        current = getattr(parent, "input", None)
     return False
 
 
