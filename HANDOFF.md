@@ -367,6 +367,37 @@ depth-scaling check.
 
 Still open, honestly:
 
+- **A THIRD ReDoS GAP, MEASURED AND NOT FIXED.** `(?:(?:a|aa))+$` and
+  `(?:(?:aa|a))+$` are ACCEPTED and are genuinely exponential: 0.0003s at n=18
+  rising to 0.0778s at n=30, about 1.59x per character added, which
+  extrapolates past 20s by n=42. The plain `(a|aa)+$` and the single-wrapped
+  `((a|aa))+$` are both refused, so the gap is specifically a `?:` prefix
+  COMBINED WITH a second layer of nesting, in the ALTERNATION path. It is a
+  different defect from the two fixed in the same commit and was not fixed by
+  them. Next step: find why the alternation body's scan does not see through two
+  prefixed wrappers, and assert the property "if `(X)+$` is refused then
+  `(?:(?:X))+$` is refused" the way the quantifier path now is.
+- **The SPL `head` sign convention is asserted, not verified.** The renderer
+  emits `desc -> -field` and `asc -> +field`. That mapping came from my
+  recollection of Splunk's `head` syntax, not from its documentation, and a
+  reviewer reports it may be INVERTED. Three tests pin the possibly-wrong
+  strings, so CI would not notice either way. This needs Splunk's documented
+  convention before anything else touches it. Compounding it: the SPL lowerer
+  refuses every pipeline command, so `head` is unreachable from a pasted rule and
+  no end-to-end test can currently catch the error.
+- **A Wazuh rule with `negate="yes"` parses and then cannot be rendered.** The
+  lowerer emits `Not(Comparison(...))`; `_flatten` returns the `Not` unchanged
+  and `_field` has no branch for it, so the renderer refuses with a message
+  blaming an "arithmetic or aggregate expression" — false for a negation. That
+  also makes `_field_elements`' `negate=` branch unreachable. Reported by
+  reading, not executed; confirm with one `author()` call before fixing.
+- **`rule_id` defaults to `"rule"`, but Wazuh looks the rule UP by id.** So
+  every Wazuh job refuses a valid ruleset with `WAZUH_RULE_NOT_IN_DOCUMENT`
+  unless the analyst also types the rule's numeric id into a second field.
+- **A REFUSED rule is still recorded in the history as saved.** A render refusal
+  becomes a *finding*, so `outcome.ok` stays `True` and `web.py` writes the entry
+  and reports `saved: true` for an artifact that was never produced.
+
 - **The last independent review was round 7.** Each round has found real
   criticals. Treat the current state as unverified against a fresh eye.
 - **11 known defects remain** from round 7. Highest is Wazuh `level`

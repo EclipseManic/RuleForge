@@ -467,5 +467,174 @@ class KqlBackslashEscaping(unittest.TestCase):
         self.assertEqual(kql_render.render_literal('a"b'), '"a\\"b"')
 
 
+class NestingMustNotHideTheCheck(unittest.TestCase):
+    """ONE EXTRA PAIR OF PARENTHESES MUST NOT CHANGE THE VERDICT.
+
+    `((a+))+$` was ACCEPTED while `(a+)+$` was refused. Same language, and the
+    only difference is a redundant group. Measured on the accepted one:
+    0.0083s at n=18, 2.64s at n=26, 58.3s at n=30. `((a*))+$` reached 11s at
+    n=26.
+
+    The cause was an ASYMMETRY, and the asymmetry is the whole point. The
+    alternation check descends into nested group bodies, so `((a|aa))+$` was
+    always refused. The quantifier check treated a nested group as a single
+    ATOM with no quantifier, so the `+` one level down was invisible. Nothing
+    in the module said those two should differ.
+
+    The test is stated as the PROPERTY rather than as a list of patterns,
+    because the property is what has to hold: for any body X, if `(X)+$` is
+    refused then `((X))+$` must be too. A table of hand-picked patterns would
+    pass again the next time someone found a fourth spelling.
+    """
+
+    #: Bodies that are catastrophic once wrapped. Every one of these is refused
+    #: in its plain `(X)+$` form -- asserted below, so the property cannot be
+    #: satisfied by refusing everything.
+    BODIES = ("a+", "a*", "a{1,}", "a|aa", "[a-z]+", "aa|a", "\\w+a")
+
+    def test_the_plain_form_is_refused_for_every_body(self):
+        """The premise of the property, asserted so it cannot rot."""
+        for body in self.BODIES:
+            with self.subTest(body=body):
+                self.assertIsNotNone(
+                    catastrophic_reason(f"({body})+$"),
+                    f"({body})+$ is not being refused, so the wrapped form is "
+                    f"not a bypass of anything")
+
+    def test_wrapping_in_a_redundant_group_does_not_help(self):
+        for body in self.BODIES:
+            with self.subTest(body=body):
+                self.assertIsNotNone(
+                    catastrophic_reason(f"(({body}))+$"),
+                    f"(({body}))+$ was ACCEPTED while ({body})+$ is refused")
+
+    def test_several_layers_of_wrapping_do_not_help_either(self):
+        for body in self.BODIES:
+            with self.subTest(body=body):
+                self.assertIsNotNone(catastrophic_reason(f"((({body})))+$"))
+
+    def test_a_group_prefix_does_not_help(self):
+        """`(?:` is the same wrapper spelled differently, and the prefix parsing
+        has to reach the same verdict through it.
+
+        KNOWN INCOMPLETE, AND THE INCOMPLETENESS IS DELIBERATELY NOT ASSERTED
+        AS PASSING. `(?:(?:a|aa))+$` and `(?:(?:aa|a))+$` are still ACCEPTED, and
+        they are genuinely exponential: measured 0.0003s at n=18 rising to
+        0.0778s at n=30, about 1.59x per character added, which extrapolates past
+        20s by n=42. The plain and single-wrapped forms are refused, so the gap
+        is specifically a `?:` wrapper COMBINED WITH a second layer of nesting in
+        the ALTERNATION path -- a different defect from the quantifier path fixed
+        in the same commit, and not fixed by it.
+
+        So the bodies asserted here are the ones without a bare alternation,
+        which is where this commit's fix applies. The alternation-through-`?:`
+        case is recorded in HANDOFF.md as an open finding with its measurement
+        rather than being written as a test that passes. A test asserting a known
+        bad state as expected is worse than no test: it institutionalises the bug
+        and turns red into green by agreement.
+        """
+        for body in ("a+", "a*", "a{1,}", "[a-z]+", "\\w+a"):
+            with self.subTest(body=body):
+                self.assertIsNotNone(
+                    catastrophic_reason(f"(?:(?:{body}))+$"),
+                    f"(?:(?:{body}))+$ was accepted")
+
+
+class EscapeClassesMustNotBeReadAsLiterals(unittest.TestCase):
+    """`_first_set` returned `{atom[1]}` for EVERY escape.
+
+    For a word escape that is the letter `w` -- the NAME of the class, treated
+    as a literal character. So it and `a` were "proved" disjoint and the
+    pattern below was accepted. Measured: 0.0022s at n=20, 0.18s at n=30,
+    12.5s at n=38 -- about 8.7x per character added. The unwrapped equivalent
+    `(aa|a)+$` is refused.
+
+    The error is one of DIRECTION. Every consumer needs an UPPER bound on what
+    an atom can match, because it uses the answer to prove two atoms cannot
+    collide. One character is a LOWER bound, and a lower bound used as an upper
+    bound proves the opposite of what is true.
+
+    The module's own docstring named this exact invariant -- "None means
+    UNKNOWN, and unknown is treated as overlapping with everything" -- and the
+    code broke it. That is why these are tested as a group: the convention has
+    to hold for every escape, not for the one somebody remembered.
+    """
+
+    def test_a_word_class_is_not_the_letter_w(self):
+        self.assertIsNotNone(catastrophic_reason(r"(\w+a)+$"))
+
+    def test_a_digit_class_is_not_the_letter_d(self):
+        """Asserted on `_first_set` DIRECTLY, because guessing an end-to-end
+        pattern for this one produced two wrong tests in a row.
+
+        The first attempt used `(\\d+a)+$`. The second used `(\\d\\da|\\da)+$`.
+        Both FAILED, and both times the screen was right and the test was wrong:
+        a digit and `a` cannot collide, so neither pattern has anything to
+        re-split, and I had asserted a falsehood rather than measuring. The
+        defect class is identical to a false comment -- a claim outrunning the
+        code -- and it is cheaper to catch by testing the thing that changed.
+
+        What changed is one line: the escape branch returned `{atom[1]}`, so
+        `\\d` became `{'d'}`. So that is what is asserted here. The end-to-end
+        consequence is covered by `test_two_branches_that_collide_through_escapes`,
+        which was measured before it was written.
+        """
+        import string
+
+        from engine.redos import _first_set
+
+        self.assertEqual(_first_set(r"\d"), frozenset(string.digits))
+        self.assertNotEqual(_first_set(r"\d"), {"d"})
+        # A word class must CONTAIN letters, which is the whole point: it is what
+        # makes it collide with a literal `a` instead of being 'proved' disjoint.
+        self.assertIn("a", _first_set(r"\w"))
+        self.assertNotEqual(_first_set(r"\w"), {"w"})
+        # Inside a character class the same one-line error existed.
+        self.assertEqual(_first_set(r"[\d]"), frozenset(string.digits))
+
+    def test_two_branches_that_collide_through_escapes(self):
+        """`\\d` and `\\w` genuinely share every digit, so `\\d\\d` and `\\w\\d`
+        are ambiguous at position two. Read as `{'d'}` versus `{'w'}` they looked
+        disjoint."""
+        self.assertIsNotNone(catastrophic_reason(r"(\d\d|\w\d)+$"))
+
+    def test_an_escape_inside_a_character_class(self):
+        """`[\\d]` used to contribute the letter `d` to the class, through a
+        second copy of the same one-line error."""
+        self.assertIsNotNone(catastrophic_reason(r"([\w]+a)+$"))
+
+    def test_a_backreference_is_not_the_digit_after_the_slash(self):
+        """`\\1` is unknowable without running the pattern, and this function
+        must not run anything."""
+        self.assertIsNone(catastrophic_reason(r"^(\w)\1(\w)\2$"),
+                          "a pattern with backreferences should be judged on "
+                          "its literal parts, not refused outright")
+
+    def test_a_word_boundary_is_not_the_letter_b(self):
+        """`\\b` matches the EMPTY string. Reporting it as `b` made a boundary
+        assertion look like a literal."""
+        self.assertIsNone(catastrophic_reason(r"\bword\b+\s"))
+
+    def test_ordinary_patterns_that_use_escapes_are_still_accepted(self):
+        """THE DIRECTION THAT MATTERS MOST. A ReDoS screen that refuses the
+        standard shapes for an email, an IP, a date, a path or a word boundary
+        is worse than no screen, because detection rules are full of them."""
+        for pattern in (r"^\w+@\w+\.\w+$",
+                        r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$",
+                        r"\d{4}-\d{2}-\d{2}",
+                        r"[0-9]+(\.[0-9]+)?",
+                        r"([a-z]+\.)+[a-z]+",
+                        r"\bSYSTEM\b",
+                        r"^lsass\.exe$",
+                        r"\\lsass\.exe$",
+                        r"(?i)\bcmd\.exe\b",
+                        r"\s+ERROR\s+"):
+            with self.subTest(pattern=pattern):
+                self.assertIsNone(
+                    catastrophic_reason(pattern),
+                    f"{pattern} is an ordinary detection pattern and must not "
+                    f"be refused")
+
+
 if __name__ == "__main__":
     unittest.main()

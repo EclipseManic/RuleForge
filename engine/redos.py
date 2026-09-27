@@ -1,4 +1,4 @@
-"""Reject patterns that can take exponential time on a non-matching subject.
+r"""Reject patterns that can take exponential time on a non-matching subject.
 
 THE PRECISE CONDITION, NOT A BLUNT ONE
 
@@ -27,6 +27,7 @@ named error the analyst can act on; a hang is not.
 from __future__ import annotations
 
 import re
+import string
 
 #: At this many unbounded quantifiers the product of the split counts stops being
 #: safe. `a*a*a*$` is three and is already exponential. Ordinary detection regexes
@@ -41,6 +42,22 @@ _MAX_ALT_LEN = 24
 # a pattern cannot make the ANALYSIS expensive -- an unbounded analysis is a
 # denial-of-service vector wearing the costume of a security control.
 _MAX_ANALYSIS_DEPTH = 64
+
+#: `\d` and `\w`, as the SETS THEY MATCH rather than the names they are spelled.
+#: Every other escape is either a literal (handled inline) or unknown, and
+#: unknown is the safe answer. See `_first_set` for why direction matters more
+#: than completeness here.
+_CLASS_ESCAPES: dict[str, frozenset[str]] = {
+    "d": frozenset(string.digits),
+    "w": frozenset(string.ascii_letters + string.digits + "_"),
+}
+
+#: Control-character escapes, which ARE literals -- unlike `\b`, which is not a
+#: literal and was being reported as the letter `b`.
+_CONTROL_ESCAPES: dict[str, str] = {
+    "n": "\n", "t": "\t", "r": "\r", "f": "\f", "v": "\v",
+    "a": "\a", "0": "\0",
+}
 
 # `_ATOM` USED TO BE DEFINED HERE AND WAS CALLED BY NOTHING. It was an atom
 # pattern for a tokeniser this module no longer has -- `catastrophic_reason`
@@ -142,6 +159,39 @@ def _char_shape(branch: str) -> list[set[str]] | None:
     return out or None
 
 
+def _body_start_after_prefix(text: str, paren: int) -> int:
+    """Index just past a group-opening `(` and any prefix that follows it.
+
+    SHARED BY `_group_body_start` AND `_group_inner` ON PURPOSE. Those two
+    callers need the same knowledge -- which characters after `(` are a group
+    prefix rather than body -- and when the alternation check and the quantifier
+    check each carried their own copy of these rules, they disagreed, and the
+    disagreement was the bug: `((a|aa))+$` was refused because the alternation
+    path descended correctly while the quantifier path did not. One
+    implementation, two callers, cannot drift.
+    """
+    length = len(text)
+    after = paren + 1
+    if after >= length or text[after] != "?":
+        return after
+
+    marker = text[after + 1:after + 2]
+    if marker == "P" and text[after + 2:after + 3] == "<":
+        close = text.find(">", after + 3)
+        return (close + 1) if close != -1 else after + 1
+    if marker == "<":
+        return after + 3
+    if marker in (":", "=", "!"):
+        return after + 2
+    if marker == "#":
+        close = text.find(")", after + 2)
+        return len(text) if close == -1 else close + 1
+    index = after + 1
+    while index < length and text[index] not in "):":
+        index += 1
+    return (index + 1) if index < length and text[index] == ":" else index
+
+
 def _group_body_start(pattern: str, paren: int) -> int:
     """Index of the first character INSIDE the group opened at `paren`.
 
@@ -171,35 +221,7 @@ def _group_body_start(pattern: str, paren: int) -> int:
     rather than waved through: an unparsed prefix is a reason to be suspicious,
     not a reason to assume the body is clean.
     """
-    length = len(pattern)
-    after = paren + 1
-    if after >= length or pattern[after] != "?":
-        return after
-
-    marker = pattern[after + 1:after + 2]
-    if marker == "P" and pattern[after + 2:after + 3] == "<":
-        # (?P<name>  -- a NAMED capture. The name ends at '>', so the body starts
-        # after it. The old code stopped at the '<' and landed ON the name, so
-        # the slice began inside the identifier.
-        close = pattern.find(">", after + 3)
-        return (close + 1) if close != -1 else after + 1
-    if marker == "<":
-        # (?<= (?<!  -- lookbehind. Two characters after the '?'.
-        return after + 3
-    if marker in (":", "=", "!"):
-        # (?:  (?=  (?!  -- non-capturing and lookahead. One character after.
-        return after + 2
-    if marker == "#":
-        # (?#...)  -- a comment group, which contains no body at all. The
-        # comment text is not a pattern, so nothing inside it can be catastrophic.
-        close = pattern.find(")", after + 2)
-        return len(pattern) if close == -1 else close + 1
-    # (?imsx)  or  (?imsx:...)  -- inline flags, with or without a group. Walk
-    # to the ')' or ':' and, in the ':' case, step past it.
-    index = after + 1
-    while index < length and pattern[index] not in "):":
-        index += 1
-    return (index + 1) if index < length and pattern[index] == ":" else index
+    return _body_start_after_prefix(pattern, paren)
 
 
 def _quantified_bodies(pattern: str) -> list[tuple[int, str, str]]:
@@ -246,11 +268,49 @@ def _quantified_bodies(pattern: str) -> list[tuple[int, str, str]]:
 
 
 def _first_set(atom: str) -> set[str] | None:
-    """Characters `atom` can match, or None when that is "anything".
+    r"""Characters `atom` can match, or None when that is "anything".
 
     None means UNKNOWN, and unknown is treated as overlapping with everything.
     A control that assumes two atoms are disjoint when it has not proved it is
-    the same class of bug as the one this module exists to prevent.
+    the same class of bug as this module exists to prevent.
+
+    THE ESCAPE BRANCH USED TO BE `{atom[1]}`, AND THAT MADE THE WHOLE
+    CONVENTION A LIE. For a word escape that is `{'w'}` -- the name of the
+    class, as a literal letter. So that escape and `a` were "proved" disjoint,
+    the pattern below was accepted, and it grows 8.71x per character added:
+    measured 0.0022s at n=20 and 12.5s at n=38. The unwrapped equivalent
+    `(aa|a)+$` is refused.
+
+    The error is one of DIRECTION, not of detail. Every consumer of this
+    function needs an UPPER bound on what an atom can match, because it uses the
+    result to prove two atoms CANNOT collide. A one-character set is a LOWER
+    bound. A lower bound used as an upper bound proves the opposite of what is
+    true, which is why the docstring above could name the exact invariant and
+    the code still break it: `\d` became `{'d'}`, `\s` became `{'s'}`, `\b`
+    became `{'b'}`, and a backreference `\1` became `{'1'}`.
+
+    So each escape is classified by what it MEANS, not by what it is spelled:
+
+      `\\d`      the ten ASCII digits -- a complete, exact, small set
+      `\\w`      ASCII letters, digits and underscore. Python's `\\w` is Unicode
+                 aware for str patterns, so this is not the whole truth; it is
+                 a superset of what matters for collision detection on real
+                 event fields, and it is deliberately on the LARGE side because
+                 finding a collision is the safe direction.
+      `\\s`      None. Whitespace under `re.UNICODE` is not a small set, and a
+                 short approximation here is a lower bound again.
+      `\\D \\W \\S`  None. These are NEGATIONS -- "anything except" -- and the
+                 whole point is that they are not enumerable.
+      `\\b \\B \\A \\Z \\z \\G`  None. Zero-width assertions match the EMPTY
+                 string, not a character. Reporting them as their own name made
+                 `\\b` look like the letter `b`.
+      `\\1`..`\\99`  None. A backreference matches whatever the group captured,
+                 which is unknowable without executing the pattern -- and this
+                 function must not execute anything.
+      `\\n \\t \\r \\f \\v \\a \\0`  the real control characters. These ARE
+                 literals, and reporting them as the letter `n` was wrong.
+      punctuation  `\\.` `\\\\` `\\+` ... all single characters, and a single
+                 character IS the complete answer. These stay exact.
     """
     if not atom:
         return None
@@ -258,7 +318,22 @@ def _first_set(atom: str) -> set[str] | None:
     if char == "\\":
         if len(atom) == 1:
             return None
-        return {atom[1]}
+        kind = atom[1]
+        if kind in _CLASS_ESCAPES:
+            return _CLASS_ESCAPES[kind]
+        # Negated classes and zero-width assertions. `\b` matching the letter
+        # `b` is how a boundary assertion turned into a literal, and a literal
+        # here is a false proof of disjointness.
+        if kind in "sSbBAZGzgWDS":
+            return None
+        if kind.isdigit():
+            # A backreference. Unknowable without running the pattern.
+            return None
+        if kind in _CONTROL_ESCAPES:
+            return {_CONTROL_ESCAPES[kind]}
+        # Anything else is escaped PUNCTUATION, which is a literal in both
+        # Python flavours, so one character is the complete answer.
+        return {kind}
     if char == "[":
         close = atom.find("]")
         if close < 0:
@@ -269,7 +344,17 @@ def _first_set(atom: str) -> set[str] | None:
         index = 1
         while index < close:
             if atom[index] == "\\":
-                out.add(atom[index + 1])
+                escaped = atom[index + 1]
+                if escaped in _CLASS_ESCAPES:
+                    out |= _CLASS_ESCAPES[escaped]
+                elif escaped in "sSbBAZGzgWDS" or escaped.isdigit():
+                    # Same reasoning as above, and it bites here too: `[\d]`
+                    # used to contribute the letter `d`.
+                    return None
+                elif escaped in _CONTROL_ESCAPES:
+                    out.add(_CONTROL_ESCAPES[escaped])
+                else:
+                    out.add(escaped)
                 index += 2
                 continue
             if (index + 2 < close and atom[index + 1] == "-"
@@ -414,10 +499,47 @@ def _open_after(items: list[tuple[str, str, set[str] | None]]) -> bool:
     quantifier and nothing after it PROVED it cannot consume the same text.
     `[a-z]+\\.` is closed -- the dot is a mandatory separator. `[a-z]+` and
     `[a-z]+[a-z]` are open.
+
+    AND A NESTED GROUP IS NOT AN ATOM, IT IS A BODY. It used to be treated as
+    one: `((a+))+$` gives a single item, the atom `(a+)` with quantifier `''`, so
+    nothing in this loop ever saw the `+` and the group looked closed. The
+    pattern was accepted, and it grows 4.00x per character added -- 0.022s at
+    n=18, 1.40s at n=24 -- while the unwrapped `(a+)+$` is refused.
+
+    That is the same language with one pair of parentheses around it, and the
+    ONLY reason it behaved differently is that the alternation check descends
+    into nested bodies and this one did not. The asymmetry was the bug:
+    `((a|aa))+$` was always refused, `((a+))+$` never was, and nothing in the
+    module said those two should differ.
+
+    So a group atom is now expanded and recursed into. The body is located with
+    the SAME `_body_start_after_prefix` the quantified-body scan uses, so the two
+    paths cannot disagree about where a body starts -- which is precisely how
+    they came to disagree in the first place.
+
+    RECURSION IS BOUNDED, NOT ASSUMED. A group whose inner call is already
+    deeper than `_MAX_ANALYSIS_DEPTH` stops descending and is reported as OPEN,
+    which is the refusing answer. An unbounded search here would be a
+    denial-of-service vector in the middle of a denial-of-service screen, which
+    is not a trade anyone needs to make.
     """
+    return _open_after_at_depth(items, 0)
+
+
+def _open_after_at_depth(items: list[tuple[str, str, set[str] | None]],
+                         depth: int) -> bool:
     pending: set[str] | None = None
     open_ = False
     for atom, quantifier, fset in items:
+        if atom.startswith("(") and atom.endswith(")"):
+            if depth >= _MAX_ANALYSIS_DEPTH:
+                return True
+            inner = atom[_body_start_after_prefix(atom, 0):-1]
+            if inner and _open_after_at_depth(_items(inner), depth + 1):
+                # The nested body is itself open, so this group is open: the
+                # outer quantifier can hand the same text to the inner one in
+                # more than one way.
+                return True
         if _is_unbounded(quantifier):
             pending = fset
             open_ = True
