@@ -31,6 +31,11 @@ from dialects.spl import LANGUAGE as SPL_LANGUAGE
 from dialects.spl import parse_spl
 from dialects.spl_ir import lower as lower_spl
 from dialects.spl_render import render as render_spl
+from dialects.eql import DIALECT as EQL_DIALECT
+from dialects.eql import LANGUAGE as EQL_LANGUAGE
+from dialects.eql import parse_eql
+from dialects.eql_ir import lower as lower_eql
+from dialects.eql_render import render as render_eql
 from dialects.wazuh import DIALECT as WAZUH_DIALECT
 from dialects.wazuh import LANGUAGE as WAZUH_LANGUAGE
 from dialects.wazuh import parse_wazuh
@@ -50,6 +55,8 @@ __all__ = [
     "WAZUH_DIALECT", "WAZUH_LANGUAGE",
     "parse_spl", "lower_spl", "render_spl",
     "SPL_DIALECT", "SPL_LANGUAGE",
+    "parse_eql", "lower_eql", "render_eql",
+    "EQL_DIALECT", "EQL_LANGUAGE",
     "TARGETS",
 ]
 
