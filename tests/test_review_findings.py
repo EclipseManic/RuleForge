@@ -109,6 +109,32 @@ class WithinWindowTests(unittest.TestCase):
                                {"a": 1, "b": 2, "ts": 30}])
         self.assertIs(result.verdict, Verdict.MATCHED)
 
+    def test_an_untimed_later_event_is_undecidable_not_matched(self):
+        """A "within 60 seconds" rule fired on a pair whose elapsed time cannot
+        be established -- MATCHED, no caveat. The same undecidability on the
+        FIRST row is refused with PATTERN_UNDECIDABLE_TIME, so it was fatal at
+        one end of the window and free at the other. An undecidable pair is not
+        decidable, in either direction."""
+        ir = RuleIR(rule_id="t", nodes=(read(), self._pattern(), emit("p")),
+                    output="o")
+        result = evaluate(ir, [{"a": 1, "b": 0, "ts": 0},
+                               {"a": 1, "b": 2}])
+        self.assertIsNot(result.verdict, Verdict.MATCHED,
+                         "whether B falls inside 60 seconds cannot be "
+                         "established, so this candidate was not decided")
+        self.assertIn("PATTERN_UNDECIDABLE_TIME",
+                      [c.code for c in result.caveats])
+
+    def test_a_later_timed_match_is_not_poisoned_by_an_untimed_one(self):
+        """The undecidability poisons the candidate it belongs to, not every row
+        after it. A later B with a real timestamp still matches."""
+        ir = RuleIR(rule_id="t", nodes=(read(), self._pattern(), emit("p")),
+                    output="o")
+        result = evaluate(ir, [{"a": 1, "b": 0, "ts": 0},
+                               {"a": 1, "b": 2},
+                               {"a": 1, "b": 2, "ts": 30}])
+        self.assertIs(result.verdict, Verdict.MATCHED)
+
 
 class UntilVetoTests(unittest.TestCase):
     """CRITICAL 3: `until` vetoed the LAST matched row, not the window.

@@ -842,7 +842,9 @@ def eval_pattern(node: Pattern, rows: list[Row],
             cursor = start_index + 1
             for stage in node.stages[1:]:
                 found = False
+                saw_untimed_match = False
                 while cursor < len(group):
+
                     candidate = group[cursor]
                     candidate_time = times[cursor]
                     cursor += 1
@@ -852,11 +854,36 @@ def eval_pattern(node: Pattern, rows: list[Row],
                         ok = False
                         break
                     if _stage_matches(stage, candidate, ctx):
-                        consumed.append(candidate)
-                        last_matched_index = cursor - 1
-                        found = True
-                        break
+                        # A MATCHING EVENT WITH NO USABLE TIME IS UNDECIDABLE,
+                        # NOT A MATCH. Whether this row falls inside the window
+                        # cannot be established, so it cannot count as the
+                        # stage. It is SKIPPED rather than ending the search,
+                        # because a later row with a real timestamp may still
+                        # match -- the undecidability poisons this candidate,
+                        # not every one after it. If nothing timed ever
+                        # matches, the caveat below says so instead of the
+                        # loop quietly treating it as in-window.
+                        if candidate_time is None:
+                            saw_untimed_match = True
+                        else:
+                            consumed.append(candidate)
+                            last_matched_index = cursor - 1
+                            found = True
+                            break
+
                 if not ok or not found:
+                    # The same undecidability the window start gets, one stage
+                    # later. An un-timestamped row that satisfied the stage means
+                    # the answer for this candidate is unknowable, not negative:
+                    # refusing the candidate silently would be a false negative,
+                    # and matching on it would be a guess. So it is named.
+                    if not found and saw_untimed_match:
+                        ctx.add(Caveat(
+                            "PATTERN_UNDECIDABLE_TIME",
+                            "a later event of a candidate sequence has no usable "
+                            "timestamp, so whether it falls inside the window "
+                            "cannot be established and this candidate was not "
+                            "decided", 1))
                     ok = False
                     break
 
