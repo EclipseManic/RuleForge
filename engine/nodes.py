@@ -834,6 +834,10 @@ def eval_pattern(node: Pattern, rows: list[Row],
             window_end = start_time + node.within.seconds
 
             consumed: list[Row] = [start_row]
+            # Index of the last row that matched a stage, tracked as it goes:
+            # group.index(consumed[-1]) later is O(n) and wrong when a row
+            # appears twice, and a veto range from a wrong index is a wrong rule.
+            last_matched_index = start_index
             ok = True
             cursor = start_index + 1
             for stage in node.stages[1:]:
@@ -849,6 +853,7 @@ def eval_pattern(node: Pattern, rows: list[Row],
                         break
                     if _stage_matches(stage, candidate, ctx):
                         consumed.append(candidate)
+                        last_matched_index = cursor - 1
                         found = True
                         break
                 if not ok or not found:
@@ -863,9 +868,21 @@ def eval_pattern(node: Pattern, rows: list[Row],
             # 10 minutes" was decided by whichever event happened to end the
             # sequence, and a logout in the middle of the window passed straight
             # through. That is the negative twin the node exists to express.
-            if node.until is not None and _window_satisfies(
-                    node.until, group, times, start_index, window_end, ctx):
-                continue
+            # `until` VETOES A RANGE, AND THE RANGE DEPENDS ON THE DIALECT.
+            # "window"  = anywhere from the candidate's FIRST event to the end of
+            #              the window: YARA-L, the default, and the historical
+            #              behaviour, where a veto after the last stage still
+            #              kills the match. "between" = strictly between the first
+            #              and last matched events: EQL, where an expiry that
+            #              falls after the sequence completed no longer matters.
+            if node.until is not None:
+                if node.until_scope == "between":
+                    if _any_satisfies(node.until, group,
+                                      start_index + 1, last_matched_index, ctx):
+                        continue
+                elif _window_satisfies(node.until, group, times, start_index,
+                                       window_end, ctx):
+                    continue
 
             out.append(_merge_pattern(consumed, key, start_row))
             matches += 1
@@ -1131,6 +1148,27 @@ def _row_time(row: Row, node: Pattern) -> Decimal | None:
     if node.time_field is None:
         return None
     return as_number(row.get(node.time_field))
+
+
+def _any_satisfies(condition: Any, group: list[Row], low: int, high: int,
+                   ctx: EvaluationContext) -> bool:
+    """Does any row in the HALF-OPEN index range [low, high) satisfy `condition`?
+
+    The "between" scope needs a range bounded at BOTH ends, and
+    `_window_satisfies` is bounded only at the far end -- it answers "anywhere
+    from here to the end of the window". So this exists rather than being a
+    special case inside that one.
+
+    The endpoints are excluded deliberately. EQL says the expiry must fall
+    "between matching events": an event that IS one of the matching events is
+    not between them, and including `last_matched_index` here would veto with
+    the final stage's own row -- so a sequence whose last stage also satisfies
+    the expiry condition would reject itself.
+    """
+    for offset in range(max(0, low), min(high, len(group))):
+        if _stage_matches((condition,), group[offset], ctx):
+            return True
+    return False
 
 
 def _window_satisfies(condition: Any, group: list[Row], times: list[Decimal | None],

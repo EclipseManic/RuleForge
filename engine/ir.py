@@ -887,6 +887,36 @@ class Pattern:
     within: Duration
     key: tuple[FieldRef, ...] = ()
     until: Any = None
+    #: WHAT RANGE `until` IS CHECKED OVER. The two dialects that use this node
+    #: disagree, and the disagreement is real, so it is data rather than a
+    #: behaviour change to whichever one was implemented first.
+    #:
+    #:   "window"   -- the whole window, from the first event of the candidate to
+    #:                the end. An `until` ANYWHERE in there vetoes the match, even
+    #:                after the last stage matched. This is what YARA-L wants: "a
+    #:                credential access followed by no logout within 10 minutes"
+    #:                is violated by a logout at ANY point in those 10 minutes,
+    #:                including one after the logon. It is also the historical
+    #:                behaviour here, so it is the DEFAULT and changing it would
+    #:                silently re-break the YARA-L bug this node's `until` was
+    #:                written to fix.
+    #:
+    #:   "between"  -- only events BETWEEN the first and last matched stages
+    #:                veto. An `until` occurring AFTER the sequence completed
+    #:                leaves the match standing. This is Elastic EQL's rule,
+    #:                stated in its documentation: "If this expiration event
+    #:                occurs between matching events in a sequence, the sequence
+    #:                expires and is not considered a match. If the expiration
+    #:                event occurs after matching events in a sequence, the
+    #:                sequence is still considered a match." Elastic's own worked
+    #:                example is the discriminating case: a dataset containing
+    #:                `A, B` and `A, B, C` and `A, C, B`, with C as the expiry,
+    #:                must match the first two and reject the third.
+    #:
+    #: Anything else is REFUSED in `__post_init__`, because a typo'd scope that
+    #: silently behaved like the default would reintroduce exactly the class of
+    #: bug this field exists to make visible.
+    until_scope: str = "window"
     ordered: bool = True
     max_matches_per_key: int = 100
     #: Which field orders the sequence. REQUIRED for an ordered pattern, and never
@@ -905,6 +935,13 @@ class Pattern:
                               f"stage {index} has no conditions", "Pattern")
         if self.max_matches_per_key <= 0:
             raise Refusal("PATTERN_LIMIT_INVALID", "limit must be positive", "Pattern")
+        if self.until_scope not in ("window", "between"):
+            raise Refusal(
+                "PATTERN_UNTIL_SCOPE_UNKNOWN",
+                f"until_scope={self.until_scope!r} is not one of 'window' or "
+                f"'between'. A misspelled scope would otherwise behave like the "
+                f"default and silently veto over the wrong range, which is the "
+                f"same failure as not having the field at all.", "Pattern")
         if self.ordered and self.time_field is None:
             raise Refusal(
                 "PATTERN_REQUIRES_TIME_FIELD",
