@@ -919,6 +919,52 @@ def _lower_aggregate(command: SplCommand, position: int, source: str,
     keys = tuple(_field_ref(k) for k in stats.keys)
 
     # `BY _time span=1h` IS A TIME BUCKET, AND span IS MANDATORY WITH IT. Without
+    # `tstats` IS REFUSED FIRST, BECAUSE IT IS ALWAYS REFUSED.
+    #
+    # It used to sit below the `span=` and `_time` checks, so a `tstats` grouped
+    # by time never reached its own refusal:
+    #
+    #     | tstats count BY _time span=1h
+    #       -> SPL_TIME_BUCKET_WITHOUT_SPAN, "...groups by _time with no span=..."
+    #
+    # -- for a rule that HAS a span. The message contradicted the input it was
+    # given. `tstats` reads index-time fields no sample can reproduce, which is
+    # true with or without a span, so it is named before any syntax check runs.
+    # The most specific true refusal wins, and this one is always true.
+    if command.name == "tstats":
+        # REFUSED, NOT APPROXIMATED. See the module docstring.
+        raise SplParseError(
+            "TSTATS_NOT_EXECUTABLE_LOCALLY",
+            "tstats reads INDEX-TIME fields from tsidx, over an accelerated "
+            "data model or a namespace"
+            + (f" ({stats.from_clause})" if stats.from_clause else "")
+            + f", not raw events. Its {len(measures)} measures and "
+            f"{len(keys)} keys are parsed and preserved, but no event sample can "
+            f"reproduce indexed-field statistics, so this is not evaluated "
+            f"locally rather than approximated as `stats`. To tune it, run it in "
+            f"Splunk and bring the results back.", DIALECT)
+
+    # `eventstats` IS A DIFFERENT COMMAND FROM `stats`, AND RENDERING ONE AS THE
+    # OTHER CHANGES THE RESULTS.
+    #
+    #     index=main | eventstats count BY host
+    #       ->  index=main | stats count AS count by host    ok=True, findings=[]
+    #
+    # In Splunk `eventstats` keeps one row per input event with the computed
+    # statistics appended as new columns; `stats` collapses to one row per
+    # group. The command name was parsed and then discarded. The IR has no node
+    # for "append an aggregate to every row" -- it would need a windowed join
+    # per group -- so lowering this onto `Aggregate` silently returns one row
+    # where Splunk returns every event.
+    if command.name == "eventstats":
+        raise SplParseError(
+            "SPL_EVENTSTATS_NOT_LOWERABLE",
+            "`eventstats` computes statistics and appends them to EVERY event, "
+            "keeping one row per input. The IR's `Aggregate` collapses to one "
+            "row per group, so lowering this as `stats` would silently return "
+            "one row where Splunk returns every event. Refused by name rather "
+            "than approximated.", DIALECT)
+
     # `span=` ON `stats` IS NOT VALID SPL AT ALL, AND ACCEPTING IT PRODUCED A
     # RENDER THAT DISAGREED WITH THE DIAGNOSTIC BESIDE IT.
     #
@@ -974,20 +1020,8 @@ def _lower_aggregate(command: SplCommand, position: int, source: str,
     else:
         frame = Frame(kind="per_event")
 
-    if command.name == "tstats":
-        # REFUSED, NOT APPROXIMATED. See the module docstring.
-        raise SplParseError(
-            "TSTATS_NOT_EXECUTABLE_LOCALLY",
-            "tstats reads INDEX-TIME fields from tsidx, over an accelerated "
-            "data model or a namespace"
-            + (f" ({stats.from_clause})" if stats.from_clause else "")
-            + f", not raw events. Its {len(measures)} measures and "
-            f"{len(keys)} keys are parsed and preserved, but no event sample can "
-            f"reproduce indexed-field statistics, so this is not evaluated "
-            f"locally rather than approximated as `stats`. To tune it, run it in "
-            f"Splunk and bring the results back.", DIALECT)
-
     if stats.from_clause:
+
         # THE `stats` SPELLING OF THE SAME CONSTRUCT `tstats` IS REFUSED FOR.
         #
         #     index=main | stats count FROM my_datamodel
