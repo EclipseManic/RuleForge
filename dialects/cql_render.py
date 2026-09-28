@@ -1,8 +1,10 @@
-"""Render a filter graph back to CQL: `filter` plus `| table`.
+"""Render a filter graph back to CQL: a filter plus its pipe stages.
 
-Only the shape slice 1 lowers is renderable. Anything else is refused by name
-rather than flattened, for the same reason an `Aggregate` is refused by every
-other renderer in this project.
+Renders exactly the shapes the CQL slice lowers -- `| table`, `| sort`,
+`| rename`, `| name :=` -- in the order the IR carries them, which is the order
+the analyst wrote. Anything else is refused by name rather than flattened, for
+the same reason an `Aggregate` is refused by every other renderer in this
+project.
 """
 
 from __future__ import annotations
@@ -18,9 +20,15 @@ def render(ir: RuleIR) -> str:
     """A `Filter` (+ `fields` Derive) back to CQL source."""
     filt = next((n for n in ir.nodes if type(n).__name__ == "Filter"), None)
     if filt is None:
+        # NAMED FOR WHAT THIS RENDERS, not for the slice it was written in.
+        # This string ships to an analyst, so "slice 1 renders one filter plus
+        # `| table`" became a lie the day sort, rename, and `:=` landed -- and a
+        # misleading refusal is worse than no refusal, because it sends someone
+        # looking for a limitation that has moved.
         raise Refusal("CQL_RENDER_NO_FILTER",
-                      "this graph has no filter to render: CQL slice 1 "
-                      "renders one filter plus `| table`, nothing else.",
+                      "this graph has no filter to render. CQL renders a filter "
+                      "plus `| table`, `| sort`, `| rename`, and `| :=` stages; "
+                      "a graph with no filter in it is a different shape.",
                       DIALECT)
     out = [render_expr(filt.condition)]
     for node in ir.nodes:

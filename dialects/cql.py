@@ -1,10 +1,14 @@
-"""CrowdStrike CQL (LogScale), slice 1: a filter plus `| table`, honestly.
+"""CrowdStrike CQL (LogScale): a filter plus its pipe stages, honestly.
 
-CQL is a PIPELINE language: `filter | table a, b`. The filter uses `=`/`!=`
-comparisons with `AND`/`OR`/`NOT`, `#tag` fields (indexed), `@meta` fields
-(`@timestamp`), and bare event fields. This slice lowers the filter onto one
-`Filter` and `| table a, b` onto `Derive(kind="fields")` -- both existing
-nodes, no approximations.
+CQL is a PIPELINE language: `filter | table a, b | sort(x)`. The filter uses
+`=`/`!=` comparisons with `AND`/`OR`/`NOT`, `#tag` fields (indexed), `@meta`
+fields (`@timestamp`), and bare event fields. The filter lowers onto one
+`Filter`; the pipes lower onto `Derive`/`Arrange` -- all existing nodes, no
+approximations.
+
+SHIPPED: the filter, plus `| table`, `| sort`, `| rename`, `| name :=` (a single
+operand: a field, quoted string, or number), and `in()`. Pipes lower IN THE
+ORDER WRITTEN, and each kind appears at most once.
 
 THIS IS NOT FQL, and the two must never share a parser. FQL is
 `property:[operator]value` with `+`/`,`; CQL is `field = "value"` with pipes
@@ -12,9 +16,10 @@ and word operators. Each refuses the other's shape by name: a combined grammar
 would accept strings valid in neither language.
 
 Refused by name in this slice: wildcards in values, regex (`/re/` and
-`regex()`), functions, `in()`, `:=` assignment, `field = *` exists-checks, and
-every pipe except `table`. Each changes which rows match or needs a node not
-yet wired, so each is named rather than approximated.
+`regex()`), functions, `field = *` exists-checks, `now()`, `| join` and the
+aggregate functions, an arithmetic or function RHS to `:=`, and a repeated pipe.
+Each changes which rows match or needs a node not yet wired, so each is named
+rather than approximated.
 """
 
 from __future__ import annotations
@@ -125,8 +130,11 @@ def parse_cql(text: str) -> CqlQuery:
         at = _find_assign(text)
         if at >= 0:
             _claim(stages, seen, "assign", "CQL_ASSIGN_TWICE",
-                   "two `| :=` stages; the second overwrites what the first "
-                   "assigned. Refused rather than silently kept.")
+                   "two `| :=` stages. Two assignments are perfectly ordinary "
+                   "CQL -- `| a := 1 | b := 2` writes two different fields and "
+                   "overwrites nothing -- so this is refused as an unsupported "
+                   "shape, NOT as a hazard. Nothing here can corrupt the rule; "
+                   "it just is not lowered yet.")
             stages.append(_parse_assign(text[:at], text[at + 3:]))
             continue
         # Function-call pipes (`sort(...)`) vs space-separated pipes (`table`,
@@ -144,8 +152,9 @@ def parse_cql(text: str) -> CqlQuery:
             args = rest[:-1].strip()
             if name == "sort":
                 _claim(stages, seen, "sort", "CQL_SORT_TWICE",
-                       "two `| sort` stages; the second reorders what the "
-                       "first ordered. Refused rather than silently kept.")
+                       "two `| sort` stages. A second sort replaces the first "
+                       "ordering, which is legal CQL, so this is refused as an "
+                       "unsupported shape rather than as a hazard.")
                 stages.append(_parse_sort_args(args))
                 continue
             raise Refusal(
@@ -157,8 +166,9 @@ def parse_cql(text: str) -> CqlQuery:
         name, args = name.lower(), args.strip()
         if name == "table":
             _claim(stages, seen, "table", "CQL_TABLE_TWICE",
-                   "two `| table` stages join nothing new; the second is "
-                   "refused rather than silently kept.")
+                   "two `| table` stages. A second projection is a re-projection "
+                   "and has nothing to do with joining; this is refused as an "
+                   "unsupported shape, not as a hazard.")
             columns = tuple(f.strip() for f in args.split(",") if f.strip())
             if not columns:
                 raise Refusal("CQL_TABLE_EMPTY",
@@ -169,8 +179,10 @@ def parse_cql(text: str) -> CqlQuery:
             stages.append(CqlTable(columns=columns))
         elif name == "rename":
             _claim(stages, seen, "rename", "CQL_RENAME_TWICE",
-                   "two `| rename` stages; the second renames what the first "
-                   "renamed. Refused rather than silently kept.")
+                   "two `| rename` stages. Renaming two different fields in one "
+                   "query is ordinary CQL, so this is an unsupported shape, not "
+                   "a hazard: nothing about it is unsafe, it is just not "
+                   "lowered yet.")
             old, sep, new = args.partition(" as ")
             old, new = old.strip(), new.strip()
             if not sep or not old or not new:

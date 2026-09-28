@@ -265,6 +265,38 @@ class RefusalTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "KQL_JOIN_NO_ON")
 
 
+class ProjectActuallyProjects(unittest.TestCase):
+    """`| project` REPLACES the row; `| extend` adds to it.
+
+    The same engine defect the CQL suite pins, seen from the dialect that
+    introduced `projects`. `eval_derive` ignored the flag entirely, so `project`
+    rendered as a projection and executed as a pass-through -- every other
+    column reached the output. Both directions are asserted, because a fix that
+    made every `Derive` project would pass an extend-only suite and silently
+    break the other half.
+    """
+
+    ROWS = [{"Account": "a", "Computer": "c", "CommandLine": "x"}]
+
+    def _values(self, source):
+        ir, _ = lower_kql(parse_kql(source))
+        result = evaluate(ir, [dict(row) for row in self.ROWS])
+        return [dict(row.values) for row in result.rows]
+
+    def test_project_drops_columns_it_did_not_name(self):
+        self.assertEqual(self._values("T | project Account"), [{"Account": "a"}])
+
+    def test_project_keeps_the_writers_column_order(self):
+        self.assertEqual(
+            [list(row) for row in self._values("T | project Computer, Account")],
+            [["Computer", "Account"]])
+
+    def test_extend_keeps_every_existing_column(self):
+        self.assertEqual(
+            self._values("T | extend Extra = 1"),
+            [{"Account": "a", "Computer": "c", "CommandLine": "x", "Extra": 1}])
+
+
 class ExecutionTests(unittest.TestCase):
     """The correlation, run against sample SecurityEvent rows."""
 

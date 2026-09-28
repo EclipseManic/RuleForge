@@ -1,16 +1,22 @@
-"""Lower CQL slice 1: a filter onto one `Filter`, `| table` onto `fields`.
+"""Lower CQL: a filter onto one `Filter`, the pipes onto the SPL-shaped nodes.
 
 The filter language here is comparisons, `AND`/`OR`/`NOT` with NOT > AND > OR
 precedence, parentheses, quoted strings, numbers, dotted fields, `#tag` and
-`@meta` prefixes, and `true`. Everything else -- wildcards, regex, functions,
-`in()`, `:=`, `field = *` -- is refused BY NAME, because each changes which
-rows match.
+`@meta` prefixes, and `true`. `in()` lowers EXACTLY, as a disjunction of
+equalities. Everything else -- wildcards, regex, functions, `field = *`, `now()`,
+`| join`, the aggregate functions, a computed `:=` RHS -- is refused BY NAME,
+because each changes which rows match or needs a node not yet wired.
 
-A LEADING `#` IS A PERFORMANCE HINT, NOT PART OF THE NAME. `#event_simpleName`
-and `event_simpleName` match the same rows; the `#` tells LogScale the field
-is indexed. So it is stripped at lowering and not rendered back -- which is
-semantically identical, the way normalising whitespace is. A leading `@` IS
-part of the name (`@timestamp` is the field), so it is kept verbatim.
+THE PIPES ARE AN ORDERED LIST, not a set of slots, and the lowerer walks it in
+the order written. See `CqlQuery` for why that is a correctness property and not
+a convenience.
+
+A LEADING `#` IS A PERFORMANCE HINT, NOT PART OF THE NAME, and is stripped at
+every field site -- sort, rename source, `:=` RHS, and membership alike. (The
+`|`-pipe form of `in()` is a filter-position test, where a bare token and a
+quoted string already mean the same thing; the `:=` RHS is not, which is why
+that one path quotes its literals.) A leading `@` IS part of the name
+(`@timestamp` is the field), so it is kept verbatim.
 """
 
 from __future__ import annotations
@@ -73,13 +79,13 @@ def lower(query: CqlQuery, rule_id: str = "rule") -> tuple[RuleIR, list[dict]]:
             # a later term reading the old name finds nothing. That is what
             # `rename` means (unlike `eval`, which keeps both), and the
             # renderer must say `rename`, not `eval`, for the same reason.
-            old = stage.old
-            if old.startswith("#"):
-                old = old[1:]
+            # The TARGET keeps a leading `#` stripped too: `rename a as #b` was
+            # minting a column named `#b`, which nothing would ever read.
             node_id = _stage_id("rename", index)
             nodes.append(Derive(id=node_id, input=current,
-                                assignments=((stage.new,
-                                              FieldExpr(FieldRef(old))),),
+                                assignments=((_field_name(stage.new),
+                                              FieldExpr(FieldRef(_field_name(
+                                                  stage.old)))),),
                                 projects=False, kind="rename"))
         elif isinstance(stage, CqlAssign):
             # `| name := operand`: the new column is ADDED and everything else
@@ -94,9 +100,15 @@ def lower(query: CqlQuery, rule_id: str = "rule") -> tuple[RuleIR, list[dict]]:
                                 projects=False, kind="eval"))
         elif isinstance(stage, CqlTable):
             node_id = _stage_id("derive", index)
+            # A LEADING `#` IS STRIPPED HERE TOO, like every other field site in
+            # this file. `| table #foo` keeping the `#` produced a column
+            # literally NAMED `#foo`, which is always ABSENT, and the query then
+            # rendered back identically while evaluating to a column the analyst
+            # never asked for. The `#` is an indexing hint, not part of the name.
             nodes.append(Derive(id=node_id, input=current,
                                 assignments=tuple(
-                                    (column, FieldExpr(FieldRef(column)))
+                                    (_field_name(column),
+                                     FieldExpr(FieldRef(_field_name(column))))
                                     for column in stage.columns),
                                 projects=True, kind="fields"))
         else:  # pragma: no cover -- a new stage type must be lowered, not skipped
@@ -109,6 +121,17 @@ def lower(query: CqlQuery, rule_id: str = "rule") -> tuple[RuleIR, list[dict]]:
     nodes.append(Emit(id="out", input=current))
     return (RuleIR(rule_id=rule_id, nodes=tuple(nodes), output="out",
                    title="CQL filter", metadata={"dialect": DIALECT}), [])
+
+
+def _field_name(name: str) -> str:
+    """A field reference with a leading `#` stripped.
+
+    `#foo` and `foo` name the same field; the `#` is an indexing hint. Stripped
+    at EVERY field site, because keeping it in one position and not another
+    means a query that names the same field three different ways in three
+    positions -- and a column literally named `#foo` is always absent.
+    """
+    return name[1:] if name.startswith("#") else name
 
 
 def _stage_id(base: str, index: int) -> str:

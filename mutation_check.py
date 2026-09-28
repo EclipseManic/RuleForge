@@ -115,6 +115,26 @@ MUTATIONS = [
      "    for index, stage in enumerate(query.stages):",
      "    for index, stage in enumerate(sorted(\n"
      "            query.stages, key=lambda s: 1 if isinstance(s, CqlTable) else 0)):"),
+
+    # THE FLAG THREE RENDERERS BELIEVED AND THE EVALUATOR IGNORED.
+    # `Derive.projects` says "replace the row, do not extend it". spl_render,
+    # kql_render, and wazuh_render all read it; `eval_derive` did not, so
+    # `| fields a,b`, KQL `| project a`, and CQL `| table a,b` all rendered as
+    # projections and executed as pass-throughs, carrying every other column
+    # into the output. The round trip looked perfect at every step, which is
+    # precisely why only an execution test could have found it.
+    ("M17 projection ignored at evaluation, so nothing is dropped",
+     "engine/nodes.py",
+     "    projected = [target for target, _ in node.assignments] if node.projects \\\n        else None",
+     "    projected = None"),
+
+    # THE OTHER HALF OF M17, and the one that catches an over-correction:
+    # making EVERY Derive project would pass a table-only suite and break
+    # `rename`, `eval`, `:=`, and KQL `extend` -- all of which ADD columns.
+    ("M18 projection applied unconditionally, so extend drops columns too",
+     "engine/nodes.py",
+     "    projected = [target for target, _ in node.assignments] if node.projects \\\n        else None",
+     "    projected = [target for target, _ in node.assignments]"),
 ]
 
 

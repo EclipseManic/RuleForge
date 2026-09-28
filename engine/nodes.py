@@ -177,6 +177,20 @@ def eval_filter(node: Filter, rows: list[Row], ctx: EvaluationContext) -> list[R
 def eval_derive(node: Derive, rows: list[Row],
                 ctx: EvaluationContext) -> list[Row]:
     out: list[Row] = []
+    # `projects=True` MEANS THE ROW IS REPLACED, not extended. This branch was
+    # MISSING ENTIRELY, and every renderer in the repo already believed the
+    # flag: kql_render, spl_render, and wazuh_render all read `node.projects`
+    # to decide whether to emit a `<fields>` list. Only the evaluator ignored
+    # it, so `project a` and `| table a,b` rendered as projections while
+    # executing as pass-throughs -- every other column survived to the output.
+    #
+    # That is not cosmetic, and it is not a CQL-only bug: KQL `project` hits it
+    # identically. A rule that says "show me these four fields" quietly
+    # returning twenty is a rule whose result nobody can trust, and the
+    # mismatch survives the whole pipeline because nothing between a lowerer
+    # and a renderer executes the rule.
+    projected = [target for target, _ in node.assignments] if node.projects \
+        else None
     for row in rows:
         ctx.budget.spend(1, "derive")
         values = dict(row.values)
@@ -195,6 +209,18 @@ def eval_derive(node: Derive, rows: list[Row],
                 values.pop(target, None)
             else:
                 values[target] = outcome
+        if projected is not None:
+            # Narrow to the projected names, IN THE ORDER THE ANALYST WROTE
+            # THEM -- `| table b, a` is not the same output as `| table a, b`.
+            # A projected field the row does not have stays ABSENT rather than
+            # becoming null: ABSENT is the honest value for "not in this event",
+            # and inventing a null here would be the same fabrication the branch
+            # above refuses. `uncertain` narrows with it, so a caveat recorded
+            # for a dropped column does not attach itself to a surviving one.
+            values = {name: values[name] for name in projected
+                      if name in values}
+            uncertain = {name: uncertain[name] for name in uncertain
+                         if name in values}
         out.append(Row(values, row.time, row.index, uncertain))
     return out
 

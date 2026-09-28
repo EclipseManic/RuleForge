@@ -11,17 +11,23 @@ THIS IS NOT FQL, and each refuses the other's shape by name. FQL's
 word-operator shapes are refused there as CQL. A combined grammar would accept
 strings valid in neither language.
 
-Refused by name in this slice: wildcards, regex, functions, `in()`, `:=`,
-`field = *` (a presence test needs a node this lowering does not build), every
-pipe except `table`, an empty filter, and an empty `table`.
+SHIPPED: a filter, plus the pipes `| table`, `| sort`, `| rename`, `| name :=`
+(single operand), and `in()`. Pipes lower IN THE ORDER WRITTEN, each kind at
+most once.
+
+Refused by name in this slice: wildcards, regex, functions, `field = *` (a
+presence test needs a node this lowering does not build), `now()`, `| join` and
+the aggregate functions, an arithmetic or function RHS to `:=`, a repeated pipe,
+an empty filter, and an empty `table`.
 """
 
 import unittest
-
 import jobs
 from dialects.cql import parse_cql
 from dialects.cql_ir import lower as lower_cql
+from engine import evaluate
 from engine.values import Refusal
+
 
 
 def _round_trip(source: str) -> str:
@@ -334,6 +340,103 @@ class StageOrderIsTheWritersOrder(unittest.TestCase):
         self.assertEqual(outcome.refusal["code"], "CQL_SORT_TWICE")
 
 
+class TableActuallyProjectsAtEvaluation(unittest.TestCase):
+    """`| table a,b` must DROP the other columns WHEN THE RULE RUNS.
+
+    A regression for an engine defect, not a CQL one. `Derive.projects` is the
+    flag that says "replace the row, do not extend it", and three renderers
+    already believed it -- `spl_render`, `kql_render`, and `wazuh_render` each
+    read it to decide whether to write a `<fields>` list. `eval_derive` did not.
+    So `| table a,b` rendered as a projection and EXECUTED as a pass-through:
+    every other column survived to the output, and the round trip looked
+    perfect the whole way.
+
+    It is invisible to a text-level test because nothing between a lowerer and a
+    renderer executes the rule. A rule that says "show me these four fields" and
+    returns twenty is a rule whose result nobody can trust, so these tests
+    evaluate, and they assert the dropped column is gone.
+    """
+
+    ROWS = [{"a": "1", "b": "2", "SECRET": "must-not-be-emitted"}]
+
+    def _values(self, source):
+        ir, _ = lower_cql(parse_cql(source))
+        return [dict(row.values) for row in evaluate(ir, list(self.ROWS)).rows]
+
+    def test_table_drops_every_column_it_did_not_name(self):
+        self.assertEqual(self._values("a = 1 | table a,b"),
+                         [{"a": "1", "b": "2"}])
+
+    def test_table_keeps_the_writers_column_order(self):
+        """`| table b,a` is a DIFFERENT OUTPUT from `| table a,b`, so the
+        projection preserves the order the analyst wrote rather than the row's."""
+        self.assertEqual([list(row) for row in
+                          self._values("a = 1 | table b,a")], [["b", "a"]])
+
+    def test_a_field_the_row_lacks_stays_absent_not_null(self):
+        """`| table a,nope` must not invent a null for `nope`. ABSENT is the
+        honest value for "not in this event"; a fabricated null is the same
+        fabrication `eval_derive` refuses elsewhere, and it would read as data."""
+        self.assertEqual(self._values("a = 1 | table a,nope"), [{"a": "1"}])
+
+    def test_rename_does_not_project(self):
+        """The other half of the flag: `rename` EXTENDS. Getting this backwards
+        is the exact bug the SPL renderer once shipped, so both directions are
+        asserted -- a fix that made every Derive project would pass a
+        table-only test."""
+        self.assertEqual(self._values('a = 1 | rename b as c'),
+                         [{"a": "1", "b": "2", "SECRET": "must-not-be-emitted",
+                           "c": "2"}])
+
+    def test_assign_does_not_project(self):
+        self.assertEqual(self._values("a = 1 | x := 9"),
+                         [{"a": "1", "b": "2", "SECRET": "must-not-be-emitted",
+                           "x": 9}])
+
+
+class HashPrefixIsOneRuleEverywhere(unittest.TestCase):
+    """`#foo` AND `foo` NAME THE SAME FIELD, so one query must not spell it
+    three different ways.
+
+    A leading `#` is an indexing hint, not part of the name. It was stripped
+    for `| sort`, `| rename`'s source, and the `:=` RHS -- and KEPT for `| table`
+    and `| rename`'s target, so `#tag = 1 | table #tag, x | sort(#tag)` named
+    `tag` in the filter, `#tag` in the projection, and `tag` in the sort. The
+    projected column was literally NAMED `#tag`, so it was always absent: the
+    rule rendered back perfectly and evaluated to a column the analyst never
+    asked for.
+    """
+
+    def _round_trip(self, source):
+        return _round_trip(source)
+
+    def test_table_strips_the_hash(self):
+        self.assertEqual(self._round_trip("#tag = 1 | table #tag, x"),
+                         "tag = 1 | table tag, x")
+
+    def test_one_query_spells_a_field_the_same_way_throughout(self):
+        self.assertEqual(
+            self._round_trip("#tag = 1 | table #tag, x | sort(#tag)"),
+            "tag = 1 | table tag, x | sort(tag)")
+
+    def test_rename_target_strips_the_hash_too(self):
+        self.assertEqual(self._round_trip("#tag = 1 | rename a as #b"),
+                         "tag = 1 | rename a as b")
+
+    def test_assign_rhs_strips_the_hash(self):
+        self.assertEqual(self._round_trip("#tag = 1 | x := #tag"),
+                         "tag = 1 | x := tag")
+
+    def test_a_hashed_column_is_actually_present_after_projection(self):
+        """The point of stripping: the projected column must now resolve
+        against a real field rather than being named after a hash."""
+        from engine import evaluate
+        ir, _ = lower_cql(parse_cql("#tag = 1 | table #tag"))
+        rows = [{"tag": "1", "other": "x"}]
+        self.assertEqual([dict(r.values) for r in evaluate(ir, rows).rows],
+                         [{"tag": "1"}])
+
+
 class MembershipLowersAsDisjunction(unittest.TestCase):
     """`in(field, [...])` IS a disjunction -- `field` equal to any one of the
     values -- so it lowers exactly onto `BoolOp("or", ...)` with no new node
@@ -374,11 +477,21 @@ class MembershipLowersAsDisjunction(unittest.TestCase):
         self.assertEqual(outcome.refusal["code"], "CQL_IN_EMPTY")
 
     def test_the_label_says_which_slice_this_is(self):
+        """Every shipped pipe is named, not just `table`.
+
+        Asserting `"table" in label` passed against the ORIGINAL
+        "filter + table" label too, so it could not fail: it was a test of
+        nothing. The label is the contract the UI shows an analyst, so it must
+        name each thing that actually works -- a label that understates the tool
+        sends someone hunting for refusals that do not exist, and one that
+        overstates it promises rules the tool will refuse.
+        """
         import jobs as _jobs
-        self.assertIn("table",
-                      _jobs.DIALECTS["logscale"]["label"].lower(),
-                      "the dialect label must say this is the filter+table "
-                      "slice, or the UI claims a language that is 5% done")
+        label = _jobs.DIALECTS["logscale"]["label"].lower()
+        for shipped in ("table", "sort", "rename", ":=", "in"):
+            self.assertIn(shipped, label,
+                          f"the logscale label does not name `{shipped}`, which "
+                          f"the slice accepts; label is {label!r}")
 
 
 if __name__ == "__main__":
