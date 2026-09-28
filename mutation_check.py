@@ -154,8 +154,29 @@ MUTATIONS = [
     # measure names.
     ("M20 projection after an aggregate is not checked against it",
      "dialects/cql_ir.py",
-     "            if aggregate_fields is not None:",
+     "            if present is not None:",
      "            if False:"),
+
+    # RENAME, WHICH DROPS ITS SOURCE. `rename user as account` makes `user` STOP
+    # EXISTING -- Splunk and CQL both, and this engine's own `ir.py` documents
+    # it. It used to COPY the value and leave the source, so the rule rendered
+    # as a rename and executed as an `eval`: byte-identical text, different
+    # rowset, invisible to every text-level test. `projects` cannot express it,
+    # because rename keeps every column EXCEPT the one it consumed.
+    ("M21 rename copies its source column instead of dropping it",
+     "engine/nodes.py",
+     "        for name in node.drops:\n            values.pop(name, None)",
+     "        for name in node.drops:\n            pass"),
+
+    # AND THE OTHER DIRECTION: dropping when nothing asked for it. This is the
+    # over-correction M21 invites -- a fix that treated every `Derive` as a
+    # rename would pass a rename-only suite and silently delete columns from
+    # every `:=`, every KQL `extend`, and every SPL `eval` in the tool.
+    ("M22 drop applied whether or not the stage asked for one",
+     "engine/nodes.py",
+     "        for name in node.drops:\n            values.pop(name, None)",
+     "        for name in node.assignments and () or ():\n"
+     "            values.pop(name, None)"),
 ]
 
 

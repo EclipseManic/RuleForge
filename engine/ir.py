@@ -686,6 +686,27 @@ class Derive:
     #: built by `kql_ir`, so one dialect's naming convention decided whether a
     #: Wazuh artifact got a `<fields>` list.
     projects: bool = False
+    #: COLUMNS THIS STAGE REMOVES, by name, once it has read them.
+    #:
+    #: WHY THIS EXISTS. `rename` is not `eval`. `eval copy=user` ADDS a column
+    #: and leaves `user` alone; `rename user as copy` makes `user` STOP
+    #: EXISTING. `projects` cannot express the difference, because it is a
+    #: whole-row decision and rename is per-column: rename keeps every column
+    #: EXCEPT the one it consumed. So before this field, a CQL and SPL
+    #: `| rename a as b` produced `{a, b, ...}` -- the evaluator copied the
+    #: value and left the source, which is `eval` semantics wearing rename's
+    #: syntax. It rendered byte-identically, so no text test could see it.
+    #:
+    #: THIS IS DATA, LIKE `projects` AND `kind`, and for the same reason: a
+    #: second source of truth derived by string-matching (on `kind == "rename"`)
+    #: is what the `projects` field was introduced to delete. The dialect that
+    #: knows the command is the one that knows which column it consumed.
+    #:
+    #: Refused if it names a column this stage also assigns, because that would
+    #: depend on evaluation order inside the loop -- add-then-drop versus
+    #: drop-then-add are different results, and an implementation that picks
+    #: one silently is the bug this field exists to make impossible.
+    drops: tuple[str, ...] = ()
     #: The SOURCE COMMAND, when the dialect has one and it matters.
     #:
     #: `projects` says whether the row is replaced or extended, which is the
@@ -718,6 +739,14 @@ class Derive:
                               f"{name!r} is assigned twice; the second would silently "
                               f"overwrite the first", "Derive")
             seen.add(name)
+        for name in self.drops:
+            if name in seen:
+                raise Refusal(
+                    "DERIVE_DROPS_ASSIGNED_COLUMN",
+                    f"this stage both assigns {name!r} and drops it, so the "
+                    f"result depends on whether the add or the drop happens "
+                    f"first. Refused rather than picked silently -- the two "
+                    f"orders are different rules.", "Derive")
 
 
 @dataclass(frozen=True, slots=True)

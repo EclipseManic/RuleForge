@@ -218,9 +218,9 @@ def parse_cql(text: str) -> CqlQuery:
             raise Refusal(
                 "CQL_PIPE_NOT_LOWERED",
                 f"`| {name}` is a real CQL command, but only `| table`, "
-                f"`| sort`, `| rename`, and `| :=` lower today. Refused by "
-                f"name rather than dropped -- dropping a pipe stage silently "
-                f"changes which rows come back.", DIALECT)
+                f"`| sort`, `| rename`, `| count()`, and `| :=` lower today. "
+                f"Refused by name rather than dropped -- dropping a pipe stage "
+                f"silently changes which rows come back.", DIALECT)
     return CqlQuery(filt=filt, stages=tuple(stages))
 
 

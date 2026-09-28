@@ -380,14 +380,46 @@ class TableActuallyProjectsAtEvaluation(unittest.TestCase):
         fabrication `eval_derive` refuses elsewhere, and it would read as data."""
         self.assertEqual(self._values("a = 1 | table a,nope"), [{"a": "1"}])
 
-    def test_rename_does_not_project(self):
-        """The other half of the flag: `rename` EXTENDS. Getting this backwards
-        is the exact bug the SPL renderer once shipped, so both directions are
-        asserted -- a fix that made every Derive project would pass a
-        table-only test."""
+    def test_rename_REMOVES_the_column_it_renamed(self):
+        """`rename` DROPS its source. CQL's `| rename a as b` makes `a` stop
+        existing -- the repo's own `engine/ir.py` says so in as many words
+        ("`user` STOPS EXISTING"), and Splunk agrees.
+
+        It used to COPY instead, keeping `a` and adding `b`. That is `eval`
+        semantics wearing rename's syntax, and it is the exact bug the SPL
+        renderer shipped once before (a fixed commit rendered `eval` as
+        `rename`; this is the same confusion arriving through the evaluator
+        instead of the renderer).
+
+        The docstring here USED TO assert the correct behaviour while the code
+        did the opposite, and a test pinned the wrong behaviour. All three
+        comment, code, and test were in disagreement, which is why this is
+        called out rather than quietly corrected: the disagreement is the
+        defect.
+        """
         self.assertEqual(self._values('a = 1 | rename b as c'),
-                         [{"a": "1", "b": "2", "SECRET": "must-not-be-emitted",
-                           "c": "2"}])
+                         [{"a": "1", "SECRET": "must-not-be-emitted", "c": "2"}])
+
+    def test_rename_is_not_eval(self):
+        """The same query as `eval` would give, pinned side by side. `:=` ADDS
+        its column and keeps every original; `rename` REMOVES the one it
+        renamed. If these two ever agree, one of them is wrong."""
+        renamed = self._values('a = 1 | rename b as c')
+        assigned = self._values('a = 1 | c := b')
+        self.assertIn("c", renamed[0])
+        self.assertIn("b", assigned[0])
+        self.assertNotIn("b", renamed[0],
+                         "rename must remove its source column")
+        self.assertIn("b", assigned[0],
+                      ":= must keep every original column")
+
+    def test_renaming_a_missing_column_projects_nothing_rather_than_failing(self):
+        """A rename of a field no row has must not invent it. ABSENT stays
+        absent -- the same rule `| table nope` follows, and the same rule that
+        keeps a null from being fabricated."""
+        values = self._values('a = 1 | rename nope as z')
+        self.assertNotIn("z", values[0],
+                         "a rename of an absent field must not create it")
 
     def test_assign_does_not_project(self):
         self.assertEqual(self._values("a = 1 | x := 9"),
@@ -427,6 +459,66 @@ class HashPrefixIsOneRuleEverywhere(unittest.TestCase):
     def test_assign_rhs_strips_the_hash(self):
         self.assertEqual(self._round_trip("#tag = 1 | x := #tag"),
                          "tag = 1 | x := tag")
+
+    def test_every_refusal_message_lists_the_same_pipes(self):
+        """Both `CQL_PIPE_NOT_LOWERED` messages must name the same five pipes.
+
+        The paren branch was updated when `count()` shipped and the space-
+        separated branch was not, so `| timechart(x)` listed `count()` while
+        `| timechart` did not. A refusal that under-reports what the tool can do
+        is the misleading-refusal class this repo keeps fixing: the reader goes
+        looking for a limitation that has moved, and stops trusting the message
+        that is right about everything else.
+        """
+        import jobs as _jobs
+        for source in ("a = 1 | timechart(x)", "a = 1 | timechart"):
+            outcome = _jobs.author("logscale", source, "r1")
+            self.assertEqual(outcome.refusal["code"], "CQL_PIPE_NOT_LOWERED")
+            message = outcome.refusal["message"]
+            for shipped in ("table", "sort", "rename", "count()", ":="):
+                self.assertIn(shipped, message,
+                              f"`{source}` refusal omits `{shipped}`: {message}")
+
+    def test_the_aggregate_render_arm_refuses_another_dialects_node(self):
+        """Latent today, live the moment any cross-dialect render exists.
+
+        SPL's `stats count AS total` produces `Measure(name="total",
+        function="count")` -- the same measure with a different output name.
+        Rendering it as `| count()` would emit a rule whose column is called
+        `count`, silently renaming the analyst's output. Same for a windowed
+        frame, which would emit one row per bucket where CQL's `count()` emits
+        one. Both are closed here so the assumption is stated, not assumed.
+        """
+        from engine.ir import (Aggregate, Comparison, Duration, FieldExpr,
+                               FieldRef, Filter, Frame, Literal, Measure, Read,
+                               RuleIR, SourceSelector, TimeRef)
+        from dialects.cql_render import render as render_cql
+        from engine.values import Refusal as _Refusal
+        # Three nodes, each wrong in a different way: the output column is
+        # renamed, the frame is windowed, and both at once.
+        wrong = (
+            (Measure(name="total", function="count"), None,
+             "CQL_RENDER_AGGREGATE_RENAMED"),
+            (Measure(name="count", function="count"),
+             Frame(kind="tumbling", size=Duration(300),
+                   time_ref=TimeRef(field_name="@timestamp")),
+             "CQL_RENDER_AGGREGATE_FRAMED"),
+        )
+        for measure, frame, code in wrong:
+            # A Filter is required, because `render` refuses a graph with no
+            # filter BEFORE it ever reaches the aggregate arm -- which is itself
+            # worth knowing, and is why this test has to supply one.
+            ir = RuleIR(rule_id="r", nodes=(
+                Read(id="x", selector=SourceSelector(name="any")),
+                Filter(id="f", input="x",
+                       condition=Comparison("=", FieldExpr(FieldRef("a")),
+                                            Literal(1))),
+                Aggregate(id="agg", input="f", measures=(measure,),
+                          frame=frame or Frame(kind="per_event")),
+            ), output="agg", title="t")
+            with self.assertRaises(_Refusal) as caught:
+                render_cql(ir)
+            self.assertEqual(caught.exception.code, code)
 
     def test_count_executes_to_the_number_of_matching_rows(self):
         """`| count()` must COUNT, not merely render. A nullary `count` reads no
@@ -481,6 +573,60 @@ class HashPrefixIsOneRuleEverywhere(unittest.TestCase):
                              "CQL_TABLE_AFTER_AGGREGATE", source)
             self.assertIn("count", caught.exception.message,
                           "the refusal must name the one column that survives")
+
+    def test_the_aggregate_guard_TRACKS_later_stages(self):
+        """The guard must follow the row, not freeze at the aggregate.
+
+        The first version set its allow-list to `("count",)` and never updated
+        it, so `| count() | x := 1 | table x` was REFUSED -- while the evaluator
+        would have produced `{count, x}` and the renderer had already accepted
+        the same text. It failed closed, which is safe, but it refused CQL the
+        tool renders happily and told the analyst "a count leaves exactly one
+        column" in the same breath as their own query.
+
+        A guard that stops tracking is worse than no guard: it turns a check
+        into a wall, and the next fix is to delete it.
+        """
+        from engine import evaluate
+        rows = [{"a": "1", "b": "2"}]
+        for source, expected in (
+                ("a = 1 | count() | table count", {"count": 1}),
+                # `:=` ADDS a column, so `x` exists by the time the table runs.
+                ("a = 1 | count() | x := 1 | table x", {"x": 1}),
+                ("a = 1 | count() | x := 1 | table count, x",
+                 {"count": 1, "x": 1}),
+                # A rename is a net change of ONE column: `total` replaces
+                # `count`. Both halves have to be tracked or this breaks.
+                ("a = 1 | count() | rename count as total | table total",
+                 {"total": 1})):
+            ir, _ = lower_cql(parse_cql(source))
+            self.assertEqual([dict(r.values) for r in evaluate(ir, rows).rows],
+                             [expected], source)
+
+    def test_the_aggregate_guard_still_refuses_an_event_field(self):
+        """Tracking must not become permissive: `a` is gone after a count no
+        matter what came between, because it was an EVENT field and the
+        aggregate replaced every event field with a number."""
+        for source in ("a = 1 | count() | table a",
+                       "a = 1 | count() | x := 1 | table a",
+                       "a = 1 | count() | rename count as total | table a"):
+            with self.assertRaises(Refusal) as caught:
+                lower_cql(parse_cql(source))
+            self.assertEqual(caught.exception.code,
+                             "CQL_TABLE_AFTER_AGGREGATE", source)
+
+    def test_the_refusal_names_the_columns_that_actually_exist(self):
+        """The message must not say "a count leaves exactly one column" when a
+        `:=` has since added another -- a false statement inside a refusal is
+        the same defect class as a false docstring, and this repo has already
+        shipped several."""
+        with self.assertRaises(Refusal) as caught:
+            lower_cql(parse_cql("a = 1 | count() | x := 1 | table a"))
+        message = caught.exception.message
+        self.assertIn("count", message)
+        self.assertIn("x", message,
+                      "the refusal must name the columns that DO exist, which "
+                      "here includes the one `:=` added")
 
     def test_a_projection_of_the_measure_itself_still_works(self):
         """`table count` names the column that DOES survive, so it lowers --

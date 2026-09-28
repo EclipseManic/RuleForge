@@ -65,6 +65,34 @@ def render(ir: RuleIR) -> str:
                     "a grouped `count()` produces one row per key, which needs "
                     "the `by` syntax this slice does not lower. Refused rather "
                     "than rendered as a single ungrouped number.", DIALECT)
+            # THE OUTPUT COLUMN NAME, CHECKED. SPL's `stats count AS total`
+            # produces exactly this node -- a `count` measure named `total` --
+            # and rendering it as `| count()` would emit a rule whose column is
+            # called `count`, silently renaming the analyst's output. This is
+            # latent rather than live, because no product path renders a
+            # lowerer against a different dialect's graph, but a cross-dialect
+            # feature is exactly what would turn it live, and the cheap time to
+            # close it is now.
+            if measure.name != "count":
+                raise Refusal(
+                    "CQL_RENDER_AGGREGATE_RENAMED",
+                    f"this count outputs a column named {measure.name!r}, and "
+                    f"`count()` names it `count`. Rendering it would rename the "
+                    f"column the rule asked for, so it is refused rather than "
+                    f"emitted under the wrong name.", DIALECT)
+            # THE FRAME, CHECKED. `| count()` is the WHOLE-INPUT frame, so a
+            # tumbling or cumulative window here means the rule counts within
+            # time buckets and emits one row per bucket -- several numbers where
+            # CQL's `count()` gives one. The lowerer cannot produce another
+            # frame, so this branch is unreachable from CQL; it exists so that
+            # the renderer's assumption is stated rather than assumed.
+            if node.frame.kind != "per_event" or node.frame.size is not None:
+                raise Refusal(
+                    "CQL_RENDER_AGGREGATE_FRAMED",
+                    f"`count()` counts everything that reached it, but this "
+                    f"aggregate is windowed ({node.frame.kind}), so it would "
+                    f"emit one row per window. Refused rather than rendered as "
+                    f"an ungrouped `count()`.", DIALECT)
             out.append("| count()")
             continue
         if kind == "Arrange":

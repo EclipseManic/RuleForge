@@ -209,6 +209,18 @@ def eval_derive(node: Derive, rows: list[Row],
                 values.pop(target, None)
             else:
                 values[target] = outcome
+        # `drops` RUNS AFTER THE ASSIGNMENTS, deliberately, and the ordering is
+        # pinned by `DERIVE_DROPS_ASSIGNED_COLUMN` refusing any name that is both
+        # assigned and dropped. Doing the drop first would mean reading a column
+        # the assignment may also be writing; doing it last means the value a
+        # rename read is the value it was before this stage, which is what every
+        # dialect that uses this means by a rename.
+        for name in node.drops:
+            values.pop(name, None)
+            # The caveat goes too. A dropped column is not undecidable, it is
+            # gone -- leaving the marker behind would make a later stage read a
+            # column as undecided that is no longer in the row at all.
+            uncertain.pop(name, None)
         if projected is not None:
             # Narrow to the projected names, IN THE ORDER THE ANALYST WROTE
             # THEM -- `| table b, a` is not the same output as `| table a, b`.

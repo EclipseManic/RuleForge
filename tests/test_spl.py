@@ -402,6 +402,27 @@ class PipelineCommandLoweringTests(unittest.TestCase):
                 "index=main | stats count by host | sort host | head 3"),
             "index=main | stats count AS count by host | sort +host | head 3")
 
+    def test_a_rename_REMOVES_the_renamed_field_at_execution(self):
+        """`rename user as account` makes `user` STOP EXISTING. Splunk does
+        this, and this engine's own `ir.py` documents it ("`user` STOPS
+        EXISTING"). It used to COPY the value and leave the source, so the rule
+        rendered as a rename and executed as an `eval` -- byte-identical text,
+        different rowset, invisible to every text-level test.
+
+        `eval` is pinned beside it, because the two are exactly one flag apart
+        and a fix that collapsed them would pass a rename-only suite.
+        """
+        row = {"index": "windows", "EventCode": 4688, "user": "alice",
+               "other": "x", "_time": "2024-01-01T00:00:00Z"}
+        renamed = evaluate(lower("index=windows EventCode=4688 "
+                                 "| rename user as account")[0], [dict(row)])
+        self.assertNotIn("user", renamed.rows[0].values)
+        self.assertEqual(renamed.rows[0].values["account"], "alice")
+        evaluated = evaluate(lower("index=windows EventCode=4688 "
+                                   "| eval acct=user")[0], [dict(row)])
+        self.assertIn("user", evaluated.rows[0].values,
+                      "eval must KEEP the source; rename must drop it")
+
     def test_a_rename_is_followed_by_a_term_reading_the_new_name(self):
         """The chain has to actually thread, or the rename is decorative."""
         rendered = self._round_trip(

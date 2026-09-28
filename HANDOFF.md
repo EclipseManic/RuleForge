@@ -344,7 +344,34 @@ assume a fresh eye is cheaper than the next round's findings.
 
 ### Open, in severity order -- verified against the tree, not carried forward
 
-**Verified state: 850 passed, 4 skipped, 3 warnings, ruff clean, all 19 mutations caught (M7 re-armed; M16 ordering, M17/M18 projection, M19 count frame added) -- see the CQL ordering note below.**
+**Verified state: 863 passed, 4 skipped, 3 warnings, ruff clean, all 22 mutations caught (M7 re-armed; M16 ordering, M17/M18 projection, M19 count frame, M20 aggregate guard, M21/M22 rename drop).**
+
+**RENAME DROPS ITS SOURCE, AND IT USED NOT TO.** `rename user as account`
+makes `user` STOP EXISTING -- Splunk and CQL both, and `engine/ir.py` has said
+so in its own docstring all along. It did not: `Derive` had no way to say "drop
+this column", so rename COPIED the value and left the source. Every rename in
+the tool rendered correctly and executed as an `eval`. This affected SPL and CQL
+alike, and it was invisible to 850 tests because nothing between a lowerer and a
+renderer executes the rule.
+
+The fix is a new `Derive.drops` field, and the design note on it is worth
+reading before adding a node: `projects` is a whole-row decision, but rename is
+PER COLUMN -- it keeps every column except the one it consumed -- so `projects`
+could not carry it. `DERIVE_DROPS_ASSIGNED_COLUMN` refuses any name that is both
+assigned and dropped, because add-then-drop and drop-then-add are different
+results and picking one silently is the bug this field exists to prevent. M22
+pins the opposite direction, since a fix that treated every `Derive` as a rename
+would delete columns from every `:=`, `extend`, and `eval`.
+
+**A GUARD THAT STOPS TRACKING IS WORSE THAN NO GUARD.** The `| table`-after-
+aggregate check was written as a frozen `("count",)` allow-list and never
+updated, so `| count() | x := 1 | table x` was refused while the evaluator
+would have produced `{count, x}`. It failed closed, which is safe, but it
+refused CQL the tool renders happily and claimed "a count leaves exactly one
+column" in the same breath as the analyst's own query. `present` is now tracked
+through every stage that adds or removes a column. The general lesson is the one
+from M7: a check that silently stopped checking is a false pass.
+
 
 Everything round 9 listed except the EQL/CQL gap is FIXED and committed, each
 mutation-verified: eventstats refused, `tstats`-first ordering, the `Not`

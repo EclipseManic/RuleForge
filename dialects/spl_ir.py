@@ -540,12 +540,28 @@ def lower(text: str, rule_id: str = "spl",
             # `sort` then `head` -- the renderer emits exactly that.
             if command.name in ("fields", "rename"):
                 pairs = _parse_field_aliases(command.name, command.args,
-                                            position, DIALECT)
+                                             position, DIALECT)
+                # `rename` DROPS the column it renamed, so a later term reading
+                # the OLD name finds nothing -- which is what `rename` means, and
+                # what Splunk does. `fields` drops everything NOT named, which is
+                # `projects`. The two are different operations and this was
+                # setting neither correctly: rename copied the value and left the
+                # source, so a rule rendered as a rename and executed as an
+                # `eval`. `drops` is per-COLUMN, which is why `projects` could
+                # not carry it.
                 nodes.append(Derive(
                     id=f"derive_{position}", input=current,
                     assignments=pairs,
                     projects=command.name == "fields",
-                    kind=command.name))
+                    kind=command.name,
+                    # The SOURCE of a rename is inside the FieldExpr, not the
+                    # assignment key -- `rename user as account` produces
+                    # `("account", FieldExpr(FieldRef("user")))`, so reading the
+                    # key would drop `account` (the thing being created) and keep
+                    # `user` (the thing rename is supposed to remove). That is
+                    # backwards, and it would have compiled happily.
+                    drops=tuple(expr.ref.name for _, expr in pairs)
+                    if command.name == "rename" else ()))
                 current = f"derive_{position}"
             else:
                 order_by, limit = _parse_arrange_args(command.name,

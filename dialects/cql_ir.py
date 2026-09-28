@@ -60,10 +60,20 @@ def lower(query: CqlQuery, rule_id: str = "rule") -> tuple[RuleIR, list[dict]]:
         Filter(id="filter", input="read", condition=condition),
     ]
     current = "filter"
-    # WHAT AN AGGREGATE LEAVES BEHIND, so a later `| table` can be checked
-    # against it. `None` means "no aggregate has run yet", which is the
-    # ordinary case and needs no check.
-    aggregate_fields: tuple[str, ...] | None = None
+    # THE COLUMNS THE CURRENT ROW HAS, OR None WHEN THEY ARE UNBOUNDED.
+    #
+    # THIS MUST BE UPDATED BY EVERY STAGE THAT ADDS ONE, not just set by the
+    # aggregate. The first version set it to `("count",)` and never touched it
+    # again, so `| count() | x := 1 | table x` was refused -- even though `x`
+    # demonstrably exists by then, and the evaluator would have produced
+    # `{count, x}`. It failed CLOSED, which is safe, but it refused CQL the
+    # tool renders happily and told the analyst "a count leaves exactly one
+    # column" in the same breath as their own query. A guard that stops
+    # tracking is worse than no guard: it turns a check into a wall.
+    #
+    # `None` means "no aggregate has run", where a `| table` can name any
+    # field and there is nothing decidable to check.
+    present: frozenset[str] | None = None
     # ONE PASS, IN WRITTEN ORDER. The previous version had one optional slot
     # per pipe kind and emitted them in a fixed order, which turned
     # `| table a,b | sort(x)` into `| sort(x) | table a,b` -- a different rule
@@ -85,16 +95,33 @@ def lower(query: CqlQuery, rule_id: str = "rule") -> tuple[RuleIR, list[dict]]:
         elif isinstance(stage, CqlRename):
             # `| rename old as new`: the original column is GONE afterwards, so
             # a later term reading the old name finds nothing. That is what
-            # `rename` means (unlike `eval`, which keeps both), and the
-            # renderer must say `rename`, not `eval`, for the same reason.
+            # `rename` means (unlike `:=`, which keeps both), and the renderer
+            # must say `rename`, not `:=`, for the same reason.
+            #
+            # `drops` IS WHAT MAKES THAT TRUE. Without it this node COPIED the
+            # value and left the source, so the rule rendered as a rename and
+            # executed as an `:=` -- byte-identical text, different rowset, and
+            # invisible to every text-level test. `projects` cannot express it
+            # either, because rename keeps every column EXCEPT the one it
+            # consumed, which is a per-column decision, not a whole-row one.
+            #
             # The TARGET keeps a leading `#` stripped too: `rename a as #b` was
             # minting a column named `#b`, which nothing would ever read.
             node_id = _stage_id("rename", index)
+            source = _field_name(stage.old)
+            target = _field_name(stage.new)
             nodes.append(Derive(id=node_id, input=current,
-                                assignments=((_field_name(stage.new),
-                                              FieldExpr(FieldRef(_field_name(
-                                                  stage.old)))),),
-                                projects=False, kind="rename"))
+                                assignments=((target,
+                                              FieldExpr(FieldRef(source))),),
+                                projects=False, kind="rename",
+                                drops=(source,)))
+            # A RENAME IS A NET CHANGE OF ONE COLUMN: the target appears, the
+            # source goes. Tracking that here is what stops the `| table` guard
+            # below from refusing `| count() | rename count as total | table
+            # total`, which is perfectly valid -- the guard must see the state
+            # the evaluator will actually be in.
+            if present is not None:
+                present = (present - {source}) | {target}
         elif isinstance(stage, CqlAssign):
             # `| name := operand`: the new column is ADDED and everything else
             # is KEPT, which is `eval` semantics, not `rename`. Getting these
@@ -106,6 +133,11 @@ def lower(query: CqlQuery, rule_id: str = "rule") -> tuple[RuleIR, list[dict]]:
                                 assignments=((stage.name,
                                               _assign_value(stage.expr)),),
                                 projects=False, kind="eval"))
+            # `:=` ONLY ADDS, so the tracked set grows. This is the case the
+            # first version of this guard missed, refusing `| count() | x := 1
+            # | table x` while the evaluator would have produced `{count, x}`.
+            if present is not None:
+                present = present | {stage.name}
         elif isinstance(stage, CqlCount):
             # A STAGE, NOT A PROPERTY. An aggregate collapses many rows into one,
             # so every stage after it sees a different rowset -- `| count() |
@@ -114,13 +146,11 @@ def lower(query: CqlQuery, rule_id: str = "rule") -> tuple[RuleIR, list[dict]]:
             # of on the query, and why putting it in the wrong position would be
             # as wrong as reordering `| table` and `| sort` was.
             node_id = _stage_id("count", index)
-            # RECORD WHAT SURVIVES THE AGGREGATE. An aggregate collapses the
-            # rowset to one row carrying only its measures, so every event
-            # field is gone. A `| table` after it can therefore only name a
-            # measure, and a `| table` naming an event field would project a
-            # column that cannot exist -- which used to produce a row with ZERO
-            # columns, silently, destroying the count the rule just computed.
-            aggregate_fields = ("count",)
+            # AN AGGREGATE COLLAPSES THE ROWSET. One row, carrying only its
+            # measures; every event field is gone. That is the point at which
+            # a later `| table` becomes checkable, because the set of columns
+            # that survive is now FINITE and KNOWN rather than open-ended.
+            present = frozenset({"count"})
             # `per_event` IS THE WHOLE-INPUT FRAME, which is what CQL's
             # ungrouped `count()` means: one number for everything that reached
             # this stage. The default `tumbling` would be WRONG here, and
@@ -134,31 +164,33 @@ def lower(query: CqlQuery, rule_id: str = "rule") -> tuple[RuleIR, list[dict]]:
                                    frame=Frame(kind="per_event")))
         elif isinstance(stage, CqlTable):
             # A PROJECTION AFTER AN AGGREGATE CAN NAME ONLY WHAT SURVIVED IT.
-            # `count()` leaves exactly one column, `count`; every event field
-            # is gone. So `| count() | table a` projects a column that cannot
-            # exist, and the result is a row with NO columns at all -- the count
-            # the rule just computed, silently destroyed, with no caveat.
+            # An aggregate collapses the rowset to one row carrying only its
+            # measures, so every event field is gone. `| count() | table a`
+            # projects a column that cannot exist, and the result is a row with
+            # NO columns at all -- the count the rule just computed, silently
+            # destroyed, with no caveat. To an analyst that is indistinguishable
+            # from "no events matched".
             #
-            # This is decidable at lower time, which is why it is refused here
-            # rather than left to the evaluator: the set of columns an
-            # Aggregate produces is its measure names, so there is nothing to
-            # discover later. Refusing beats a caveat because the analyst's
-            # query is almost certainly a mistake, and a rule that returns an
-            # empty row looks like "no matches" rather than "you asked for a
-            # field that is not there".
-            if aggregate_fields is not None:
+            # `present` is TRACKED, not assumed, so a `:=` or `rename` between
+            # the count and the table widens it correctly. It is set only once
+            # an aggregate has run, because that is the moment the column set
+            # becomes finite and knowable; before then a projection may name any
+            # field and there is nothing decidable to check.
+            if present is not None:
                 missing = [column for column in stage.columns
-                           if column not in aggregate_fields]
+                           if column not in present]
                 if missing:
                     raise Refusal(
                         "CQL_TABLE_AFTER_AGGREGATE",
-                        f"`| table {', '.join(missing)}` comes after "
-                        f"`| count()`, and a count leaves exactly one column -- "
-                        f"`count`. Every event field is gone once rows have been "
-                        f"collapsed into a number, so this would project a "
-                        f"column that does not exist and return a row with no "
-                        f"columns at all. Refused rather than silently "
-                        f"returning nothing.", DIALECT)
+                        f"`| table {', '.join(missing)}` comes after an "
+                        f"aggregate. Once rows are collapsed into a number, only "
+                        f"the columns the aggregate produced exist -- right now "
+                        f"that is {', '.join(sorted(present))}"
+                        f"{' plus anything a later `:=` or `rename` adds' if len(present) > 1 else ''}"
+                        f" -- so this would project a column that does not "
+                        f"exist and return a row with no columns at all. "
+                        f"Refused rather than silently returning nothing.",
+                        DIALECT)
             node_id = _stage_id("derive", index)
             # A LEADING `#` IS STRIPPED HERE TOO, like every other field site in
             # this file. `| table #foo` keeping the `#` produced a column
