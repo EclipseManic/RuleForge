@@ -200,6 +200,46 @@ class SortAndRenameLower(unittest.TestCase):
         self.assertFalse(outcome.rendered)
         self.assertEqual(outcome.refusal["code"], "CQL_PIPE_NOT_LOWERED")
 
+
+class MembershipLowersAsDisjunction(unittest.TestCase):
+    """`in(field, [...])` IS a disjunction -- `field` equal to any one of the
+    values -- so it lowers exactly onto `BoolOp("or", ...)` with no new node
+    and no approximation."""
+
+    def test_membership_round_trips_as_or(self):
+        self.assertEqual(
+            _round_trip('in(host, ["a", "b"])'),
+            "host = a OR host = b")
+
+    def test_values_keyword_form_round_trips(self):
+        self.assertEqual(
+            _round_trip('in(host, values=["a", "b", "c"])'),
+            "host = a OR host = b OR host = c")
+
+    def test_single_value_membership_is_bare_equality(self):
+        """One value needs no `or` node -- and the renderer must not invent
+        parens around a single comparison."""
+        self.assertEqual(
+            _round_trip('in(host, ["a"]) AND b = 1'),
+            "host = a AND b = 1")
+
+    def test_empty_list_is_refused(self):
+        """`in(host, [])` matches nothing, so the rule could never fire.
+        Refused rather than rendered, the way `head 0` is."""
+        with self.assertRaises(Refusal) as caught:
+            lower_cql(parse_cql("in(host, [])"))
+        self.assertEqual(caught.exception.code, "CQL_IN_EMPTY")
+
+    def test_malformed_membership_is_refused(self):
+        with self.assertRaises(Refusal) as caught:
+            lower_cql(parse_cql("in(host)"))
+        self.assertEqual(caught.exception.code, "CQL_IN_MALFORMED")
+
+    def test_no_artifact_is_produced_for_an_empty_list(self):
+        outcome = jobs.author("logscale", "in(host, [])", "r1")
+        self.assertFalse(outcome.rendered)
+        self.assertEqual(outcome.refusal["code"], "CQL_IN_EMPTY")
+
     def test_the_label_says_which_slice_this_is(self):
         import jobs as _jobs
         self.assertIn("table",

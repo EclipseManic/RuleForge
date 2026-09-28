@@ -163,17 +163,22 @@ def _comparison(text: str) -> Any:
         return Literal(value=True)
     if body.startswith("(") and body.endswith(")"):
         return _condition(body[1:-1])
+    if body.lower().startswith("in(") and body.endswith(")"):
+        return _membership(body)
     bare = _without_strings(body)
     # Refused by name, because each changes which rows match:
     if "/" in bare and _looks_like_regex(body):
         raise Refusal("CQL_REGEX_NOT_LOWERED",
                       "regex (`/pattern/` and `regex()`) is not in the lowered "
                       "subset. Refused rather than approximated.", DIALECT)
-    if " in(" in bare.lower() or bare.lower().startswith("in("):
+    # A LEADING `in(` lowers above; what remains here is `in(` buried
+    # mid-expression where the AND/OR splitter did not separate it -- which
+    # means the surrounding syntax is malformed, not a membership test.
+    if " in(" in bare.lower():
         raise Refusal("CQL_IN_NOT_LOWERED",
-                      "`in(field, [...])` tests membership in a list, which "
-                      "has no node yet. Refused rather than approximated.",
-                      DIALECT)
+                      "`in(field, [...])` outside a boolean position is not a "
+                      "membership test this lowering can place. Refused rather "
+                      "than approximated.", DIALECT)
     if ":=" in bare:
         raise Refusal("CQL_ASSIGN_NOT_LOWERED",
                       "`:=` creates a new field, which needs a `Derive` the "
@@ -197,6 +202,47 @@ def _looks_like_regex(body: str) -> bool:
     """A `/` outside strings that opens a `/pattern/` or `regex(` call."""
     bare = _without_strings(body)
     return "/" in bare
+
+
+def _membership(body: str) -> Any:
+    """`in(field, values=[v1, v2])` or `in(field, [v1, v2])` as an OR of
+    equalities.
+
+    Membership IS a disjunction -- `field` equal to any one of the values --
+    so this lowers exactly onto `BoolOp("or", ...)` with no new node and no
+    approximation. An empty value list matches nothing, so the rule could never
+    fire; refused rather than rendered, the way `head 0` is.
+    """
+    inner = body[len("in("):-1].strip()
+    field, sep, rest = inner.partition(",")
+    field = field.strip()
+    if not sep or not field:
+        raise Refusal("CQL_IN_MALFORMED",
+                      f"`{body[:50]!r}` is not `in(field, [...])`. Refused "
+                      f"rather than guessed.", DIALECT)
+    values_text = rest.strip()
+    if values_text.lower().startswith("values="):
+        values_text = values_text[len("values="):].strip()
+    if not (values_text.startswith("[") and values_text.endswith("]")):
+        raise Refusal("CQL_IN_MALFORMED",
+                      f"`{body[:50]!r}` needs a `[...]` value list. Refused "
+                      f"rather than guessed.", DIALECT)
+    raw_values = [v.strip() for v in values_text[1:-1].split(",")
+                  if v.strip()]
+    if not raw_values:
+        raise Refusal("CQL_IN_EMPTY",
+                      f"`in({field}, [])` matches nothing, so the rule could "
+                      f"never fire. Refused rather than rendered.", DIALECT)
+    if not all(part.isidentifier() or part.replace("_", "").isalnum()
+               for part in field.replace("#", "").replace("@", "").split(".")):
+        raise Refusal("CQL_FIELD_NOT_A_NAME",
+                      f"`{field}` is not a plain field name.", DIALECT)
+    bare = field[1:] if field.startswith("#") else field
+    terms = tuple(Comparison("=", FieldExpr(FieldRef(bare)),
+                             _literal(v)) for v in raw_values)
+    if len(terms) == 1:
+        return terms[0]
+    return BoolOp("or", terms)
 
 
 def _without_strings(body: str) -> str:
