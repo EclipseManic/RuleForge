@@ -309,13 +309,37 @@ def _eval_comparison(expr: Comparison, row: Row, ctx: EvaluationContext,
 
     result = compare(left, right, expr.op)
     if not result.decided and result.reason:
-        ctx.note_uncertain(_describe_operand(left), result.reason)
+        # THE FIELD EXPRESSION, NOT THE VALUE. `left` here is a VALUE -- the
+        # ABSENT sentinel itself when the row has no such field -- so naming it
+        # described the sentinel instead of the column the analyst wrote. The
+        # caveat then read "`<an absent field>` was a field was absent", which
+        # points at nothing a reader can go and look for.
+        #
+        # `expr.left` is the field the RULE referenced, which is exactly what
+        # the analyst needs to see to fix it. Only when the left side is not a
+        # field at all does it fall back to describing the value.
+        ctx.note_uncertain(_describe_operand(expr.left), result.reason)
     return result.value
 
 
 def _describe_operand(operand: Any) -> str:
     if isinstance(operand, FieldExpr):
         return operand.ref.full
+    # A VALUE, NOT AN OPERAND. `eval_expr` returns ABSENT for a field the row
+    # does not carry, and the caller hands that value to this function to name
+    # in the caveat. It fell through to `type(operand).__name__.lower()`,
+    # which is the private class name: the caveat told the analyst that
+    # "`_absent` was a field was absent" -- naming a FIELD THAT DOES NOT EXIST
+    # IN THEIR DATA.
+    #
+    # That is the specific harm: a reader cannot look for a field called
+    # `_absent`, so the one message that exists to point them at the missing
+    # field points at nothing instead. And it is a false statement about their
+    # data, produced by the module whose purpose is to avoid exactly that.
+    if operand is ABSENT:
+        return "<an absent field>"
+    if isinstance(operand, Undecided):
+        return "<an undecided value>"
     return type(operand).__name__.lower()
 
 

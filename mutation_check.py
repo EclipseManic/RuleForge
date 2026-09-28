@@ -227,6 +227,16 @@ MUTATIONS = [
      "engine/nodes.py",
      "                    if stage_index in node.negative_stages:",
      "                    if False and stage_index in node.negative_stages:"),
+
+    # THE CAVEAT NAMED THE INTERNAL SENTINEL INSTEAD OF THE FIELD. A reader
+    # cannot go and look for a field called `_absent`, so the one message whose
+    # job is to point at the missing column pointed at nothing -- and it was a
+    # false statement about the analyst's data, produced by the module whose
+    # purpose is to avoid exactly that.
+    ("M27 the absent-field caveat names the sentinel, not the field",
+     "engine/evaluate.py",
+     "        ctx.note_uncertain(_describe_operand(expr.left), result.reason)",
+     "        ctx.note_uncertain(_describe_operand(left), result.reason)"),
 ]
 
 
