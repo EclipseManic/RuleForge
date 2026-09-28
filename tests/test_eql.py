@@ -300,6 +300,53 @@ class EverythingElseIsRefusedByName(unittest.TestCase):
         self.assertEqual(caught.exception.code,
                          "EQL_PER_STEP_BY_NOT_LOWERED")
 
+    def test_the_per_step_by_refusal_cites_the_vendor(self):
+        """The refusal must state the REASON, not assert it.
+
+        Elastic's EQL reference: "Use the `by` keyword in a sequence query to
+        only match events that share the same values, EVEN IF THOSE VALUES ARE
+        IN DIFFERENT FIELDS." That is what makes this refusal load-bearing
+        rather than a shrug: `Pattern.key` is one global list of field names
+        compared by NAME, so it can only ever say "same field everywhere". A
+        rule joining `user.name` in one step to `user.id` in the next is a
+        different rule, and faking it with a global key would over-match --
+        matching on a field nobody asked about.
+
+        So the message has to name the different-fields behaviour, or an
+        analyst reads "not lowered" and assumes it is a missing feature rather
+        than a rule the IR cannot state.
+        """
+        with self.assertRaises(Refusal) as caught:
+            parse_eql('sequence with maxspan=1h\n'
+                      '  [ file where true ] by file.path\n'
+                      '  [ process where true ]')
+        message = caught.exception.message
+        self.assertIn("DIFFERENT fields", message)
+        self.assertIn("global", message,
+                      "the message must say Pattern.key is global, since that "
+                      "is the constraint being hit")
+
+    def test_both_per_step_by_shapes_are_refused_the_same_way(self):
+        """A trailing `by` on the step, and a `by` the splitter left as its
+        own segment, are the SAME construct and must not diverge. The dangling
+        form once produced a message that named neither the reason nor the
+        fields."""
+        trailing = ('sequence with maxspan=1h\n'
+                    '  [ file where true ] by file.path\n'
+                    '  [ process where true ]')
+        dangling = ('sequence with maxspan=1h\n'
+                    '  [ file where true ]\n'
+                    '  by file.path\n'
+                    '  [ process where true ]')
+        codes = set()
+        for source in (trailing, dangling):
+            with self.assertRaises(Refusal) as caught:
+                parse_eql(source)
+            codes.add(caught.exception.code)
+        self.assertEqual(codes, {"EQL_PER_STEP_BY_NOT_LOWERED"},
+                         "both shapes are the same construct and must refuse "
+                         "under the same code")
+
 class SamplesLowerOntoUnorderedPatterns(unittest.TestCase):
     """`sample by keys steps...` is an unordered, windowless, key-grouped set
     of events -- which is `Pattern` with `ordered=False`, `within=None`, and

@@ -476,12 +476,16 @@ def _parse_step(text: str, allow_bang: bool, context: str):
     if body.lower().startswith("by "):
         # A per-step `by` that the splitter left dangling: it follows a `]`,
         # so it arrives here as its own segment rather than as a trailer. Same
-        # refusal as the trailer form, because it is the same construct.
+        # refusal as the trailer form, because it is the same construct -- the
+        # reason is at the trailer site, where the fields are in hand.
         raise Refusal(
             "EQL_PER_STEP_BY_NOT_LOWERED",
-            "per-step `by` joins different fields per step, and `Pattern.key` "
-            "is global to the whole sequence. Use `sequence by ...` for a "
-            "shared key.", DIALECT)
+            "per-step `by` joins values that may live in DIFFERENT fields "
+            "between consecutive steps, while `Pattern.key` is one global list "
+            "of field names compared by name and so can only express a shared "
+            "key. Using it here would join on the wrong fields and over-match. "
+            f"Write `{body.strip()}` on the step it belongs to, or use "
+            "`sequence by ...` for a shared key.", DIALECT)
     if body.startswith("!"):
         if not allow_bang:
             raise Refusal("EQL_UNTIL_MISSING_EVENT",
@@ -515,12 +519,33 @@ def _parse_step(text: str, allow_bang: bool, context: str):
             f"`{parts[0]}` is not one of the documented event categories.",
             DIALECT)
     if trailer:
-        # PER-STEP `by` HAS NO `Pattern` SPELLING. `Pattern.key` is global, and
-        # EQL allows different fields per step. Faking it with a global key
-        # would join on the wrong fields.
+        # PER-STEP `by` HAS NO `Pattern` SPELLING, AND THE VENDOR SAYS WHY.
+        # Elastic's EQL reference: "Use the `by` keyword in a sequence query to
+        # only match events that share the same values, EVEN IF THOSE VALUES ARE
+        # IN DIFFERENT FIELDS. These shared values are called join keys." So
+        # `[a where ...] by user.name [b where ...] by user.id` joins the FIRST
+        # step's `user.name` to the SECOND's `user.id` -- two DIFFERENT field
+        # names, matched pairwise by POSITION.
+        #
+        # `Pattern.key` is `tuple[FieldRef, ...]`, a single global list compared
+        # by field NAME, so it can only ever express "same name in every step".
+        # Faking the per-step case with a global key would join on the wrong
+        # fields: the two would agree only when both steps happen to name the
+        # same field, and would silently over-match in every other case.
+        #
+        # The IR would need a per-stage key list (a list of PAIRS, or a list of
+        # per-stage field tuples) before this is honest -- and a half-measure
+        # here is worse than the refusal, because a rule that joins on the wrong
+        # field is a rule that matches things nobody asked it to match.
         raise Refusal(
             "EQL_PER_STEP_BY_NOT_LOWERED",
-            "per-step `by` joins different fields per step, and `Pattern.key` "
-            "is global to the whole sequence. Use `sequence by ...` for a "
-            "shared key.", DIALECT)
+            "per-step `by` matches shared values even when they are in "
+            "DIFFERENT fields (Elastic's own words: \"even if those values are "
+            "in different fields\"), so this step joins "
+            f"{trailer.split()[1:]} by POSITION against the previous step's "
+            "fields. `Pattern.key` is one global list of field names compared "
+            "by name, which can only express a shared key -- using it here "
+            "would join on the wrong fields and over-match. Use "
+            "`sequence by ...` for a shared key, or a single `by` naming the "
+            "same field on every step.", DIALECT)
     return EqlSequenceStep(category=category, condition=parts[2].strip())
