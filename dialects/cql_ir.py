@@ -60,6 +60,10 @@ def lower(query: CqlQuery, rule_id: str = "rule") -> tuple[RuleIR, list[dict]]:
         Filter(id="filter", input="read", condition=condition),
     ]
     current = "filter"
+    # WHAT AN AGGREGATE LEAVES BEHIND, so a later `| table` can be checked
+    # against it. `None` means "no aggregate has run yet", which is the
+    # ordinary case and needs no check.
+    aggregate_fields: tuple[str, ...] | None = None
     # ONE PASS, IN WRITTEN ORDER. The previous version had one optional slot
     # per pipe kind and emitted them in a fixed order, which turned
     # `| table a,b | sort(x)` into `| sort(x) | table a,b` -- a different rule
@@ -110,6 +114,13 @@ def lower(query: CqlQuery, rule_id: str = "rule") -> tuple[RuleIR, list[dict]]:
             # of on the query, and why putting it in the wrong position would be
             # as wrong as reordering `| table` and `| sort` was.
             node_id = _stage_id("count", index)
+            # RECORD WHAT SURVIVES THE AGGREGATE. An aggregate collapses the
+            # rowset to one row carrying only its measures, so every event
+            # field is gone. A `| table` after it can therefore only name a
+            # measure, and a `| table` naming an event field would project a
+            # column that cannot exist -- which used to produce a row with ZERO
+            # columns, silently, destroying the count the rule just computed.
+            aggregate_fields = ("count",)
             # `per_event` IS THE WHOLE-INPUT FRAME, which is what CQL's
             # ungrouped `count()` means: one number for everything that reached
             # this stage. The default `tumbling` would be WRONG here, and
@@ -122,6 +133,32 @@ def lower(query: CqlQuery, rule_id: str = "rule") -> tuple[RuleIR, list[dict]]:
                                                      function="count"),),
                                    frame=Frame(kind="per_event")))
         elif isinstance(stage, CqlTable):
+            # A PROJECTION AFTER AN AGGREGATE CAN NAME ONLY WHAT SURVIVED IT.
+            # `count()` leaves exactly one column, `count`; every event field
+            # is gone. So `| count() | table a` projects a column that cannot
+            # exist, and the result is a row with NO columns at all -- the count
+            # the rule just computed, silently destroyed, with no caveat.
+            #
+            # This is decidable at lower time, which is why it is refused here
+            # rather than left to the evaluator: the set of columns an
+            # Aggregate produces is its measure names, so there is nothing to
+            # discover later. Refusing beats a caveat because the analyst's
+            # query is almost certainly a mistake, and a rule that returns an
+            # empty row looks like "no matches" rather than "you asked for a
+            # field that is not there".
+            if aggregate_fields is not None:
+                missing = [column for column in stage.columns
+                           if column not in aggregate_fields]
+                if missing:
+                    raise Refusal(
+                        "CQL_TABLE_AFTER_AGGREGATE",
+                        f"`| table {', '.join(missing)}` comes after "
+                        f"`| count()`, and a count leaves exactly one column -- "
+                        f"`count`. Every event field is gone once rows have been "
+                        f"collapsed into a number, so this would project a "
+                        f"column that does not exist and return a row with no "
+                        f"columns at all. Refused rather than silently "
+                        f"returning nothing.", DIALECT)
             node_id = _stage_id("derive", index)
             # A LEADING `#` IS STRIPPED HERE TOO, like every other field site in
             # this file. `| table #foo` keeping the `#` produced a column

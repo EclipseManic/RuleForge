@@ -145,6 +145,17 @@ MUTATIONS = [
      "dialects/cql_ir.py",
      '                                   frame=Frame(kind="per_event")))',
      "                                   ))"),
+
+    # THE SILENT EMPTY ROW. `| count() | table a` projected a column the
+    # aggregate could not produce, and the rule returned a row with ZERO columns
+    # -- the count it had just computed, destroyed, with no caveat. To an
+    # analyst that is indistinguishable from "no events matched". The check is
+    # decidable at lower time because an Aggregate's output columns ARE its
+    # measure names.
+    ("M20 projection after an aggregate is not checked against it",
+     "dialects/cql_ir.py",
+     "            if aggregate_fields is not None:",
+     "            if False:"),
 ]
 
 

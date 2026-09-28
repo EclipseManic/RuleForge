@@ -458,6 +458,49 @@ class HashPrefixIsOneRuleEverywhere(unittest.TestCase):
         self.assertIsInstance(
             next(n for n in after.nodes if n.id == "arrange1"), Arrange)
 
+    def test_a_projection_after_a_count_is_refused_not_silently_emptied(self):
+        """`| count() | table a` must NOT return a row with zero columns.
+
+        A count collapses the rowset to one row carrying only `count`, so every
+        event field is gone. Projecting `a` after it names a column that cannot
+        exist, and the row came back as `{}` -- the count the rule just computed,
+        silently destroyed, with no caveat and no refusal. To an analyst that
+        looks identical to "no events matched", which is the worst possible
+        shape for a wrong answer.
+
+        It is decidable at lower time because the columns an Aggregate produces
+        are its measure names, so there is nothing to discover later. A refusal
+        beats a caveat here: the query is almost certainly a mistake, and a
+        caveat on an empty row reads as data, not as an error.
+        """
+        for source in ("a = 1 | count() | table a",
+                       "a = 1 | count() | table a, count"):
+            with self.assertRaises(Refusal) as caught:
+                lower_cql(parse_cql(source))
+            self.assertEqual(caught.exception.code,
+                             "CQL_TABLE_AFTER_AGGREGATE", source)
+            self.assertIn("count", caught.exception.message,
+                          "the refusal must name the one column that survives")
+
+    def test_a_projection_of_the_measure_itself_still_works(self):
+        """`table count` names the column that DOES survive, so it lowers --
+        the refusal has to be about the missing field, not about being after a
+        count at all."""
+        from engine import evaluate
+        ir, _ = lower_cql(parse_cql("a = 1 | count() | table count"))
+        rows = [{"a": "1"}, {"a": "1"}]
+        self.assertEqual([dict(r.values) for r in evaluate(ir, rows).rows],
+                         [{"count": 2}])
+
+    def test_a_count_after_a_projection_is_unaffected(self):
+        """`| table a | count()` counts the projected rows -- the other order,
+        and it must not inherit the refusal above."""
+        from engine import evaluate
+        ir, _ = lower_cql(parse_cql("a = 1 | table a | count()"))
+        rows = [{"a": "1", "b": "x"}, {"a": "1", "b": "y"}]
+        self.assertEqual([dict(r.values) for r in evaluate(ir, rows).rows],
+                         [{"count": 2}])
+
     def test_count_uses_the_whole_input_frame(self):
         """A `tumbling` frame would emit ONE ROW PER WINDOW, so `| count()` would
         return several numbers where the rule asks for one. `per_event` is the
