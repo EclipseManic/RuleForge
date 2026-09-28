@@ -36,6 +36,12 @@ def render(ir: RuleIR) -> str:
         if kind in ("Read", "Filter", "Emit"):
             continue
         if kind == "Derive" and getattr(node, "kind", "") == "fields":
+            # A PROJECTION RENDERS AS ITSELF: `| table`. A rule written with
+            # `| select` comes back as `| table`, which is semantically identical
+            # -- LogScale documents select as "creates a table as default" -- but
+            # it is a normalising choice, not a silent substitution, so it is
+            # stated here rather than left to be discovered by an analyst
+            # wondering where their `select` went.
             out.append("| table " + ", ".join(
                 alias for alias, _ in node.assignments))
             continue

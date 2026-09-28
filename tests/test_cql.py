@@ -629,6 +629,73 @@ class HashPrefixIsOneRuleEverywhere(unittest.TestCase):
                 parse_cql(source)
             self.assertEqual(caught.exception.code, code, source)
 
+    def test_select_IS_a_projection_and_lowers_to_the_same_node(self):
+        """`select(fields)` and `| table` are the SAME operation.
+
+        LogScale's own words: "The select statement creates a table as default
+        and copies data from one table to another." So it lowers onto the same
+        `CqlTable` stage and the same `Derive(kind="fields")` node rather than
+        getting a near-copy of its own -- one shape, one lowering, which is what
+        stopped `in()` and `:=` from needing separate machinery.
+
+        It renders back as `| table`. That is a NORMALISING choice between two
+        spellings the vendor documents as equivalent, not a substitution, and
+        the renderer says so rather than leaving an analyst to wonder where
+        their `select` went.
+        """
+        from engine.ir import Derive
+        for source in ("a = 1 | select([b])", "a = 1 | select(b)"):
+            ir, _ = lower_cql(parse_cql(source))
+            node = next(n for n in ir.nodes if isinstance(n, Derive))
+            self.assertEqual(node.kind, "fields")
+            self.assertTrue(node.projects,
+                            "select is a PROJECTION; it drops unlisted columns")
+            self.assertEqual(_round_trip(source), "a = 1 | table b")
+
+    def test_select_ACTUALLY_DROPS_the_unselected_columns(self):
+        """Executed, not just lowered. `select` that failed to project would
+        render perfectly and return every column."""
+        from engine import evaluate
+        rows = [{"a": "1", "b": "2", "SECRET": "must-not-be-emitted"}]
+        result = evaluate(lower_cql(parse_cql("a = 1 | select([b])"))[0], rows)
+        self.assertEqual([dict(r.values) for r in result.rows], [{"b": "2"}])
+
+    def test_select_keeps_the_writers_column_order(self):
+        self.assertEqual(_round_trip("a = 1 | select([b, a])"), "a = 1 | table b, a")
+
+    def test_select_and_table_together_are_refused_as_a_second_projection(self):
+        """Both claim the same slot, so `| select` then `| table` is a
+        re-projection -- the same refusal the reverse order already gave."""
+        for source in ("a = 1 | select([b]) | table a",
+                       "a = 1 | table a | select([b])"):
+            with self.assertRaises(Refusal) as caught:
+                parse_cql(source)
+            self.assertEqual(caught.exception.code, "CQL_TABLE_TWICE", source)
+
+    def test_select_refuses_what_it_cannot_read_honestly(self):
+        """Each is a different query, not a missing feature.
+
+        An UNBRACKETED list is refused rather than read either way: LogScale
+        writes `select([a, b])`, and guessing whether `select(a, b)` is two
+        columns or one silently changes which columns come back. An unknown
+        parameter is refused because an accepted-and-ignored parameter runs the
+        rule and returns something other than what was written.
+        """
+        for source, code in (
+                ("a = 1 | select(a, b)", "CQL_SELECT_KEYS_UNBRACKETED"),
+                ("a = 1 | select([])", "CQL_SELECT_EMPTY"),
+                ("a = 1 | select()", "CQL_SELECT_EMPTY"),
+                ("a = 1 | select(x=1)", "CQL_SELECT_PARAMETER_UNKNOWN"),
+                # An unclosed bracket is caught earlier, by the pipe parser's
+                # own malformed-call check, before argument parsing ever runs.
+                # Asserting a specific code here would pin an implementation
+                # detail rather than the behaviour that matters, which is that
+                # it is refused.
+                ("a = 1 | select([a", "CQL_PIPE_MALFORMED")):
+            with self.assertRaises(Refusal) as caught:
+                parse_cql(source)
+            self.assertEqual(caught.exception.code, code, source)
+
     def test_count_executes_to_the_number_of_matching_rows(self):
         """`| count()` must COUNT, not merely render. A nullary `count` reads no
         field -- it is the number of rows that reached the stage, which is a
@@ -868,8 +935,8 @@ class MembershipLowersAsDisjunction(unittest.TestCase):
         """
         import jobs as _jobs
         label = _jobs.DIALECTS["logscale"]["label"].lower()
-        for shipped in ("table", "sort", "rename", ":=", "in", "count()",
-                        "groupby"):
+        for shipped in ("table", "select", "sort", "rename", ":=", "in",
+                        "count()", "groupby"):
             # COMPARED CASE-INSENSITIVELY, because the label is a human-facing
             # string and `groupBy` is spelled with a capital B in LogScale. The
             # assertion is about which features the label NAMES, not about how

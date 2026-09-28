@@ -196,6 +196,22 @@ def parse_cql(text: str) -> CqlQuery:
             if name == "count":
                 stages.append(_parse_count(text, args))
                 continue
+            if name == "select":
+                # `select(fields)` IS A PROJECTION, and LogScale says so in as
+                # many words: "The select statement creates a table as default
+                # and copies data from one table to another." So it lowers onto
+                # the same `CqlTable` stage `| table` produces -- one shape, one
+                # lowering, rather than a near-copy that could drift. This is the
+                # same discipline as `in()`: one construct, one IR node.
+                #
+                # The parameter name may be omitted, so `select([a, b])` and
+                # `select(fields=[a, b])` are both legal, and both lower.
+                _claim(stages, seen, "table", "CQL_TABLE_TWICE",
+                       "two projection stages (`| table` or `| select`). A "
+                       "second projection is a re-projection, which is not "
+                       "lowered; refused as an unsupported shape, not a hazard.")
+                stages.append(CqlTable(columns=_parse_select_fields(args, text)))
+                continue
             if name in ("groupby", "group_by"):
                 _claim(stages, seen, "groupby", "CQL_GROUPBY_TWICE",
                        "two `| groupBy` stages. A second grouping re-groups the "
@@ -316,6 +332,54 @@ def _join_refusal(args: str) -> tuple[str, str]:
         f"`include` list, or a subquery over a different repo or time range. "
         f"Refused rather than lowered as a plain join, which would be a "
         f"different rule returning different rows.")
+
+
+def _parse_select_fields(args: str, text: str) -> tuple[str, ...]:
+    """`select([a, b])` or `select(fields=[a, b])` -> the field names.
+
+    The brackets are NOT cosmetic here. LogScale's own examples write
+    `select([statuscode, responsetime])`, and a column list without them is a
+    single field, so `select([a, b])` and `select(a, b)` are different queries.
+    Reading the unbracketed form as a two-column list would silently keep two
+    columns the analyst named as one, and reading the bracketed form as one
+    column would name a column that cannot exist.
+    """
+    body = args.strip()
+    prefix, sep, rest = body.partition("=")
+    if sep:
+        if prefix.strip().lower() != "fields":
+            raise Refusal(
+                "CQL_SELECT_PARAMETER_UNKNOWN",
+                f"`select({args})` has a parameter this lowering does not read "
+                f"(`{prefix.strip()}`). An accepted-and-ignored parameter is "
+                f"worse than a refusal, because the rule runs and returns "
+                f"something other than what was written.", DIALECT)
+        body = rest.strip()
+    if body.startswith("["):
+        if not body.endswith("]"):
+            raise Refusal("CQL_SELECT_KEYS_MALFORMED",
+                          f"`select({text.strip()})` has an unclosed `[`. "
+                          f"Refused rather than guessed.", DIALECT)
+        body = body[1:-1]
+    elif not sep:
+        # An unbracketed, comma-free argument is one field; one WITH a comma is
+        # a list the analyst wrote without brackets, which LogScale does not
+        # document, so it is refused rather than read either way.
+        if "," in body:
+            raise Refusal(
+                "CQL_SELECT_KEYS_UNBRACKETED",
+                f"`select({args})` lists fields without brackets. LogScale "
+                f"writes this as `select([a, b])`; reading an unbracketed list "
+                f"as one column or as several would be a guess, and a wrong "
+                f"guess here silently changes which columns come back.", DIALECT)
+    columns = tuple(part.strip() for part in body.split(",") if part.strip())
+    if not columns:
+        raise Refusal("CQL_SELECT_EMPTY",
+                      f"`select({text.strip()})` names no fields, which would "
+                      f"produce a row with no columns at all.", DIALECT)
+    for column in columns:
+        _check_field_name(column, "select field")
+    return columns
 
 
 def _parse_groupby(text: str, args: str) -> CqlGroupBy:

@@ -197,7 +197,7 @@ DIALECTS: dict[str, dict[str, Any]] = {
         # counts are refused, so the label says "count()" rather than "count".
         # `groupBy` is the COUNT variant only; every other aggregate function,
         # `function=[]`, and `limit=` are refused by name.
-        "label": ("CrowdStrike CQL (filter + table/sort/rename/:=/in/"
+        "label": ("CrowdStrike CQL (filter + table/select/sort/rename/:=/in/"
                   "count()/groupBy)"),
         "dialect": CQL_DIALECT,
         "lower_text": _lower_cql_text, "render": render_cql,
