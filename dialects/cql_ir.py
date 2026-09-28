@@ -19,6 +19,7 @@ from typing import Any
 
 from dialects.cql import CqlQuery, DIALECT
 from engine.ir import (
+    Arrange,
     BoolOp,
     Comparison,
     Derive,
@@ -36,13 +37,42 @@ from engine.values import Refusal
 
 
 def lower(query: CqlQuery, rule_id: str = "rule") -> tuple[RuleIR, list[dict]]:
-    """A CQL filter -> `Read` -> `Filter` (+ `Derive` for `table`) -> `Emit`."""
+    """A CQL filter -> `Read` -> `Filter` (+ pipes in order) -> `Emit`.
+
+    Pipes lower in PIPELINE ORDER, because each transforms its input: `| sort`
+    then `| table` sorts the full rows and projects the sorted ones, while the
+    reverse would sort one-column rows. Reordering stages returns different
+    events, so the order the analyst wrote is the order lowered.
+    """
     condition = _condition(query.filt)
     nodes: list[Any] = [
         Read(id="read", selector=SourceSelector(name="any")),
         Filter(id="filter", input="read", condition=condition),
     ]
     current = "filter"
+    if query.sort is not None:
+        # `| sort(field[, limit=N])` is ascending with an optional cap -- the
+        # only form this parser accepts, so there is no direction to lose.
+        field = query.sort.field
+        if field.startswith("#"):
+            field = field[1:]
+        nodes.append(Arrange(id="arrange", input=current,
+                             order_by=((FieldRef(field), "asc"),),
+                             limit=query.sort.limit))
+        current = "arrange"
+    if query.rename is not None:
+        # `| rename old as new`: the original column is GONE afterwards, so a
+        # later term reading the old name finds nothing. That is what `rename`
+        # means (unlike `eval`, which keeps both), and the renderer must say
+        # `rename`, not `eval`, for the same reason.
+        old = query.rename.old
+        if old.startswith("#"):
+            old = old[1:]
+        nodes.append(Derive(id="rename", input=current,
+                            assignments=((query.rename.new,
+                                          FieldExpr(FieldRef(old))),),
+                            projects=False, kind="rename"))
+        current = "rename"
     if query.table:
         nodes.append(Derive(id="derive", input=current,
                             assignments=tuple(

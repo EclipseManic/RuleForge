@@ -31,6 +31,40 @@ def render(ir: RuleIR) -> str:
             out.append("| table " + ", ".join(
                 alias for alias, _ in node.assignments))
             continue
+        if kind == "Arrange":
+            # `| sort(field[, limit=N])`, ascending -- the only form this
+            # parser accepts, so the direction is data, not a default. A
+            # descending order here would render as ascending and invert the
+            # rule; since the lowerer cannot produce one, reaching this branch
+            # with anything but "asc" is refused rather than rendered wrong.
+            pairs = node.order_by
+            if len(pairs) != 1 or pairs[0][1] != "asc":
+                raise Refusal(
+                    "CQL_RENDER_SORT_NOT_ASCENDING",
+                    "this sort is not a plain ascending single field, which "
+                    "is all this CQL slice lowers. Refused rather than "
+                    "rendered as ascending.", DIALECT)
+            ref = pairs[0][0]
+            name = ref.full if hasattr(ref, "full") else str(ref)
+            if node.limit is not None:
+                out.append(f"| sort({name}, limit={node.limit})")
+            else:
+                out.append(f"| sort({name})")
+            continue
+        if kind == "Derive" and getattr(node, "kind", "") == "rename":
+            # `| rename old as new`, in that order -- the main SPL loop and the
+            # subpipeline disagreed about this once, in opposite directions, so
+            # the order is asserted by test rather than left to memory.
+            if len(node.assignments) != 1:
+                raise Refusal(
+                    "CQL_RENDER_RENAME_NOT_A_PAIR",
+                    "a rename here holds one pair; anything else is refused "
+                    "rather than flattened.", DIALECT)
+            alias, expr = node.assignments[0]
+            old = expr.ref.full if hasattr(expr, "ref") \
+                and hasattr(expr.ref, "full") else str(expr)
+            out.append(f"| rename {old} as {alias}")
+            continue
         raise Refusal(
             "CQL_RENDER_NODE_UNSUPPORTED",
             f"a {kind} cannot appear in this CQL slice. Rendering it as a "

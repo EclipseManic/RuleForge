@@ -113,13 +113,82 @@ class EverythingElseIsRefusedByName(unittest.TestCase):
 
     def test_other_pipes_are_refused_by_name(self):
         with self.assertRaises(Refusal) as caught:
-            parse_cql("#event_simpleName=ProcessRollup2 | sort x")
+            parse_cql("#event_simpleName=ProcessRollup2 | join x")
         self.assertEqual(caught.exception.code, "CQL_PIPE_NOT_LOWERED")
 
     def test_double_table_is_refused(self):
         with self.assertRaises(Refusal) as caught:
             parse_cql("a = 1 | table a | table b")
         self.assertEqual(caught.exception.code, "CQL_TABLE_TWICE")
+
+
+class SortAndRenameLower(unittest.TestCase):
+    """`| sort(field[, limit=N])` and `| rename old as new` use existing
+    nodes -- `Arrange` and `Derive(kind="rename")` -- so no new IR was needed.
+    Stages lower in pipeline order, because reordering them returns different
+    events."""
+
+    def test_sort_round_trips(self):
+        self.assertEqual(
+            _round_trip("#event_simpleName=ProcessRollup2 | sort(UserName)"),
+            "event_simpleName = ProcessRollup2 | sort(UserName)")
+
+    def test_sort_with_limit_round_trips(self):
+        self.assertEqual(
+            _round_trip("#event_simpleName=ProcessRollup2 "
+                        "| sort(UserName, limit=10)"),
+            "event_simpleName = ProcessRollup2 | sort(UserName, limit=10)")
+
+    def test_rename_round_trips_old_as_new(self):
+        """The order is `rename <old> as <new>` -- asserted, because the SPL
+        main loop and subpipeline once disagreed about this in opposite
+        directions."""
+        self.assertEqual(
+            _round_trip("#event_simpleName=ProcessRollup2 | rename a as b"),
+            "event_simpleName = ProcessRollup2 | rename a as b")
+
+    def test_stages_keep_pipeline_order(self):
+        """`sort` then `table` sorts full rows and projects the sorted ones;
+        the reverse would sort one-column rows. The order written is the order
+        lowered."""
+        self.assertEqual(
+            _round_trip("#event_simpleName=ProcessRollup2 | sort(UserName) "
+                        "| table a, b"),
+            "event_simpleName = ProcessRollup2 | sort(UserName) "
+            "| table a, b")
+
+    def test_sort_with_unknown_arg_is_refused(self):
+        """A direction keyword this parser does not know would be silently
+        defaulted to ascending -- so it is refused instead."""
+        with self.assertRaises(Refusal) as caught:
+            parse_cql("a = 1 | sort(x, order=desc)")
+        self.assertEqual(caught.exception.code, "CQL_SORT_ARG_UNKNOWN")
+
+    def test_sort_with_non_positive_limit_is_refused(self):
+        with self.assertRaises(Refusal) as caught:
+            parse_cql("a = 1 | sort(x, limit=0)")
+        self.assertEqual(caught.exception.code,
+                         "CQL_SORT_LIMIT_NOT_POSITIVE")
+
+    def test_rename_without_as_is_refused(self):
+        with self.assertRaises(Refusal) as caught:
+            parse_cql("a = 1 | rename a b")
+        self.assertEqual(caught.exception.code, "CQL_RENAME_NOT_A_PAIR")
+
+    def test_double_sort_is_refused(self):
+        with self.assertRaises(Refusal) as caught:
+            parse_cql("a = 1 | sort(x) | sort(y)")
+        self.assertEqual(caught.exception.code, "CQL_SORT_TWICE")
+
+    def test_double_rename_is_refused(self):
+        with self.assertRaises(Refusal) as caught:
+            parse_cql("a = 1 | rename a as b | rename c as d")
+        self.assertEqual(caught.exception.code, "CQL_RENAME_TWICE")
+
+    def test_an_unclosed_paren_is_refused(self):
+        with self.assertRaises(Refusal) as caught:
+            parse_cql("a = 1 | sort(x")
+        self.assertEqual(caught.exception.code, "CQL_PIPE_MALFORMED")
 
     def test_exists_check_is_refused(self):
         with self.assertRaises(Refusal) as caught:

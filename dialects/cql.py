@@ -28,10 +28,30 @@ LANGUAGE = "CrowdStrike CQL"
 
 
 @dataclass(frozen=True, slots=True)
+class CqlSort:
+    """`| sort(field[, limit=N])` -- ascending by default. CQL's sort takes an
+    optional row limit; direction, if the query spells one this parser does not
+    know, is refused rather than defaulted."""
+    field: str
+    limit: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CqlRename:
+    """`| rename old as new`, one pair. Each pair is its own pipe in CQL."""
+    old: str
+    new: str
+
+
+@dataclass(frozen=True, slots=True)
 class CqlQuery:
-    """A CQL filter with zero or more pipes. Slice 1 allows only `table`."""
+    """A CQL filter with pipes. Slice 1 allowed only `table`; slice 2 adds
+    `sort` and `rename`. Each pipe appears at most once and in pipeline order
+    -- the parser preserves the order the analyst wrote."""
     filt: str
     table: tuple[str, ...] = ()
+    sort: CqlSort | None = None
+    rename: CqlRename | None = None
 
 
 def parse_cql(text: str) -> CqlQuery:
@@ -57,8 +77,37 @@ def parse_cql(text: str) -> CqlQuery:
                       "a query starting with `|` has no filter, which matches "
                       "everything -- a no-op disguised as a rule.", DIALECT)
     table: tuple[str, ...] = ()
+    sort: CqlSort | None = None
+    rename: CqlRename | None = None
     for pipe in segments[1:]:
-        name, _, args = pipe.strip().partition(" ")
+        text = pipe.strip()
+        # Function-call pipes (`sort(...)`) vs space-separated pipes (`table`,
+        # `rename`). Split on `(` first: a pipe whose name contains `(` is a
+        # call, and anything after the closing paren is refused rather than
+        # silently ignored.
+        if "(" in text:
+            name, _, rest = text.partition("(")
+            name = name.strip().lower()
+            if not rest.endswith(")"):
+                raise Refusal(
+                    "CQL_PIPE_MALFORMED",
+                    f"`| {text[:40]}` has an opening paren with no close. "
+                    f"Refused rather than guessed.", DIALECT)
+            args = rest[:-1].strip()
+            if name == "sort":
+                if sort is not None:
+                    raise Refusal("CQL_SORT_TWICE",
+                                  "two `| sort` stages; the second reorders "
+                                  "what the first ordered. Refused rather "
+                                  "than silently kept.", DIALECT)
+                sort = _parse_sort_args(args)
+                continue
+            raise Refusal(
+                "CQL_PIPE_NOT_LOWERED",
+                f"`| {name}(...)` is a real CQL command, but only `| table`, "
+                f"`| sort`, and `| rename` lower today. Refused by name rather "
+                f"than dropped.", DIALECT)
+        name, _, args = text.partition(" ")
         name, args = name.lower(), args.strip()
         if name == "table":
             if table:
@@ -72,20 +121,75 @@ def parse_cql(text: str) -> CqlQuery:
                               "`| table` with no columns projects nothing.",
                               DIALECT)
             for column in table:
-                if not all(part.isidentifier()
-                           for part in column.replace("#", "").replace(
-                               "@", "").split(".")):
-                    raise Refusal(
-                        "CQL_COLUMN_NOT_A_NAME",
-                        f"`{column}` is not a plain field name. Refused "
-                        f"rather than guessed.", DIALECT)
+                _check_field_name(column, "column")
+        elif name == "rename":
+            if rename is not None:
+                raise Refusal("CQL_RENAME_TWICE",
+                              "two `| rename` stages; the second renames what "
+                              "the first renamed. Refused rather than silently "
+                              "kept.", DIALECT)
+            old, sep, new = args.partition(" as ")
+            old, new = old.strip(), new.strip()
+            if not sep or not old or not new:
+                raise Refusal(
+                    "CQL_RENAME_NOT_A_PAIR",
+                    f"`| rename {args}` is not `old as new`. A rename needs "
+                    f"both sides, and guessing either is a different rule.",
+                    DIALECT)
+            _check_field_name(old, "rename source")
+            _check_field_name(new, "rename target")
+            rename = CqlRename(old=old, new=new)
         else:
             raise Refusal(
                 "CQL_PIPE_NOT_LOWERED",
-                f"`| {name}` is a real CQL command, but only `| table` lowers "
-                f"today. Refused by name rather than dropped -- dropping a "
-                f"pipe stage silently changes which rows come back.", DIALECT)
-    return CqlQuery(filt=filt, table=table)
+                f"`| {name}` is a real CQL command, but only `| table`, "
+                f"`| sort`, and `| rename` lower today. Refused by name rather "
+                f"than dropped -- dropping a pipe stage silently changes which "
+                f"rows come back.", DIALECT)
+    return CqlQuery(filt=filt, table=table, sort=sort, rename=rename)
+
+
+def _check_field_name(column: str, what: str) -> None:
+    """A plain dotted field name, with `#`/`@` prefixes allowed."""
+    if not column or not all(part.isidentifier()
+                             for part in column.replace("#", "").replace(
+                                 "@", "").split(".")):
+        raise Refusal(
+            "CQL_COLUMN_NOT_A_NAME",
+            f"`{column}` is not a plain field name. Refused rather than "
+            f"guessed.", DIALECT)
+
+
+def _parse_sort_args(args: str) -> CqlSort:
+    """`field` or `field, limit=N`. Anything else is refused by name.
+
+    Direction is deliberately absent: CQL's `sort()` takes a field and an
+    optional row limit, and any direction keyword this parser does not know
+    would be silently defaulted -- so an unknown argument is a refusal, not an
+    ascending sort the analyst did not ask for.
+    """
+    parts = [p.strip() for p in args.split(",") if p.strip()]
+    if not parts:
+        raise Refusal("CQL_SORT_EMPTY",
+                      "`| sort()` with no field orders by nothing.", DIALECT)
+    field = parts[0]
+    _check_field_name(field, "sort field")
+    limit: int | None = None
+    for extra in parts[1:]:
+        key, sep, value = extra.partition("=")
+        if not sep or key.strip().lower() != "limit" or not value.strip():
+            raise Refusal(
+                "CQL_SORT_ARG_UNKNOWN",
+                f"`| sort({args})` takes a field and `limit=N` -- nothing "
+                f"else is known here, and defaulting an unknown argument "
+                f"would silently change the sort. Refused by name.", DIALECT)
+        if not value.strip().isdigit() or int(value.strip()) <= 0:
+            raise Refusal(
+                "CQL_SORT_LIMIT_NOT_POSITIVE",
+                f"`limit={value.strip()}` is not a positive integer, so it "
+                f"cannot cap rows. Refused rather than guessed.", DIALECT)
+        limit = int(value.strip())
+    return CqlSort(field=field, limit=limit)
 
 
 def _split_pipes(text: str) -> list[str]:
