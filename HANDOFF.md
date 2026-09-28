@@ -344,24 +344,21 @@ assume a fresh eye is cheaper than the next round's findings.
 
 ### Open, in severity order -- verified against the tree, not carried forward
 
-**Verified state: 761 passed, 4 skipped, 3 warnings, ruff clean.**
+**Verified state: 777 passed, 4 skipped, 3 warnings, ruff clean, all 15 mutations caught, at d7843e7.**
 
 Everything round 9 listed except the EQL/CQL gap is FIXED and committed, each
-mutation-verified: eventstats refused, 	stats-first ordering, the Not
-depth arm, the 
-ame-arm sweep, the anti-drift reflection over all fields with
+mutation-verified: eventstats refused, `tstats`-first ordering, the `Not`
+depth arm, the `name`-arm sweep, the anti-drift reflection over all fields with
 Package probed, the selector latch closing after the first filter, the
-undecidable mid-window timestamp, prestats/signed-count/are_search,
-COUNT(x), the backwards subpipeline 
-ename, and the M8 retargeting (all 15
-mutations caught). Then EQL slices 1+2 and FQL slice 1 landed on top. What
-remains:
+undecidable mid-window timestamp, prestats/signed-count/`bare_search`,
+COUNT(x), the backwards subpipeline `rename`, and the M8 retargeting (all 15
+mutations caught). Then EQL slices 1+2, FQL slice 1, EQL `runs=1`, round-10
+fixes, and the registry anti-drift landed on top. What remains:
 
-1. **EQL: with runs=N, ! missing-event, per-step y, sample.** Each
-   needs an IR decision, not just code: 
-uns needs a repeat count Pattern
+1. **EQL: with runs=N, ! missing-event, per-step `by`, sample.** Each
+   needs an IR decision, not just code: `runs` needs a repeat count Pattern
    does not have; ! needs a negative step plus its mandatory maxspan;
-   per-step y needs key to stop being global (do not fake it); sample
+   per-step `by` needs key to stop being global (do not fake it); sample
    is ordered=False without until/maxspan. sequence without maxspan
    is refused (no unbounded spelling). See docs/eql-design.md.
 2. **CQL pipeline stages.** FQL (flat filters) is done. The LogScale pipes --
@@ -372,7 +369,7 @@ uns needs a repeat count Pattern
 ow() must be evaluated at lower
    time, never frozen into a literal. See docs/cql-design.md.
 3. **Four POSIX assertions have never executed.** Permission-bit tests and the
-   directory sync, written on Windows. The Windows halves are exercised;
+   directory `fsync`,  written on Windows. The Windows halves are exercised;
    run the file on Linux before trusting that half at all.
 4. **Round 10 review.** Nine rounds, every one found real defects behind green.
    The newest unreviewed code is dialects/eql*.py, dialects/fql*.py, and
