@@ -10,10 +10,10 @@ easy 5% and must say so.
 `sequence`, `sample`, `join`, `pipe` (`|`) and `until` are recognised HERE, at
 parse time, and refused by name with the reason and the missing piece, rather
 than falling through to a generic "unknown syntax" message. The IR already has
-`Pattern` (stages, within, key, ordered, until with `until_scope`), so these
-refusals are "not yet lowered", not "cannot be expressed" -- except `runs=N`
-and the `!` missing-event clause, which have no node at all. See
-`docs/eql-design.md` for the construct-by-construct mapping.
+`Pattern` (stages, within, key, ordered, until with `until_scope`, runs), so these
+refusals are "not yet lowered", not "cannot be expressed" -- except the `!`
+missing-event clause, which has no node at all. See `docs/eql-design.md` for
+the construct-by-construct mapping.
 """
 
 from __future__ import annotations
@@ -48,9 +48,16 @@ class EqlSequence:
     maxspan: str | None
     steps: tuple[EqlSequenceStep, ...]
     until: EqlSequenceStep | None
-    #: `with runs=N`. Only `1` lowers -- one run IS the pattern, so there is
-    #: nothing to repeat. Anything higher needs a repeat count `Pattern` does
-    #: not have, and is refused where it is parsed.
+    #: `with runs=N` requires N CONSECUTIVE COMPLETE REPEATS of the whole
+    #: pattern, all inside ONE `maxspan`. `None` means the clause was absent,
+    #: which the lowerer passes through as the node default of 1 -- the same
+    #: thing, and the same behaviour YARA-L already had.
+    #:
+    #: N IS NOT A WINDOW MULTIPLIER. `runs=2` on a two-stage sequence with
+    #: `maxspan=5m` needs four events within five minutes, not two events spread
+    #: over ten. "This happened twice" and "this took twice as long" are
+    #: unrelated claims, and conflating them is the obvious way to get this
+    #: wrong, so the tests check the event count rather than the text.
     runs: int | None = None
 
 
@@ -318,28 +325,28 @@ def _parse_sequence(text: str) -> EqlSequence:
                                   "`with maxspan=` with no duration bounds "
                                   "nothing.", DIALECT)
             elif clause.lower().startswith("runs="):
-                # `with runs=1` MEANS "MATCH ONCE", WHICH IS THE PATTERN ITSELF.
+                # `with runs=N` IS CARRIED TO THE NODE AND ENFORCED THERE, for
+                # any positive N. It used to accept only 1 and refuse 2+ with
+                # "Pattern has no repeat count" -- which is no longer true, and
+                # which meant a rule saying "happened twice" was refused while a
+                # rule saying "happened once" was accepted, which is a fine line
+                # to draw right up until the line is in the wrong place.
                 #
-                # `runs=N` requires N consecutive repeats, and `Pattern` has no
-                # repeat count -- but `runs=1` requires exactly one run, which is
-                # what a plain sequence already is. So 1 is accepted and carried
-                # through (the lowerer ignores it, because one run needs no extra
-                # semantics), and only 2+ is refused. A non-integer is refused too,
-                # because a repeat count that is not a number is not a count.
+                # A NON-COUNT IS STILL REFUSED, and `0` specifically: `runs=0`
+                # would mean the pattern matches when it does NOT occur, which is
+                # an inverted rule rather than a weaker one. `isdigit` also rules
+                # out `2.5`, `-1`, and `two`, so a count that is not a count can
+                # never reach the evaluator as one.
                 raw = clause[len("runs="):].strip()
                 if not raw.isdigit() or int(raw) < 1:
                     raise Refusal(
                         "EQL_RUNS_NOT_A_COUNT",
                         f"`with runs={raw}` is not a positive integer, so it "
-                        f"cannot count repeats. Refused rather than guessed.",
-                        DIALECT)
-                if int(raw) > 1:
-                    raise Refusal(
-                        "EQL_RUNS_NOT_LOWERED",
-                        f"`with runs={raw}` requires {raw} consecutive repeats "
-                        f"of the pattern, and `Pattern` has no repeat count. "
-                        f"Refused rather than matched once.", DIALECT)
-                runs = 1
+                        f"cannot count repeats -- and zero would mean the "
+                        f"sequence matches when it does NOT occur, which is an "
+                        f"inverted rule rather than a weaker one. Refused rather "
+                        f"than guessed.", DIALECT)
+                runs = int(raw)
             else:
                 raise Refusal("EQL_WITH_UNKNOWN",
                               f"`with {clause}` is not `maxspan=` or `runs=`. "

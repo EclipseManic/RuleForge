@@ -100,7 +100,11 @@ def _lower_sequence(sequence, rule_id: str) -> tuple[RuleIR, list[dict]]:
         Pattern(id="pattern", input="read", stages=stages,
                 within=Duration(_span_seconds(sequence.maxspan)),
                 key=key, until=until, until_scope="between",
-                ordered=True, time_field="@timestamp"),
+                ordered=True, time_field="@timestamp",
+                # `runs=N` -> `Pattern.runs`, which the evaluator READS. The
+                # absent clause is `None` here and 1 on the node, so a rule with
+                # no `runs` gets the identical default YARA-L always had.
+                runs=1 if sequence.runs is None else sequence.runs),
         Emit(id="out", input="pattern"),
     )
     return (RuleIR(rule_id=rule_id, nodes=nodes, output="out",

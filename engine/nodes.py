@@ -892,10 +892,27 @@ def eval_pattern(node: Pattern, rows: list[Row],
             # whole sample.
             consumed_idx = {start_index}
             ok = True
-            cursor = start_index + 1
-            for stage in node.stages[1:]:
-                found = False
-                saw_untimed_match = False
+            # THE CURSOR IS RE-BASED PER REPEAT, not advanced forever. A repeat
+            # starts where the previous one ENDED (`last_matched_index`), so the
+            # next run's stage 0 cannot reuse an event the previous run already
+            # consumed. Sharing them would let one event satisfy two stages of two
+            # different runs, which is how "happened twice" turns into "happened
+            # once, counted twice".
+            cursor = last_matched_index + 1
+            #
+            # `runs` IS READ HERE, which is the point. This is the third field in
+            # this engine that a lowerer could set and the evaluator would ignore
+            # -- `Derive.projects` and `Aggregate.keys` were the other two, and
+            # both shipped green. So the loop is written so that `runs=1` runs
+            # this exact code once and cannot skip it, rather than special-casing
+            # `runs == 1` into the old path and leaving the general case untested
+            # by every existing test.
+            for _repeat in range(node.runs):
+                if not ok:
+                    break
+                for stage in node.stages[1:]:
+                    found = False
+                    saw_untimed_match = False
                 # UNORDERED SEARCHES THE WHOLE GROUP, NOT JUST WHAT FOLLOWS.
                 #
                 # An EQL `sample` has no order: its stages match events wherever
@@ -966,6 +983,14 @@ def eval_pattern(node: Pattern, rows: list[Row],
                     ok = False
                     break
 
+            # THE FAILURE CHECK SITS AT THE `start_index` LEVEL, ON PURPOSE. An
+            # earlier version of the `runs` loop put this `continue` one level too
+            # deep, so `continue` bound to the REPEAT loop instead: a candidate
+            # that failed simply ran out of repeats and fell through to the
+            # `until` check and the append, i.e. a FAILED candidate was recorded
+            # as a match. With `runs=1` there is no next repeat, so the fall-
+            # through was unconditional. Three existing "should not match" tests
+            # caught it, which is the only reason it was not a shipped defect.
             if not ok:
                 continue
 

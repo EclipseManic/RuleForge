@@ -73,6 +73,14 @@ def _render_pattern(pattern: Any) -> str:
                       "this pattern has no window, and a `sequence` without "
                       "`maxspan` has no spelling here.", DIALECT)
     lines[0] += f" with maxspan={_format_span(seconds)}"
+    # `runs` IS RENDERED BACK, and a repeat count is not cosmetic: emitting
+    # `with maxspan=...` for a `runs=2` rule would produce a query that matches
+    # ONE occurrence where the analyst wrote two. That is the same failure as
+    # rendering `eval` as `rename`, and it is invisible to any test that only
+    # compares the IR.
+    runs = getattr(pattern, "runs", 1)
+    if runs != 1:
+        lines[0] += f" with runs={runs}"
     for stage in pattern.stages:
         if len(stage) != 1:
             raise Refusal("EQL_RENDER_PATTERN_STAGE",

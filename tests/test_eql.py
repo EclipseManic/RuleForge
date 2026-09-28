@@ -18,6 +18,8 @@ import unittest
 import jobs
 from dialects.eql import parse_eql
 from dialects.eql_ir import lower as lower_eql
+from engine import Duration, Verdict, evaluate
+from engine.ir import Literal
 from engine.values import Refusal
 
 
@@ -231,15 +233,141 @@ class SequencesExecuteWithEqlUntilSemantics(unittest.TestCase):
 
 
 class EverythingElseIsRefusedByName(unittest.TestCase):
-    def test_runs_is_refused_at_parse_time(self):
-        """`with runs=N` needs N consecutive repeats and `Pattern` has no
-        repeat count. Recognised in the parser and refused there, with the
-        missing piece named."""
+    def test_runs_ACTUALLY_REQUIRES_THAT_MANY_REPEATS(self):
+        """`runs=N` is EXECUTED, not just carried through the IR.
+
+        This is the third instance of this repo's worst bug shape -- a field a
+        lowerer sets and the evaluator ignores. `Derive.projects` was one,
+        `Aggregate.keys` was another, and both shipped green because every test
+        compared text. So the assertion is on the EVENT COUNT, which is the only
+        thing that can tell "happened once" from "happened twice":
+
+          runs absent / 1, with TWO events of the pattern  -> matches
+          runs=2,       with TWO events of the pattern       -> does NOT match
+          runs=2,       with FOUR events (two repeats)      -> matches
+
+        The middle line is the whole feature. The other two are the regression
+        guards: the first proves the new default did not change the meaning of
+        every existing rule, the third proves the count is not merely compared
+        against 1.
+        """
+        one = "[process where true] [network where true]"
+
+        def events(count):
+            return [{"event.category": "process" if i % 2 == 0 else "network",
+                     "@timestamp": 10 + i * 10, "host": "h1"}
+                    for i in range(count)]
+
+        def run(clause, count):
+            source = f"sequence by host{clause} with maxspan=10m {one}"
+            ir, _ = lower_eql(parse_eql(source))
+            result = evaluate(ir, events(count))
+            return result.verdict
+
+        self.assertIs(run("", 2), Verdict.MATCHED,
+                      "one repeat of a two-stage pattern is the default")
+        self.assertIs(run(" with runs=1", 2), Verdict.MATCHED)
+        self.assertIs(run(" with runs=2", 2), Verdict.NO_MATCH,
+                      "TWO events is ONE repeat, so runs=2 must not match")
+        self.assertIs(run(" with runs=2", 4), Verdict.MATCHED,
+                      "four events is two complete repeats")
+
+    def test_runs_is_a_count_of_repeats_NOT_a_window_multiplier(self):
+        """`runs=2` with `maxspan=10m` needs the repeats INSIDE ten minutes.
+
+        Reading N as a window multiplier instead -- "this took twice as long" --
+        is the obvious wrong answer, and it is not a conservative one: it makes
+        the rule MATCH MORE than the analyst wrote, on events spread over a
+        wider span. Here both repeats fit in 30 seconds, so this test cannot
+        tell the two readings apart, and the window case below can.
+        """
+        one = "[process where true] [network where true]"
+        # Two repeats, but the second starts two hours after the first. Under a
+        # correct reading the window rejects it; under "double the window" it
+        # would pass.
+        spread = [{"event.category": "process", "@timestamp": 0, "host": "h1"},
+                  {"event.category": "network", "@timestamp": 10, "host": "h1"},
+                  {"event.category": "process", "@timestamp": 7200, "host": "h1"},
+                  {"event.category": "network", "@timestamp": 7210, "host": "h1"}]
+        ir, _ = lower_eql(parse_eql(
+            f"sequence by host with runs=2 with maxspan=10m {one}"))
+        self.assertIs(evaluate(ir, spread).verdict, Verdict.NO_MATCH,
+                      "the second repeat is outside maxspan, so runs=2 does not "
+                      "hold; a window-multiplier reading would have matched")
+
+    def test_runs_cannot_reuse_one_event_for_two_repeats(self):
+        """The repeats must be DISJOINT.
+
+        If the second repeat could start at the same event the first one ended
+        on, two events would satisfy `runs=2` -- "happened twice" would become
+        "happened once, counted twice", which matches strictly more than the
+        analyst wrote.
+        """
+        one = "[process where true] [network where true]"
+        two_events = [{"event.category": "process", "@timestamp": 0,
+                       "host": "h1"},
+                      {"event.category": "network", "@timestamp": 10,
+                       "host": "h1"}]
+        ir, _ = lower_eql(parse_eql(
+            f"sequence by host with runs=2 with maxspan=10m {one}"))
+        self.assertIs(evaluate(ir, two_events).verdict, Verdict.NO_MATCH,
+                      "the same two events cannot serve as both repeats")
+
+    def test_runs_round_trips_and_is_not_silently_dropped(self):
+        """`with runs=2` is rendered BACK.
+
+        Omitting it would emit a query that matches ONE occurrence where the
+        analyst wrote two -- the same failure as rendering `eval` as `rename`,
+        and equally invisible to a test that only compares the IR.
+        """
+        # The expectation is written out rather than assembled from the input,
+        # because deriving it from the input would pass even if `runs` were
+        # dropped on both sides. The renderer puts each step on its own line.
+        self.assertEqual(
+            _round_trip("sequence with runs=2 with maxspan=10m "
+                        "[process where true] [network where true]"),
+            "sequence with maxspan=10m with runs=2\n"
+            "  [process where true]\n"
+            "  [network where true]")
+        # And runs=1 stays implicit, because `with runs=1` IS the pattern.
+        self.assertNotIn("runs=1", _round_trip(
+            "sequence with runs=1 with maxspan=10m "
+            "[process where true] [network where true]"))
+
+    def test_runs_is_no_longer_refused_but_only_a_REAL_COUNT_is_accepted(self):
+        """`with runs=N` now lowers for any positive integer.
+
+        What it will NOT accept is a non-count, because "how many times" with a
+        non-number in it is not a number of times -- and `runs=0` would mean the
+        pattern matches when it does NOT occur, which is an inverted rule rather
+        than a weaker one. Both are refused, by code, at parse time.
+        """
+        for bad, code in (("runs=0", "EQL_RUNS_NOT_A_COUNT"),
+                          ("runs=-1", "EQL_RUNS_NOT_A_COUNT"),
+                          ("runs=two", "EQL_RUNS_NOT_A_COUNT"),
+                          ("runs=2.5", "EQL_RUNS_NOT_A_COUNT"),
+                          ("runs=", "EQL_RUNS_NOT_A_COUNT")):
+            with self.assertRaises(Refusal) as caught:
+                parse_eql(f'sequence with maxspan=15m with {bad}\n'
+                          '  [ file where true ]\n'
+                          '  [ process where true ]')
+            self.assertEqual(caught.exception.code, code, bad)
+
+    def test_a_runs_count_of_zero_is_refused_by_the_node_too(self):
+        """Belt and braces: `Pattern(runs=0)` is refused by the IR as well, so
+        a future lowerer cannot construct an inverted rule by accident. The
+        parser check is the user-facing one; this is the invariant."""
+        from engine.ir import Pattern
         with self.assertRaises(Refusal) as caught:
-            parse_eql('sequence with runs=3\n'
-                      '  [ file where true ]\n'
-                      '  [ process where true ]')
-        self.assertEqual(caught.exception.code, "EQL_RUNS_NOT_LOWERED")
+            Pattern(id="p", input="r", stages=((Literal(True),), (Literal(True),)),
+                    within=Duration(60), time_field="ts", runs=0)
+        self.assertEqual(caught.exception.code, "PATTERN_RUNS_INVALID")
+        # And a negative count is refused the same way, so no producer can
+        # construct a pattern that must repeat a negative number of times.
+        with self.assertRaises(Refusal) as caught:
+            Pattern(id="p", input="r", stages=((Literal(True),), (Literal(True),)),
+                    within=Duration(60), time_field="ts", runs=-1)
+        self.assertEqual(caught.exception.code, "PATTERN_RUNS_INVALID")
 
     def test_runs_one_lowers_exactly(self):
         """`with runs=1` MEANS "MATCH ONCE", WHICH IS THE PATTERN ITSELF. One

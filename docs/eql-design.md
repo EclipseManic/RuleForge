@@ -95,10 +95,35 @@ YARA-L already uses it for cross-event rules (`dialects/yaral_ir.py:239`).
 | `with maxspan=15m` | `within` | have it |
 | `by user.name` | `key` | have it |
 | `until [c where c3]` — expires only if it falls BETWEEN matches | `until` as a veto | **present but DIVERGES — see below** |
-| `with runs=3` — N consecutive repeats | — | **missing** |
+| `with runs=3` — N consecutive repeats | `Pattern(runs=N)` | have it — enforced in the evaluator, not just carried |
 | `![ c where cond ]` — missing event, `maxspan` mandatory | — | **missing** |
 | `sample` — unordered, no `maxspan`/`until`/`runs` | `ordered=False` + no `until` | nearly: `ordered=False` is all `sample` needs |
-| per-step `by` (different fields per step) | `key` is global | **missing** |
+| per-step `by` (different fields per step) | `key` is global | **missing** — and the vendor says why, see below |
+
+### `runs=N` is a count of COMPLETE REPEATS, all inside one `maxspan`
+
+`runs=2` on a two-stage sequence with `maxspan=5m` needs **four events within
+five minutes** — not two events spread over ten. "This happened twice" and
+"this took twice as long" are unrelated claims, and reading N as a window
+multiplier is not the conservative mistake it looks like: it makes the rule
+match MORE than the analyst wrote.
+
+Two further properties the tests pin, because both are ways to get a
+plausible-looking wrong answer:
+
+- **Repeats must be DISJOINT.** The second repeat starts where the first
+  *ended*, so one event cannot satisfy two stages of two different runs.
+  Otherwise two events would satisfy `runs=2` and "happened twice" would become
+  "happened once, counted twice".
+- **The window still bounds the whole thing.** A second repeat two hours after
+  the first does not match, even though `maxspan` is unchanged.
+
+`Pattern.runs` defaults to 1, which is what YARA-L — which never sets it — has
+always meant. That keeps the field additive in the same way `until_scope` is:
+the default is the pre-existing behaviour, so adding it cannot re-break a rule.
+`runs=0` is refused at both the parser and the node, because zero would mean the
+pattern matches when it does *not* occur — an inverted rule, not a weaker one.
+
 | `?` optional join key (allow null) | — | **missing** |
 
 That is a much shorter gap than "no node exists". The honest first slice is

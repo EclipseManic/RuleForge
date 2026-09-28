@@ -966,6 +966,25 @@ class Pattern:
     until_scope: str = "window"
     ordered: bool = True
     max_matches_per_key: int = 100
+    #: HOW MANY TIMES THE WHOLE PATTERN MUST REPEAT to count as a match.
+    #:
+    #: EQL's `sequence ... with runs=N` requires N CONSECUTIVE repeats. `1` is
+    #: the default and means "no repeat requirement at all", which is what every
+    #: producer that does not use the clause means -- so YARA-L, which never sets
+    #: this, keeps exactly its previous behaviour. That is the same additive
+    #: discipline `until_scope` follows: the default is the behaviour that was
+    #: already there, so adding the field cannot re-break a rule.
+    #:
+    #: IT IS A COUNT OF COMPLETE REPEATS, NOT A WINDOW MULTIPLIER. A pattern of
+    #: three stages with `runs=2` needs six events, not three spread over twice
+    #: the window -- and the window is NOT doubled either, because `maxspan`
+    #: bounds the whole thing in EQL. Getting that wrong is the difference
+    #: between "this sequence happened twice" and "this sequence took twice as
+    #: long", which are unrelated claims.
+    #:
+    #: 0 is refused: it would mean the pattern matches whenever it does NOT
+    #: occur, which is not a weaker rule but an inverted one.
+    runs: int = 1
     #: Which field orders the sequence. REQUIRED for an ordered pattern, and never
     #: inferred. Guessing which column is the timestamp is how a sequence gets
     #: ordered by something unrelated, which changes which events count as "then".
@@ -997,6 +1016,12 @@ class Pattern:
                 "and with no window there is nothing to be inside of. Either "
                 "give the pattern a window or use the `between` scope, which "
                 "needs only the matched events.", "Pattern")
+        if self.runs < 1:
+            raise Refusal(
+                "PATTERN_RUNS_INVALID",
+                f"runs={self.runs} is not a repeat count of at least 1. Zero "
+                f"would mean the pattern matches when it does NOT occur, which "
+                f"is an inverted rule rather than a weaker one. Refused.", "Pattern")
         if self.ordered and self.time_field is None:
             raise Refusal(
                 "PATTERN_REQUIRES_TIME_FIELD",

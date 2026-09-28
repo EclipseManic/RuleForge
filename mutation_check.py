@@ -187,6 +187,16 @@ MUTATIONS = [
      "dialects/cql_ir.py",
      "                keys=tuple(FieldRef(_field_name(key)) for key in stage.keys)))",
      "                keys=()))"),
+
+    # `runs` RECORDED BUT NOT ENFORCED -- the fourth instance of this repo's
+    # worst bug shape, and the one most likely to ship, because a
+    # `with runs=2` rule renders and round-trips perfectly while matching a
+    # single occurrence. The mutation is the literal bug: the repeat loop runs
+    # once regardless of the count.
+    ("M24 runs is set by the lowerer but the evaluator runs it once anyway",
+     "engine/nodes.py",
+     "            for _repeat in range(node.runs):",
+     "            for _repeat in range(1):"),
 ]
 
 
