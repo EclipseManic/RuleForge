@@ -75,6 +75,12 @@ IR vocabulary built for SPL applies almost directly:
 | `\| count()` | `Aggregate(count)`, `Frame(kind="per_event")` | shipped, NULLARY only |
 | `\| count(field=x)` | `Aggregate` over a field | **refused** — a different count |
 | `\| count(by=x)` | `Aggregate` with keys | **refused** — grouped, not one number |
+| `\| groupBy([a, b])` | `Aggregate(keys=..., measures=(count as \`_count\`))` | shipped — COUNT variant only |
+| `\| groupBy([a], function=count(as=n))` | same, measure named `n` | shipped |
+| `\| groupBy([a], function=[])` | — | **refused** — distinct values, nothing aggregated |
+| `\| groupBy([a], limit=N)` | — | **refused** — top-N series *selection*, a cap whose point is which groups vanish |
+| `\| groupBy([a], function=avg(x))` | — | **refused** — a different aggregate |
+| nested / embedded `groupBy({...})` | — | **refused** — nested output shape, sub-pipeline |
 | `in(field, [...])` | `BoolOp("or", equalities)` | shipped, lowered EXACTLY as a disjunction |
 | `join()` | — | **refused** — see "Why `join()` is refused" below |
 | `timechart()`, other aggregates | `Aggregate` | **not lowered yet** — have the node; per-function mapping needed |
@@ -83,6 +89,26 @@ The two header examples above are deliberately NOT both shipped. The pipeline
 sample at the top of this file uses `newField := oldField + "_suffix"`, which is
 an expression; the slice takes a single operand and refuses the rest by name.
 That refusal is the correct behaviour, not a missing feature to be papered over.
+
+### `groupBy`'s default column is `_count`, and that is load-bearing
+
+LogScale's reference: `groupBy(field, [function], [limit])` with `function`
+defaulting to **`count(as=_count)`**. The default output column is therefore
+`_count`, not `count`. This is not a formatting preference — a dashboard
+parameter, a saved search, or a downstream `| table _count` names that column,
+and rendering it as `count` renames it.
+
+So `CqlGroupBy` carries `measure_name` as **data**, the lowerer puts it in
+`Measure(name=...)`, and the render arm emits `count(as=NAME)` back when it is
+not the default. Reusing the nullary count's check here would have refused the
+node outright, since that check requires the name to be exactly `count`.
+
+`Aggregate.keys` is the first field any CQL stage sets, which makes it the
+first to be at risk of the bug that bit this repo twice already (`Derive.projects`
+recorded but unread, `rename` copying instead of dropping): a field a lowerer
+sets and the evaluator ignores. M23 pins it, and the test **executes** the rule
+rather than comparing text — `(a=1,b=x)` twice plus `(a=1,b=y)` once must be
+two groups of 2 and 1, not one group of 3.
 
 ### Why `join()` is refused — the design doc's first guess was wrong
 

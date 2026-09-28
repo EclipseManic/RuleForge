@@ -17,9 +17,10 @@ would accept strings valid in neither language.
 
 Refused by name in this slice: wildcards in values, regex (`/re/` and
 `regex()`), functions, `field = *` exists-checks, `now()`, `join()`, the
-aggregates other than the nullary `count()`, an arithmetic or function RHS to
-`:=`, and a repeated pipe. Each changes which rows match, fabricates a value, or
-needs a node not yet wired, so each is named rather than approximated.
+aggregates other than the nullary `count()` and a counted `groupBy`, an
+arithmetic or function RHS to `:=`, and a repeated pipe. Each changes which
+rows match, fabricates a value, or needs a node not yet wired, so each is named
+rather than approximated.
 """
 
 from __future__ import annotations
@@ -75,6 +76,26 @@ class CqlCount:
 
 
 @dataclass(frozen=True, slots=True)
+class CqlGroupBy:
+    """`| groupBy([a, b])` -- one row per distinct COMBINATION of the keys.
+
+    LogScale's own reference: `groupBy(field, [function], [limit])`, and the
+    `function` parameter DEFAULTS to `count(as=_count)`. So the default output
+    column is named `_count`, not `count` -- which is why this carries the
+    measure name as data rather than assuming the nullary `count()` shape.
+
+    `function=[]` is a DIFFERENT result: unique values with nothing aggregated,
+    one row per value and no measure column at all. That is not a count with a
+    zero in it, so it is refused by name rather than folded into one.
+    """
+    keys: tuple[str, ...]
+    #: The measure's OUTPUT column, from `count(as=...)`. Defaults to `_count`,
+    #: which is LogScale's spelling and NOT a cosmetic choice -- rendering it as
+    #: `count` would rename a column the analyst's own queries read.
+    measure_name: str = "_count"
+
+
+@dataclass(frozen=True, slots=True)
 class CqlTable:
     """`| table c1, c2` -- PROJECT: the result keeps only these columns, in
     this order. A `CqlTable` is a stage, not a property of the query, because
@@ -85,7 +106,8 @@ class CqlTable:
 #: Every pipe stage this lowering understands. A stage is a `|` in the analyst's
 #: query, and stages lower IN WRITTEN ORDER -- so this is a union of shapes, not
 #: a list of features the query optionally has.
-CqlStage = CqlTable | CqlSort | CqlRename | CqlAssign | CqlCount
+CqlStage = (CqlTable | CqlSort | CqlRename | CqlAssign | CqlCount
+            | CqlGroupBy)
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,14 +196,23 @@ def parse_cql(text: str) -> CqlQuery:
             if name == "count":
                 stages.append(_parse_count(text, args))
                 continue
+            if name in ("groupby", "group_by"):
+                _claim(stages, seen, "groupby", "CQL_GROUPBY_TWICE",
+                       "two `| groupBy` stages. A second grouping re-groups the "
+                       "first one's output, which is a different shape and not "
+                       "lowered yet; refused as an unsupported shape, not as a "
+                       "hazard.")
+                stages.append(_parse_groupby(text, args))
+                continue
             if name == "join":
                 raise Refusal(*_join_refusal(args), DIALECT)
             raise Refusal(
                 "CQL_PIPE_NOT_LOWERED",
                 f"`| {name}(...)` is a real CQL command, but only `| table`, "
-                f"`| sort`, `| rename`, `| count()`, and `| :=` lower today. "
-                f"Refused by name rather than dropped -- dropping a pipe stage "
-                f"silently changes which rows come back.", DIALECT)
+                f"`| sort`, `| rename`, `| count()`, `| groupBy(...)`, and "
+                f"`| :=` lower today. Refused by name rather than dropped -- "
+                f"dropping a pipe stage silently changes which rows come back.",
+                DIALECT)
         name, _, args = text.partition(" ")
         name, args = name.lower(), args.strip()
         if name == "table":
@@ -218,9 +249,10 @@ def parse_cql(text: str) -> CqlQuery:
             raise Refusal(
                 "CQL_PIPE_NOT_LOWERED",
                 f"`| {name}` is a real CQL command, but only `| table`, "
-                f"`| sort`, `| rename`, `| count()`, and `| :=` lower today. "
-                f"Refused by name rather than dropped -- dropping a pipe stage "
-                f"silently changes which rows come back.", DIALECT)
+                f"`| sort`, `| rename`, `| count()`, `| groupBy(...)`, and "
+                f"`| :=` lower today. Refused by name rather than dropped -- "
+                f"dropping a pipe stage silently changes which rows come back.",
+                DIALECT)
     return CqlQuery(filt=filt, stages=tuple(stages))
 
 
@@ -284,6 +316,178 @@ def _join_refusal(args: str) -> tuple[str, str]:
         f"`include` list, or a subquery over a different repo or time range. "
         f"Refused rather than lowered as a plain join, which would be a "
         f"different rule returning different rows.")
+
+
+def _parse_groupby(text: str, args: str) -> CqlGroupBy:
+    """`groupBy([a, b])`, `groupBy([a], function=count())`, `function=[count(as=n)]`.
+
+    MEASURED AGAINST LOGSCALE'S REFERENCE, which states the shape plainly:
+    `groupBy(field, [function], [limit])`, `field` required, `function` an array
+    of aggregate functions defaulting to `count(as=_count)`, and `limit`
+    defaulting to 20,000 with top-N series selection semantics.
+
+    THE OUTPUT COLUMN NAME IS DATA, NOT A FORMATTING CHOICE. The default is
+    literally `_count`, and `count(as=total)` names it `total`. A renderer that
+    assumed the nullary `count()` shape would emit `| groupBy([a])` for a rule
+    whose columns are `a` and `total`, renaming a column downstream queries
+    read. So the name is parsed and carried, and the render arm emits it back.
+
+    WHAT IS REFUSED, AND WHY EACH IS A DIFFERENT RULE RATHER THAN A MISSING
+    FEATURE:
+
+      `function=[]`      unique values, NOTHING aggregated. One row per value
+                         and no measure column. Not a count of zero per group.
+      `limit=N`          top-N SERIES SELECTION: it keeps the N groups with the
+                         highest aggregate, dropping the rest. A cap, not a
+                         filter, and the rows that disappear are the whole point.
+      nested `groupBy`   a groupBy inside a groupBy, which changes the shape of
+                         the output to a nested structure.
+      embedded `{...}`   a sub-PIPELINE inside the function list, e.g.
+                         `function=[{count() | esp:=_count/300}]`. That is a
+                         whole pipeline where this expects one function.
+    """
+    if "{" in args:
+        raise Refusal(
+            "CQL_GROUPBY_EMBEDDED_PIPELINE",
+            f"`groupBy({args})` embeds a sub-pipeline inside its function list. "
+            f"That is a nested pipeline where this expects a single function, "
+            f"and it computes per-group expressions this lowering does not "
+            f"build. Refused rather than read as a plain count.", DIALECT)
+    if "groupby(" in args.lower().replace(" ", ""):
+        raise Refusal(
+            "CQL_GROUPBY_NESTED",
+            f"`groupBy({args})` nests one groupBy inside another, which produces "
+            f"a nested output structure rather than one row per key. Refused "
+            f"rather than flattened into a single grouping.", DIALECT)
+
+    keys_raw, tail = _split_groupby_params(args)
+    keys = _parse_groupby_keys(keys_raw, text)
+    measure_name = "_count"
+    tail = tail.strip()
+    if not tail:
+        return CqlGroupBy(keys=keys, measure_name=measure_name)
+    lowered = tail.lower()
+    if not lowered.startswith("function"):
+        raise Refusal(
+            "CQL_GROUPBY_PARAMETER_UNKNOWN",
+            f"`groupBy({args})` has a parameter this lowering does not read "
+            f"(`{tail.split('=')[0].strip()}`). An accepted-and-ignored parameter "
+            f"is worse than a refusal, because the rule runs and returns "
+            f"something other than what was written.", DIALECT)
+    body = tail.partition("=")[2].strip()
+    if not lowered.startswith("function="):
+        raise Refusal(
+            "CQL_GROUPBY_PARAMETER_UNKNOWN",
+            f"`groupBy({args})` needs `function=` before its function list. "
+            f"Refused rather than guessed at which half was meant.", DIALECT)
+    if body in ("[]", ""):
+        raise Refusal(
+            "CQL_GROUPBY_NO_AGGREGATE",
+            f"`groupBy({args}, function=[])` asks for the DISTINCT VALUES with "
+            f"nothing aggregated: one row per value and no measure column. That "
+            f"is not a count of zero per group, so it is a different result "
+            f"shape and is refused rather than folded into a count.", DIALECT)
+    named = _parse_groupby_function(body, args)
+    return CqlGroupBy(keys=keys, measure_name=named)
+
+
+def _split_groupby_params(args: str) -> tuple[str, str]:
+    """Split on the first COMMA THAT IS NOT INSIDE BRACKETS.
+
+    `groupBy([a, b], function=count())` has a comma inside `[a, b]` and another
+    after it. Splitting on the first one regardless took `[a` as the key list,
+    saw an unclosed `[`, and refused a perfectly valid query -- and the message
+    named `groupBy(groupBy([a, b]))`, quoting the pipe twice, because the
+    caller passes the whole `groupBy(...)` text. Both are the "misleading refusal
+    on valid input" defect, reached through a missing depth check rather than
+    through a wrong decision.
+    """
+    depth = 0
+    quote: str | None = None
+    for index, char in enumerate(args):
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in ("'", '"'):
+            quote = char
+        elif char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+        elif char == "," and depth == 0:
+            return args[:index], args[index + 1:].strip()
+    return args, ""
+
+
+def _parse_groupby_keys(raw: str, text: str) -> tuple[str, ...]:
+    """The `field` parameter: `a`, `[a]`, `[a, b]`, or any of those with a
+    `field=` prefix. LogScale allows all four; the brackets are optional and
+    the parameter name may be omitted."""
+    body = raw.strip()
+    # `field=` is peeled FIRST, and the brackets after -- the other order read
+    # `field=[a]` as the single key `field=[a]` and refused it as a malformed
+    # column name, which is a refusal on input LogScale documents.
+    prefix, sep, rest = body.partition("=")
+    if sep:
+        if prefix.strip().lower() != "field":
+            raise Refusal(
+                "CQL_GROUPBY_KEYS_MALFORMED",
+                f"`groupBy({text.strip()})` has an unrecognised first "
+                f"parameter `{prefix.strip()}`. `field` is the only one that "
+                f"names the keys, and reading any other as a column would "
+                f"group by a field the analyst never named.", DIALECT)
+        body = rest.strip()
+    if body.startswith("["):
+        if not body.endswith("]"):
+            raise Refusal("CQL_GROUPBY_KEYS_MALFORMED",
+                          f"`groupBy({text.strip()})` has an unclosed `[`. "
+                          f"Refused rather than guessed.", DIALECT)
+        body = body[1:-1]
+    keys = tuple(part.strip() for part in body.split(",") if part.strip())
+    if not keys:
+        raise Refusal(
+            "CQL_GROUPBY_NO_KEYS",
+            f"`groupBy({text.strip()})` groups by nothing, which would collapse "
+            f"every event into a single group. Refused rather than treated as a "
+            f"count, which is a different query.", DIALECT)
+    for key in keys:
+        _check_field_name(key, "groupBy key")
+    return keys
+
+
+def _parse_groupby_function(body: str, whole: str) -> str:
+    """`count()` or `[count(as=name)]` -> the measure's output column name."""
+    inner = body.strip()
+    if inner.startswith("[") and inner.endswith("]"):
+        inner = inner[1:-1].strip()
+    if not inner.startswith("count"):
+        raise Refusal(
+            "CQL_GROUPBY_FUNCTION_NOT_LOWERED",
+            f"`groupBy(..., function={body})` is not a count. This slice lowers "
+            f"the grouped count only -- every other aggregate is a different set "
+            f"of rows, and a count here would answer a different question.",
+            DIALECT)
+    rest = inner[len("count"):].strip()
+    if not rest:
+        return "_count"
+    if rest == "()":
+        return "_count"
+    if rest.startswith("(as=") and rest.endswith(")"):
+        name = rest[4:-1].strip()
+        if not name:
+            raise Refusal(
+                "CQL_GROUPBY_MEASURE_NAME_EMPTY",
+                f"`groupBy(..., function={body})` names no output column, so the "
+                f"count would land in a column with no name. Refused rather "
+                f"than invented.", DIALECT)
+        _check_field_name(name, "count output column")
+        return name
+    raise Refusal(
+        "CQL_GROUPBY_FUNCTION_NOT_LOWERED",
+        f"`groupBy(..., function={body})` is not a plain count. Only "
+        f"`count()` and `count(as=name)` lower; anything else is a different "
+        f"aggregate and is refused rather than approximated.", DIALECT)
 
 
 def _parse_count(text: str, args: str) -> CqlCount:

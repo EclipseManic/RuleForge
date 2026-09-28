@@ -177,6 +177,16 @@ MUTATIONS = [
      "        for name in node.drops:\n            values.pop(name, None)",
      "        for name in node.assignments and () or ():\n"
      "            values.pop(name, None)"),
+
+    # `keys` RECORDED BUT NOT GROUPED -- the same bug shape as Derive.projects
+    # and rename, and the reason this test executes the rule rather than
+    # comparing text. `| groupBy([a])` would render perfectly and return one
+    # row per EVENT, each carrying the first row's key, instead of one row per
+    # distinct key.
+    ("M23 groupBy emits keys but never groups on them",
+     "dialects/cql_ir.py",
+     "                keys=tuple(FieldRef(_field_name(key)) for key in stage.keys)))",
+     "                keys=()))"),
 ]
 
 

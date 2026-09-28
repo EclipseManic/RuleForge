@@ -12,14 +12,17 @@ word-operator shapes are refused there as CQL. A combined grammar would accept
 strings valid in neither language.
 
 SHIPPED: a filter, plus the pipes `| table`, `| sort`, `| rename`, `| name :=`
-(single operand: a field, quoted string, or number), `| count()` (nullary), and
-`in()`. Pipes lower IN THE ORDER WRITTEN, each kind at most once.
+(single operand: a field, quoted string, or number), `| count()` (nullary),
+`| groupBy([keys])` (grouped count, `count(as=NAME)`), and `in()`. Pipes lower
+IN THE ORDER WRITTEN, each kind at most once.
 
 Refused by name in this slice: wildcards, regex, functions, `field = *` (a
 presence test needs a node this lowering does not build), `now()`, `join()` (a
 LogScale FILTER function whose `include` fills missing fields with the empty
-string), `count(field=)` and grouped `count(by=)`, an arithmetic or function RHS
-to `:=`, a repeated pipe, an empty filter, and an empty `table`.
+string), `count(field=)` and grouped `count(by=)`, `groupBy` with
+`function=[]` or `limit=` or a non-count function or a nested/embedded
+pipeline, an arithmetic or function RHS to `:=`, a repeated pipe, an empty
+filter, and an empty `table`.
 """
 
 import unittest
@@ -520,6 +523,112 @@ class HashPrefixIsOneRuleEverywhere(unittest.TestCase):
                 render_cql(ir)
             self.assertEqual(caught.exception.code, code)
 
+    def test_groupBy_GROUPS_rather_than_just_rendering(self):
+        """`| groupBy([a])` must produce ONE ROW PER DISTINCT KEY.
+
+        This is the first CQL stage to set `Aggregate.keys`, so the test has to
+        prove the evaluator GROUPS rather than proving the text round-trips.
+        `keys` is exactly the kind of field `Derive.projects` was -- recorded by
+        a lowerer and read by nobody -- and two of this session's worst bugs were
+        that shape, found only by executing a rule.
+        """
+        from engine import evaluate
+        rows = [{"a": "1", "b": "x"}, {"a": "1", "b": "y"},
+                {"a": "2", "b": "x"}, {"a": "1", "b": "x"}]
+        result = evaluate(lower_cql(parse_cql('a = "1" | groupBy([a])'))[0], rows)
+        self.assertEqual(sorted((r.values["a"], r.values["_count"])
+                                for r in result.rows),
+                         [("1", 3)],
+                         "three matching events share a=1, so one group of 3")
+
+    def test_groupBy_counts_distinct_key_COMBINATIONS_separately(self):
+        """Two keys are not one key. `(a=1,b=x)` twice and `(a=1,b=y)` once is
+        two groups of 2 and 1, not one group of 3 -- collapsing them would be
+        a different answer, and a plausible-looking one."""
+        from engine import evaluate
+        rows = [{"a": "1", "b": "x"}, {"a": "1", "b": "y"},
+                {"a": "2", "b": "x"}, {"a": "1", "b": "x"}]
+        result = evaluate(lower_cql(parse_cql('a = "1" | groupBy([a, b])'))[0],
+                          rows)
+        self.assertEqual(sorted((r.values["a"], r.values["b"],
+                                 r.values["_count"]) for r in result.rows),
+                         [("1", "x", 2), ("1", "y", 1)])
+
+    def test_groupBy_default_measure_is_named_underscore_count(self):
+        """LogScale's default is `count(as=_count)`, so the column is `_count`.
+
+        That spelling is load-bearing: rendering it as `count` would rename a
+        column the analyst's own downstream queries read, and reusing the nullary
+        count's check would refuse the node outright. The name round-trips
+        because it is data, not a format the renderer owns.
+        """
+        self.assertEqual(_round_trip('a = 1 | groupBy([a])'),
+                         'a = 1 | groupBy([a])')
+        self.assertEqual(_round_trip('a = 1 | groupBy([a], function=count())'),
+                         'a = 1 | groupBy([a])',
+                         "count() IS the default, so it renders as the default")
+        self.assertEqual(
+            _round_trip('a = 1 | groupBy([a], function=[count(as=n)])'),
+            'a = 1 | groupBy([a], function=[count(as=n)])')
+
+    def test_groupBy_accepts_every_documented_key_spelling(self):
+        """`a`, `[a]`, `[a, b]`, and each with a `field=` prefix are all legal
+        LogScale. A parser that reads `field=[a]` as the single key
+        `field=[a]` refuses input the vendor documents.
+
+        The expected output is written out per source rather than derived from
+        it, because the point is that the RENDERED form is normalised to
+        `groupBy([...])` while every spelling is accepted -- deriving the
+        expectation from the input would let a bug in both pass.
+        """
+        for source, expected in (
+                ('a = 1 | groupBy(a)', 'a = 1 | groupBy([a])'),
+                ('a = 1 | groupBy([a])', 'a = 1 | groupBy([a])'),
+                ('a = 1 | groupBy([a, b])', 'a = 1 | groupBy([a, b])'),
+                ('a = 1 | groupBy(field=a)', 'a = 1 | groupBy([a])'),
+                ('a = 1 | groupBy(field=[a])', 'a = 1 | groupBy([a])'),
+                ('a = 1 | groupBy(field=[a, b])', 'a = 1 | groupBy([a, b])')):
+            self.assertEqual(_round_trip(source), expected, source)
+
+    def test_groupBy_leaves_a_projection_of_its_own_columns_alone(self):
+        """The `| table` guard tracks keys AND measure, so projecting them is
+        allowed. A guard that only knew the measure name would refuse valid
+        CQL -- which is what the first version of that guard did to `| x := 1`."""
+        from engine import evaluate
+        rows = [{"a": "1", "b": "x"}, {"a": "1", "b": "y"}]
+        result = evaluate(lower_cql(
+            parse_cql('a = "1" | groupBy([a]) | table a, _count'))[0], rows)
+        self.assertEqual(sorted((r.values["a"], r.values["_count"])
+                                for r in result.rows), [("1", 2)])
+        with self.assertRaises(Refusal) as caught:
+            lower_cql(parse_cql('a = "1" | groupBy([a]) | table b'))
+        self.assertEqual(caught.exception.code, "CQL_TABLE_AFTER_AGGREGATE")
+
+    def test_groupBy_refusals_name_what_would_change_the_rows(self):
+        """Each is a different result, not a missing feature.
+
+        `function=[]` returns distinct values with nothing aggregated -- not a
+        count of zero per group. `limit=N` is top-N SERIES SELECTION, a cap
+        whose whole point is which groups disappear. A nested groupBy changes
+        the output to a nested structure. An embedded `{...}` is a whole
+        sub-pipeline. `avg(x)` is a different aggregate.
+        """
+        for source, code in (
+                ('a = 1 | groupBy([])', "CQL_GROUPBY_NO_KEYS"),
+                ('a = 1 | groupBy([a], function=[])',
+                 "CQL_GROUPBY_NO_AGGREGATE"),
+                ('a = 1 | groupBy([a], limit=5)',
+                 "CQL_GROUPBY_PARAMETER_UNKNOWN"),
+                ('a = 1 | groupBy([a], function=avg(x))',
+                 "CQL_GROUPBY_FUNCTION_NOT_LOWERED"),
+                ('a = 1 | groupBy([a], function=[{count() | x := _count}])',
+                 "CQL_GROUPBY_EMBEDDED_PIPELINE"),
+                ('a = 1 | groupBy([a]) | groupBy([b])', "CQL_GROUPBY_TWICE"),
+                ('a = 1 | groupBy(limit=5)', "CQL_GROUPBY_KEYS_MALFORMED")):
+            with self.assertRaises(Refusal) as caught:
+                parse_cql(source)
+            self.assertEqual(caught.exception.code, code, source)
+
     def test_count_executes_to_the_number_of_matching_rows(self):
         """`| count()` must COUNT, not merely render. A nullary `count` reads no
         field -- it is the number of rows that reached the stage, which is a
@@ -759,8 +868,13 @@ class MembershipLowersAsDisjunction(unittest.TestCase):
         """
         import jobs as _jobs
         label = _jobs.DIALECTS["logscale"]["label"].lower()
-        for shipped in ("table", "sort", "rename", ":=", "in", "count()"):
-            self.assertIn(shipped, label,
+        for shipped in ("table", "sort", "rename", ":=", "in", "count()",
+                        "groupby"):
+            # COMPARED CASE-INSENSITIVELY, because the label is a human-facing
+            # string and `groupBy` is spelled with a capital B in LogScale. The
+            # assertion is about which features the label NAMES, not about how
+            # it capitalises them.
+            self.assertIn(shipped.lower(), label,
                           f"the logscale label does not name `{shipped}`, which "
                           f"the slice accepts; label is {label!r}")
 

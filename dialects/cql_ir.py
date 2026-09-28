@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from dialects.cql import (CqlAssign, CqlCount, CqlQuery, CqlRename, CqlSort,
+from dialects.cql import (CqlAssign, CqlCount, CqlGroupBy, CqlQuery, CqlRename, CqlSort,
                           CqlTable, DIALECT)
 from engine.ir import (
     Aggregate,
@@ -150,8 +150,7 @@ def lower(query: CqlQuery, rule_id: str = "rule") -> tuple[RuleIR, list[dict]]:
             # measures; every event field is gone. That is the point at which
             # a later `| table` becomes checkable, because the set of columns
             # that survive is now FINITE and KNOWN rather than open-ended.
-            present = frozenset({"count"})
-            # `per_event` IS THE WHOLE-INPUT FRAME, which is what CQL's
+            present = frozenset({"count"})            # `per_event` IS THE WHOLE-INPUT FRAME, which is what CQL's
             # ungrouped `count()` means: one number for everything that reached
             # this stage. The default `tumbling` would be WRONG here, and
             # silently so -- it refuses without a `size`, and with a size it
@@ -162,6 +161,23 @@ def lower(query: CqlQuery, rule_id: str = "rule") -> tuple[RuleIR, list[dict]]:
                                    measures=(Measure(name="count",
                                                      function="count"),),
                                    frame=Frame(kind="per_event")))
+        elif isinstance(stage, CqlGroupBy):
+            # ONE ROW PER DISTINCT COMBINATION OF KEYS, plus a count per group.
+            # This is the first CQL stage to set `Aggregate.keys`, so the test
+            # has to prove the evaluator GROUPS -- `keys` is exactly the kind of
+            # field that `Derive.projects` was, recorded by a lowerer and read by
+            # nobody, and two of this session's worst bugs were that shape.
+            node_id = _stage_id("groupby", index)
+            nodes.append(Aggregate(
+                id=node_id, input=current,
+                measures=(Measure(name=stage.measure_name, function="count"),),
+                frame=Frame(kind="per_event"),
+                keys=tuple(FieldRef(_field_name(key)) for key in stage.keys)))
+            # The output row is the KEYS plus the measure -- not the measure
+            # alone, which is what a nullary count leaves behind. Getting this
+            # wrong would refuse every valid `| groupBy(...) | table a`.
+            present = frozenset(_field_name(key) for key in stage.keys) \
+                | {stage.measure_name}
         elif isinstance(stage, CqlTable):
             # A PROJECTION AFTER AN AGGREGATE CAN NAME ONLY WHAT SURVIVED IT.
             # An aggregate collapses the rowset to one row carrying only its

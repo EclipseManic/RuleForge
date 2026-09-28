@@ -60,11 +60,35 @@ def render(ir: RuleIR) -> str:
                     f"different set of rows. Refused rather than rendered as "
                     f"`count()`.", DIALECT)
             if node.keys:
-                raise Refusal(
-                    "CQL_RENDER_AGGREGATE_GROUPED",
-                    "a grouped `count()` produces one row per key, which needs "
-                    "the `by` syntax this slice does not lower. Refused rather "
-                    "than rendered as a single ungrouped number.", DIALECT)
+                # A GROUPED COUNT IS ITS OWN SPELLING, AND THE COLUMN NAME IS
+                # PART OF IT. LogScale's `groupBy` defaults to
+                # `count(as=_count)`, so the measure is named `_count` -- NOT
+                # `count`. Reusing the nullary check above would have refused
+                # this node outright, or emitted `| count()` and renamed a
+                # column the analyst's downstream queries read. The measure name
+                # round-trips because it is DATA, not a format the renderer owns.
+                if measure.function != "count" or measure.field is not None:
+                    raise Refusal(
+                        "CQL_RENDER_AGGREGATE_NOT_COUNT",
+                        f"only a grouped count renders in this CQL slice; this is "
+                        f"{measure.function!r} over a field, which computes "
+                        f"something else. Refused rather than rendered as a "
+                        f"count.", DIALECT)
+                if node.frame.kind != "per_event" or node.frame.size is not None:
+                    raise Refusal(
+                        "CQL_RENDER_AGGREGATE_FRAMED",
+                        f"`groupBy` counts every row in each group, but this "
+                        f"aggregate is windowed ({node.frame.kind}), so it would "
+                        f"emit one row per group per window. Refused rather than "
+                        f"rendered as an ungrouped `groupBy`.", DIALECT)
+                names = [getattr(ref, "name", str(ref)) for ref in node.keys]
+                keys = ", ".join(names)
+                if measure.name == "_count":
+                    out.append(f"| groupBy([{keys}])")
+                else:
+                    out.append(f"| groupBy([{keys}], "
+                               f"function=[count(as={measure.name})])")
+                continue
             # THE OUTPUT COLUMN NAME, CHECKED. SPL's `stats count AS total`
             # produces exactly this node -- a `count` measure named `total` --
             # and rendering it as `| count()` would emit a rule whose column is
