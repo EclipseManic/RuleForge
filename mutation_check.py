@@ -135,6 +135,16 @@ MUTATIONS = [
      "engine/nodes.py",
      "    projected = [target for target, _ in node.assignments] if node.projects \\\n        else None",
      "    projected = [target for target, _ in node.assignments]"),
+
+    # THE DEFAULT FRAME IS A SILENTLY-WRONG ANSWER, NOT A LOUD ONE. `| count()`
+    # with the default `tumbling` frame would emit ONE ROW PER WINDOW, so a rule
+    # asking "how many" would return several numbers -- and it renders as
+    # `| count()` either way, so no text test could see it. `per_event` is the
+    # whole-input frame, the same one SPL's spanless `stats` uses.
+    ("M19 CQL count uses the default tumbling frame, not the whole input",
+     "dialects/cql_ir.py",
+     '                                   frame=Frame(kind="per_event")))',
+     "                                   ))"),
 ]
 
 

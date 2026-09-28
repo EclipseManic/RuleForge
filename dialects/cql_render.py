@@ -39,6 +39,34 @@ def render(ir: RuleIR) -> str:
             out.append("| table " + ", ".join(
                 alias for alias, _ in node.assignments))
             continue
+        if kind == "Aggregate":
+            # ONLY THE NULLARY COUNT IS RENDERABLE HERE, and only because it is
+            # the only one that can be produced. A `count(field=x)` measure has
+            # no CQL spelling in this slice -- writing it as `count()` would
+            # answer "how many rows" when the rule asks "how many have an x" --
+            # so it is refused rather than rendered as a different aggregate.
+            if len(node.measures) != 1:
+                raise Refusal(
+                    "CQL_RENDER_AGGREGATE_NOT_SINGLE",
+                    "this CQL slice renders one nullary count per stage; a "
+                    "multi-measure aggregate is a different shape and is "
+                    "refused rather than flattened.", DIALECT)
+            measure = node.measures[0]
+            if measure.function != "count" or measure.field is not None:
+                raise Refusal(
+                    "CQL_RENDER_AGGREGATE_NOT_COUNT",
+                    f"only the nullary `count()` renders in this CQL slice; "
+                    f"this is {measure.function!r} over a field, which counts a "
+                    f"different set of rows. Refused rather than rendered as "
+                    f"`count()`.", DIALECT)
+            if node.keys:
+                raise Refusal(
+                    "CQL_RENDER_AGGREGATE_GROUPED",
+                    "a grouped `count()` produces one row per key, which needs "
+                    "the `by` syntax this slice does not lower. Refused rather "
+                    "than rendered as a single ungrouped number.", DIALECT)
+            out.append("| count()")
+            continue
         if kind == "Arrange":
             # `| sort(field[, limit=N])`, ascending -- the only form this
             # parser accepts, so the direction is data, not a default. A

@@ -193,7 +193,9 @@ DIALECTS: dict[str, dict[str, Any]] = {
         # works, no more and no less. It said "filter + table" while sort,
         # rename, `:=`, and `in()` had all landed, which understates the tool
         # and would send an analyst looking for refusals that do not exist.
-        "label": "CrowdStrike CQL (filter + table/sort/rename/:=/in)",
+        # `count()` is the nullary one ONLY -- `count(field=)` and grouped
+        # counts are refused, so the label says "count()" rather than "count".
+        "label": "CrowdStrike CQL (filter + table/sort/rename/:=/in/count())",
         "dialect": CQL_DIALECT,
         "lower_text": _lower_cql_text, "render": render_cql,
     },

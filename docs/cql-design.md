@@ -72,14 +72,48 @@ IR vocabulary built for SPL applies almost directly:
 | `\| table a, b` | `Derive(kind="fields")` | shipped |
 | `\| sort(f)` | `Arrange` | shipped, ascending + optional `limit=` |
 | `\| rename a as b` | `Derive(kind="rename")` | shipped |
-| `\| join k [ search ... ]` | `Join` + sub-search | **not lowered yet** — IR has Join; SPL renderer has the sub-search path |
+| `\| count()` | `Aggregate(count)`, `Frame(kind="per_event")` | shipped, NULLARY only |
+| `\| count(field=x)` | `Aggregate` over a field | **refused** — a different count |
+| `\| count(by=x)` | `Aggregate` with keys | **refused** — grouped, not one number |
 | `in(field, [...])` | `BoolOp("or", equalities)` | shipped, lowered EXACTLY as a disjunction |
-| `count()`, `timechart()`, aggregates | `Aggregate` | **not lowered yet** — have the node; per-function mapping needed |
+| `join()` | — | **refused** — see "Why `join()` is refused" below |
+| `timechart()`, other aggregates | `Aggregate` | **not lowered yet** — have the node; per-function mapping needed |
 
 The two header examples above are deliberately NOT both shipped. The pipeline
 sample at the top of this file uses `newField := oldField + "_suffix"`, which is
 an expression; the slice takes a single operand and refuses the rest by name.
 That refusal is the correct behaviour, not a missing feature to be papered over.
+
+### Why `join()` is refused — the design doc's first guess was wrong
+
+This file originally proposed `| join k [ search ... ]` mapping onto the IR's
+`Join` node, on the assumption that it was a pipeline stage shaped like the one
+KQL builds. Measured against LogScale's own `join()` reference, that is wrong in
+ways that matter, so the proposal is withdrawn rather than softened.
+
+`join()` is a FILTER function with eleven named parameters whose **defaults
+change which rows come back**:
+
+| Parameter | Default | Why the IR's `Join` cannot hold it |
+|---|---|---|
+| `mode` | `inner` | `left` keeps every left event. The node has `how`, so this one is fine. |
+| `max` | `1` | Takes ONE subquery row per key. Two subquery rows sharing a key yield ONE output row. No field for a per-key fan-in limit. |
+| `include` | none | Adds named subquery fields to matching events — and per the docs, a subquery event missing one outputs **the empty string**. |
+| `limit` | `100000` | Caps the subquery. |
+| `repo` / `view` / `start` / `end` | inherited | The subquery may read a **different repository or time range**. |
+
+The `include` row is the decisive one, and it is not a missing-feature problem.
+This engine keeps `NULL` and `""` distinct throughout, because a detection that
+cannot tell "field absent" from "field empty" cannot be trusted. LogScale's
+`join` documents filling a missing include field with the empty string. Lowering
+it onto the IR would put a fabricated value into the output row — so the honest
+answer is a refusal naming the behaviour, not a join node one commit away.
+
+What the IR's `Join` CAN express, per `kql_ir.py`: same-named key equality,
+`inner` or `left`, and a `column_map` recording which merged column came from
+which side. That is what `mode=inner` with no `include`, no `max`, and no
+cross-repo read would reduce to. A future slice can take exactly that subset —
+and must say so, rather than accepting a `join(` and dropping what it ignores.
 
 ### The shape traps this slice already hit
 

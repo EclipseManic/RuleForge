@@ -344,7 +344,7 @@ assume a fresh eye is cheaper than the next round's findings.
 
 ### Open, in severity order -- verified against the tree, not carried forward
 
-**Verified state: 831 passed, 4 skipped, 3 warnings, ruff clean, all 16 mutations caught (M7 re-armed, M16 added) -- see the CQL ordering note below.**
+**Verified state: 850 passed, 4 skipped, 3 warnings, ruff clean, all 19 mutations caught (M7 re-armed; M16 ordering, M17/M18 projection, M19 count frame added) -- see the CQL ordering note below.**
 
 Everything round 9 listed except the EQL/CQL gap is FIXED and committed, each
 mutation-verified: eventstats refused, `tstats`-first ordering, the `Not`
@@ -364,19 +364,38 @@ What remains:
    step plus its mandatory maxspan; per-step `by` needs `key` to stop being
    global (do not fake it). `sequence` without `maxspan` is refused (no
    unbounded spelling). See `docs/eql-design.md`.
-2. **CQL pipeline stages -- MOSTLY SHIPPED NOW, NOT ALL OF IT.** FQL (flat
-   filters) is done, and so are the LogScale pipes `| table`, `| sort`,
-   `| rename`, `:=` (single operand), and `in()`. What is NOT lowered:
-   `| join` with a sub-search, and the aggregate functions. Those map onto
-   nodes that already exist, but the renderer work must be SHARED with the SPL
-   stage builder rather than written a third time -- the two existing copies
-   have already drifted twice. `now()` must be evaluated at lower time, never
-   frozen into a literal, and is refused until then. See docs/cql-design.md,
-   whose status table is now checked against real refusals rather than intent.
+2. **CQL pipeline stages -- the pipeline vocabulary is done; the FUNCTION
+   language is not, and one function is refused on purpose.** FQL (flat
+   filters) is done. The pipes `| table`, `| sort`, `| rename`, `:=` (single
+   operand), `| count()` (nullary), and `in()` all lower and round-trip.
+   Not lowered: the other aggregates, and every function CQL offers
+   (`timechart`, `groupBy`, `select`, the lookup functions). `now()` is refused
+   because it must be evaluated at lower time, never frozen into a literal.
+
+   **`join()` IS REFUSED, AND THE DESIGN DOC'S ORIGINAL PLAN FOR IT WAS
+   WRONG.** docs/cql-design.md had proposed `| join k [ search ... ]` onto the
+   IR's `Join` node, assuming a pipeline stage shaped like KQL's. LogScale's own
+   reference says otherwise: `join()` is a FILTER function with eleven
+   parameters whose DEFAULTS change the answer -- `mode` (inner/left),
+   `max=1` (one subquery row per key, so two matching rows yield ONE output
+   row), `include=[...]`, `limit`, and `repo`/`view`/`start`/`end` letting the
+   subquery read a different repository or time range. The IR's `Join` has
+   fields for same-named key equality and inner/left, and NO field for a
+   per-key fan-in limit, an `include` list, or a cross-repo subquery.
+
+   The `include` row is why this is a refusal rather than a TODO: LogScale
+   documents that `include` fills a missing subquery field with THE EMPTY
+   STRING, and this engine keeps NULL and "" distinct because a detection that
+   cannot tell absent from empty cannot be trusted. Lowering it would fabricate
+   a value into the output row. A future slice MAY take the exact subset the
+   node can hold (`mode=inner`, no `include`, no `max`, no cross-repo read) --
+   but it must say so, never accept a `join(` and drop what it ignores.
 
 3. **Four POSIX assertions have never executed.** Permission-bit tests and the
    directory `fsync`,  written on Windows. The Windows halves are exercised;
-   run the file on Linux before trusting that half at all.
+   run the file on Linux before trusting that half at all. This is the only
+   remaining item that needs an environment rather than an engineer, so it is
+   the one to hand to whoever has a Linux box.
 4. **A review round, and a guard that had quietly stopped guarding.** Eleven
    rounds now, every one found real defects behind a green suite. Two things
    from the CQL ordering fix, both of which belong in a handoff because neither

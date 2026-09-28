@@ -12,13 +12,14 @@ word-operator shapes are refused there as CQL. A combined grammar would accept
 strings valid in neither language.
 
 SHIPPED: a filter, plus the pipes `| table`, `| sort`, `| rename`, `| name :=`
-(single operand), and `in()`. Pipes lower IN THE ORDER WRITTEN, each kind at
-most once.
+(single operand: a field, quoted string, or number), `| count()` (nullary), and
+`in()`. Pipes lower IN THE ORDER WRITTEN, each kind at most once.
 
 Refused by name in this slice: wildcards, regex, functions, `field = *` (a
-presence test needs a node this lowering does not build), `now()`, `| join` and
-the aggregate functions, an arithmetic or function RHS to `:=`, a repeated pipe,
-an empty filter, and an empty `table`.
+presence test needs a node this lowering does not build), `now()`, `join()` (a
+LogScale FILTER function whose `include` fills missing fields with the empty
+string), `count(field=)` and grouped `count(by=)`, an arithmetic or function RHS
+to `:=`, a repeated pipe, an empty filter, and an empty `table`.
 """
 
 import unittest
@@ -427,6 +428,87 @@ class HashPrefixIsOneRuleEverywhere(unittest.TestCase):
         self.assertEqual(self._round_trip("#tag = 1 | x := #tag"),
                          "tag = 1 | x := tag")
 
+    def test_count_executes_to_the_number_of_matching_rows(self):
+        """`| count()` must COUNT, not merely render. A nullary `count` reads no
+        field -- it is the number of rows that reached the stage, which is a
+        different question from `count(field=x)`."""
+        from engine import evaluate
+        ir, _ = lower_cql(parse_cql("a = 1 | count()"))
+        rows = [{"a": "1"}, {"a": "1"}, {"a": "2"}]
+        self.assertEqual([dict(r.values) for r in evaluate(ir, rows).rows],
+                         [{"count": 2}])
+
+    def test_count_position_changes_the_answer_not_just_the_text(self):
+        """`| count() | sort(a)` sorts ONE row; `| sort(a) | count()` sorts first.
+        The aggregate collapses the rowset, so its position is semantics -- which
+        is why `count` is a stage in the ordered list rather than a property."""
+        self.assertEqual(_round_trip("a = 1 | count() | sort(a)"),
+                         "a = 1 | count() | sort(a)")
+        self.assertEqual(_round_trip("a = 1 | sort(a) | count()"),
+                         "a = 1 | sort(a) | count()")
+        from engine.ir import Aggregate, Arrange
+        before = lower_cql(parse_cql("a = 1 | count() | sort(a)"))[0]
+        self.assertLess([n.id for n in before.nodes].index("count1"),
+                        [n.id for n in before.nodes].index("arrange2"))
+        after = lower_cql(parse_cql("a = 1 | sort(a) | count()"))[0]
+        self.assertLess([n.id for n in after.nodes].index("arrange1"),
+                        [n.id for n in after.nodes].index("count2"))
+        self.assertIsInstance(
+            next(n for n in after.nodes if n.id == "count2"), Aggregate)
+        self.assertIsInstance(
+            next(n for n in after.nodes if n.id == "arrange1"), Arrange)
+
+    def test_count_uses_the_whole_input_frame(self):
+        """A `tumbling` frame would emit ONE ROW PER WINDOW, so `| count()` would
+        return several numbers where the rule asks for one. `per_event` is the
+        whole-input frame, and is the same one SPL's spanless `stats` uses."""
+        from engine.ir import Aggregate
+        ir, _ = lower_cql(parse_cql("a = 1 | count()"))
+        node = next(n for n in ir.nodes if isinstance(n, Aggregate))
+        self.assertEqual(node.frame.kind, "per_event")
+        self.assertIsNone(node.frame.size)
+
+    def test_count_field_is_refused_rather_than_counted_unfielded(self):
+        """`count(field=a)` counts rows where a is PRESENT. Reading it as
+        `count()` returns a different number, and "different number" is exactly
+        what a detection rule cannot be allowed to do."""
+        for source, code in (
+                ("a = 1 | count(field=a)", "CQL_COUNT_FIELD_NOT_LOWERED"),
+                ("a = 1 | count(as x)", "CQL_COUNT_NOT_NULLARY"),
+                ("a = 1 | count(by=a)", "CQL_COUNT_BY_NOT_LOWERED")):
+            with self.assertRaises(Refusal) as caught:
+                parse_cql(source)
+            self.assertEqual(caught.exception.code, code, source)
+
+    def test_join_is_refused_with_the_specific_reason(self):
+        """`join()` is a LogScale FILTER function, not a stage, and its defaults
+        are load-bearing: `mode` decides which rows survive, `max=1` takes one
+        subquery row per key, and `include=[...]` fills a missing field with THE
+        EMPTY STRING. This engine keeps absent and empty distinct, so the
+        refusal has to name all of it -- "not implemented" would suggest a
+        `Join` node is one commit away when the node has no field for a
+        per-key fan-in limit."""
+        for source in ('a = 1 | join(query={b=2}, field=c, key=d)',
+                       "a = 1 | join(query={b=2}, mode=left)",
+                       "a = 1 | join()"):
+            with self.assertRaises(Refusal) as caught:
+                parse_cql(source)
+            self.assertEqual(caught.exception.code, "CQL_JOIN_NOT_LOWERED")
+        message = caught.exception.message
+        self.assertIn("EMPTY STRING", message,
+                      "the refusal must name the include-fills-empty-string "
+                      "behaviour, which is the one that would break this "
+                      "engine's absent/empty distinction")
+        self.assertIn("max=1", message,
+                      "the refusal must name the per-key fan-in limit, which "
+                      "the IR's Join node has nowhere to record")
+
+    def test_no_artifact_is_produced_for_a_join(self):
+        outcome = jobs.author("logscale",
+                              "a = 1 | join(query={b=2}, field=c)", "r1")
+        self.assertFalse(outcome.rendered)
+        self.assertEqual(outcome.refusal["code"], "CQL_JOIN_NOT_LOWERED")
+
     def test_a_hashed_column_is_actually_present_after_projection(self):
         """The point of stripping: the projected column must now resolve
         against a real field rather than being named after a hash."""
@@ -488,7 +570,7 @@ class MembershipLowersAsDisjunction(unittest.TestCase):
         """
         import jobs as _jobs
         label = _jobs.DIALECTS["logscale"]["label"].lower()
-        for shipped in ("table", "sort", "rename", ":=", "in"):
+        for shipped in ("table", "sort", "rename", ":=", "in", "count()"):
             self.assertIn(shipped, label,
                           f"the logscale label does not name `{shipped}`, which "
                           f"the slice accepts; label is {label!r}")

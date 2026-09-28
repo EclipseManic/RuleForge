@@ -16,10 +16,10 @@ and word operators. Each refuses the other's shape by name: a combined grammar
 would accept strings valid in neither language.
 
 Refused by name in this slice: wildcards in values, regex (`/re/` and
-`regex()`), functions, `field = *` exists-checks, `now()`, `| join` and the
-aggregate functions, an arithmetic or function RHS to `:=`, and a repeated pipe.
-Each changes which rows match or needs a node not yet wired, so each is named
-rather than approximated.
+`regex()`), functions, `field = *` exists-checks, `now()`, `join()`, the
+aggregates other than the nullary `count()`, an arithmetic or function RHS to
+`:=`, and a repeated pipe. Each changes which rows match, fabricates a value, or
+needs a node not yet wired, so each is named rather than approximated.
 """
 
 from __future__ import annotations
@@ -61,6 +61,20 @@ class CqlAssign:
 
 
 @dataclass(frozen=True, slots=True)
+class CqlCount:
+    """`| count()` -- nullary: counts ROWS, reading no field.
+
+    `count(field=x)` is a DIFFERENT aggregate (it counts rows where x is
+    present) and is refused by name. `count` is the only nullary aggregate the
+    IR's `AGGREGATES` set contains, and it is the one an analyst reaches for
+    first -- "how many of these events" is the question most CQL asks.
+    """
+    #: `count()` has no argument at all, so this is always empty. It is here so
+    #: a future `by` variant has a home rather than growing a parallel field.
+    by: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class CqlTable:
     """`| table c1, c2` -- PROJECT: the result keeps only these columns, in
     this order. A `CqlTable` is a stage, not a property of the query, because
@@ -71,7 +85,7 @@ class CqlTable:
 #: Every pipe stage this lowering understands. A stage is a `|` in the analyst's
 #: query, and stages lower IN WRITTEN ORDER -- so this is a union of shapes, not
 #: a list of features the query optionally has.
-CqlStage = CqlTable | CqlSort | CqlRename | CqlAssign
+CqlStage = CqlTable | CqlSort | CqlRename | CqlAssign | CqlCount
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,11 +171,17 @@ def parse_cql(text: str) -> CqlQuery:
                        "unsupported shape rather than as a hazard.")
                 stages.append(_parse_sort_args(args))
                 continue
+            if name == "count":
+                stages.append(_parse_count(text, args))
+                continue
+            if name == "join":
+                raise Refusal(*_join_refusal(args), DIALECT)
             raise Refusal(
                 "CQL_PIPE_NOT_LOWERED",
                 f"`| {name}(...)` is a real CQL command, but only `| table`, "
-                f"`| sort`, `| rename`, and `| :=` lower today. Refused by name "
-                f"rather than dropped.", DIALECT)
+                f"`| sort`, `| rename`, `| count()`, and `| :=` lower today. "
+                f"Refused by name rather than dropped -- dropping a pipe stage "
+                f"silently changes which rows come back.", DIALECT)
         name, _, args = text.partition(" ")
         name, args = name.lower(), args.strip()
         if name == "table":
@@ -214,6 +234,90 @@ def _claim(stages: list[CqlStage], seen: set[str], kind: str, code: str,
     if kind in seen:
         raise Refusal(code, why, DIALECT)
     seen.add(kind)
+
+
+def _join_refusal(args: str) -> tuple[str, str]:
+    """`join()` is refused, and the reason is SPECIFIC rather than "not yet".
+
+    Measured against LogScale's own `join()` reference, this is not a pipeline
+    stage that happens to resemble the IR's `Join` node. It is a FILTER function
+    with eleven named parameters, and the defaults are load-bearing:
+
+      - `mode=inner` (default) keeps only events matching in both queries;
+        `mode=left` keeps every left event. Different rows survive.
+      - `max=1` (default) takes ONE subquery row per key. Two subquery rows
+        sharing a key produce ONE output row, not two. This is a fan-in limit,
+        and the IR's `Join` has no field for it -- there is nowhere to record a
+        number that changes how many rows come back.
+      - `include=[...]` adds the named subquery fields to matching events, and
+        the documentation is explicit that a subquery event missing one of them
+        outputs THE EMPTY STRING. This project treats NULL and "" as DISTINCT
+        values throughout, because a detection that cannot tell "field absent"
+        from "field empty" is a detection that cannot be trusted. Fabricating ""
+        here would put a lie into the output row.
+      - `limit=100000` caps the subquery, and `repo=`/`view=`/`start=`/`end=`
+        let it read a different repository or time range than the main query.
+        A subquery over different data is not a join over this data.
+
+    So the refusal names these rather than saying "unsupported", because "not
+    implemented yet" invites the reader to think a `Join` node is one commit
+    away when the node does not have the fields the construct needs. The KQL
+    `Join` producer is the reference for what this IR CAN express: same-named
+    key equality, inner or left, nothing else.
+    """
+    mode = "inner"
+    lowered = args.lower()
+    if "mode=" in lowered:
+        at = lowered.index("mode=")
+        mode = args[at + 5:].split(",")[0].split("}")[0].strip() or "?"
+    detail = f"`mode={mode}`" if mode else "`mode`"
+    return (
+        "CQL_JOIN_NOT_LOWERED",
+        f"`join()` is a LogScale FILTER function, not a pipeline stage, and this "
+        f"tool does not lower it. {detail} decides which rows survive; `max=1` "
+        f"by default takes one subquery row per key, so two subquery rows "
+        f"sharing a key yield one output row; and per LogScale's own reference, "
+        f"`include=[...]` fills a missing subquery field with THE EMPTY STRING, "
+        f"which this engine refuses to fabricate because it keeps absent and "
+        f"empty distinct. The IR's `Join` node has fields for same-named key "
+        f"equality and inner/left, and no field for a per-key fan-in limit, an "
+        f"`include` list, or a subquery over a different repo or time range. "
+        f"Refused rather than lowered as a plain join, which would be a "
+        f"different rule returning different rows.")
+
+
+def _parse_count(text: str, args: str) -> CqlCount:
+    """`| count()` and nothing else.
+
+    An aggregate is NOT a projection or a filter -- it collapses many rows into
+    one, so every stage after it sees a different rowset. That is why this is a
+    stage in the ordered list rather than a detail of the query.
+
+    `count(field=x)` is refused separately, not folded in: it counts rows where
+    `x` is PRESENT, which is a different question from "how many rows". Reading
+    it as a field count would turn "how many of these events" into "how many of
+    these events have an x", which is a rule that returns a different number.
+    """
+    if not args:
+        return CqlCount()
+    if args.lower().startswith("field="):
+        raise Refusal(
+            "CQL_COUNT_FIELD_NOT_LOWERED",
+            f"`count({args})` counts the rows where a field is PRESENT, which is "
+            f"a different question from `count()`'s \"how many rows\". Taking the "
+            f"field and ignoring it would return a number the analyst did not "
+            f"ask for, so it is refused rather than approximated.", DIALECT)
+    if args.lower().startswith("by ") or args.lower().startswith("by="):
+        raise Refusal(
+            "CQL_COUNT_BY_NOT_LOWERED",
+            f"`count({args})` groups the count, which is a different aggregate "
+            f"shape (grouped keys, not one number) and is not lowered yet. "
+            f"Refused rather than counted ungrouped.", DIALECT)
+    raise Refusal(
+        "CQL_COUNT_NOT_NULLARY",
+        f"`| {text.strip()}` is not `count()`. CQL aggregates take a field or a "
+        f"`by` grouping, both of which change which rows the count describes; "
+        f"only the nullary `count()` lowers.", DIALECT)
 
 
 def _find_assign(text: str) -> int:

@@ -23,8 +23,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from dialects.cql import CqlAssign, CqlQuery, CqlRename, CqlSort, CqlTable, DIALECT
+from dialects.cql import (CqlAssign, CqlCount, CqlQuery, CqlRename, CqlSort,
+                          CqlTable, DIALECT)
 from engine.ir import (
+    Aggregate,
     Arrange,
     BoolOp,
     Comparison,
@@ -33,7 +35,9 @@ from engine.ir import (
     FieldExpr,
     FieldRef,
     Filter,
+    Frame,
     Literal,
+    Measure,
     Not,
     Read,
     RuleIR,
@@ -98,6 +102,25 @@ def lower(query: CqlQuery, rule_id: str = "rule") -> tuple[RuleIR, list[dict]]:
                                 assignments=((stage.name,
                                               _assign_value(stage.expr)),),
                                 projects=False, kind="eval"))
+        elif isinstance(stage, CqlCount):
+            # A STAGE, NOT A PROPERTY. An aggregate collapses many rows into one,
+            # so every stage after it sees a different rowset -- `| count() |
+            # sort(x)` sorts a single row, while `| sort(x) | count()` sorts
+            # first. That is why `count` lives in the ordered stage list instead
+            # of on the query, and why putting it in the wrong position would be
+            # as wrong as reordering `| table` and `| sort` was.
+            node_id = _stage_id("count", index)
+            # `per_event` IS THE WHOLE-INPUT FRAME, which is what CQL's
+            # ungrouped `count()` means: one number for everything that reached
+            # this stage. The default `tumbling` would be WRONG here, and
+            # silently so -- it refuses without a `size`, and with a size it
+            # would emit one row PER WINDOW, so `| count()` would return several
+            # numbers where the rule asks for one. This is the same frame SPL
+            # uses for `stats` with no `span`, for the same reason.
+            nodes.append(Aggregate(id=node_id, input=current,
+                                   measures=(Measure(name="count",
+                                                     function="count"),),
+                                   frame=Frame(kind="per_event")))
         elif isinstance(stage, CqlTable):
             node_id = _stage_id("derive", index)
             # A LEADING `#` IS STRIPPED HERE TOO, like every other field site in
