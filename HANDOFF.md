@@ -344,7 +344,7 @@ assume a fresh eye is cheaper than the next round's findings.
 
 ### Open, in severity order -- verified against the tree, not carried forward
 
-**Verified state: 777 passed, 4 skipped, 3 warnings, ruff clean, all 15 mutations caught, at d7843e7.**
+**Verified state: 782 passed, 4 skipped, 3 warnings, ruff clean, all 15 mutations caught, at b9104af.**
 
 Everything round 9 listed except the EQL/CQL gap is FIXED and committed, each
 mutation-verified: eventstats refused, `tstats`-first ordering, the `Not`
@@ -355,12 +355,14 @@ COUNT(x), the backwards subpipeline `rename`, and the M8 retargeting (all 15
 mutations caught). Then EQL slices 1+2, FQL slice 1, EQL `runs=1`, round-10
 fixes, and the registry anti-drift landed on top. What remains:
 
-1. **EQL: with runs=N, ! missing-event, per-step `by`, sample.** Each
-   needs an IR decision, not just code: `runs` needs a repeat count Pattern
-   does not have; ! needs a negative step plus its mandatory maxspan;
-   per-step `by` needs key to stop being global (do not fake it); sample
-   is ordered=False without until/maxspan. sequence without maxspan
-   is refused (no unbounded spelling). See docs/eql-design.md.
+1. **EQL: with runs=2+, ! missing-event, per-step `by`.** Done since: single
+   events, sequence with by/maxspan/until/runs=1, and sample (unordered
+   windowless Pattern, ordered=False, within=None, execution verified
+   order-independent). Each remainder needs an IR decision, not just code:
+   `runs` needs a repeat count Pattern does not have; `!` needs a negative
+   step plus its mandatory maxspan; per-step `by` needs `key` to stop being
+   global (do not fake it). `sequence` without `maxspan` is refused (no
+   unbounded spelling). See `docs/eql-design.md`.
 2. **CQL pipeline stages.** FQL (flat filters) is done. The LogScale pipes --
    | table, | sort, | rename, :=, | join with sub-search, aggregates,
    in() -- map onto existing SPL-shaped nodes, but the renderer work must be
