@@ -70,6 +70,15 @@ __all__ = [
 
 #: The platforms this tool targets. Names only -- this table records WHICH
 #: syntaxes must be handled, not where code for them lives.
+#:
+#: WHERE ONLY A SLICE IS WIRED, THE VALUE NAMES THE FULL TARGET, NOT THE SLICE.
+#: The wired slice is named in `jobs.DIALECTS[...]["label"]` instead ("Elastic
+#: EQL (single event + sequence)", "CrowdStrike FQL (flat filter)"), and tests
+#: assert those labels -- because the home page shows DIALECTS labels for what
+#: works and TARGETS names for what is still missing, and putting the slice in
+#: both places would either under-claim the target or over-claim the wiring.
+#: `elastic` targets full EQL; `falcon` targets CQL pipelines. What is wired
+#: today is a matter for DIALECTS, not this table.
 TARGETS: dict[str, str] = {
     "yaral": "YARA-L 2.0",
     "qradar": "AQL",
