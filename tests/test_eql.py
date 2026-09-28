@@ -634,6 +634,73 @@ class EverythingElseIsRefusedByName(unittest.TestCase):
             lower_eql(parse_eql('sequence with maxspan=10m\n'
                                  '  ![ process where true ]'))
 
+    def test_a_THREE_STAGE_sequence_evaluates_every_stage(self):
+        """THE COVERAGE HOLE THE DEDENT LIVED IN, now closed.
+
+        `e7e70b3` wrapped the per-stage walk in the repeat loop and re-indented
+        the two inserted lines, but left the walk at its old indent -- so it
+        became a SIBLING of the stage loop rather than its body. The loop body
+        kept only the negative check and the two `found = False` stores, and the
+        walk then ran once using whatever `stage` the loop left bound: the LAST
+        one. Every stage in between was never evaluated, so a three-stage
+        sequence matched on its first and last stages with the middle one
+        unconstrained -- a rule that fires on strictly more events than written.
+
+        It was invisible because EVERY executing sequence test used exactly two
+        stages, where the two layouts behave identically. This is a three-stage
+        pattern with a POSITIVE expectation, which nothing exercised before.
+        """
+        from engine import Verdict, evaluate
+        source = ('sequence with maxspan=10m\n'
+                  '  [ process where a == 1 ]\n'
+                  '  [ process where b == 2 ]\n'
+                  '  [ process where c == 3 ]')
+        ir, _ = lower_eql(parse_eql(source))
+
+        def event(offset, **fields):
+            row = {"event.category": "process", "@timestamp": offset}
+            row.update(fields)
+            return row
+
+        # Middle stage never true: the sequence did not happen. THIS is the
+        # assertion the bug breaks.
+        middle_missing = [event(1, a=1), event(2, a=1, c=3)]
+        self.assertEqual(len(evaluate(ir, middle_missing).rows), 0,
+                         "b == 2 never happened, so a three-stage sequence must "
+                         "not match on its first and last stages alone")
+
+        # All three true, in order: it did happen. The bug would also have
+        # passed this one; what distinguishes them is the case above.
+        all_true = [event(1, a=1), event(2, b=2), event(3, c=3)]
+        self.assertIs(evaluate(ir, all_true).verdict, Verdict.MATCHED,
+                      "all three stages true in order must match")
+
+        # Out of order must not, since the pattern is ordered.
+        out_of_order = [event(1, c=3), event(2, b=2), event(3, a=1)]
+        self.assertEqual(len(evaluate(ir, out_of_order).rows), 0,
+                         "an ordered sequence is not satisfied by its events in "
+                         "the wrong order")
+
+    def test_a_missing_event_step_survives_an_out_of_window_row(self):
+        """The trailing `![...]` must not be evaluated as a required stage.
+
+        The dedent made the walk run on whatever `stage` the loop left bound --
+        for a trailing negative step that is the NEGATIVE one. Walking it to the
+        end of the window then set `ok = False` on a candidate that should have
+        stood, so "a process event and no exit inside a one-second window" was
+        killed by an unrelated row far in the future.
+        """
+        from engine import Verdict, evaluate
+        source = ('sequence with maxspan=1s\n'
+                  '  [ process where a == 1 ]\n'
+                  '  ![ process where b == 2 ]')
+        ir, _ = lower_eql(parse_eql(source))
+        rows = [{"event.category": "process", "a": 1, "@timestamp": 1},
+                {"event.category": "process", "@timestamp": 9999}]
+        self.assertIs(evaluate(ir, rows).verdict, Verdict.MATCHED,
+                      "the sequence matched and no b == 2 fell inside the one "
+                      "second window, so a row far outside it is irrelevant")
+
     def test_a_missing_event_AND_an_until_clause_is_refused(self):
         """Both veto over the same window. The rule does not say which wins."""
         with self.assertRaises(Refusal) as caught:

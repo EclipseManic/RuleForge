@@ -892,12 +892,19 @@ def eval_pattern(node: Pattern, rows: list[Row],
             # whole sample.
             consumed_idx = {start_index}
             ok = True
-            # THE CURSOR IS RE-BASED PER REPEAT, not advanced forever. A repeat
-            # starts where the previous one ENDED (`last_matched_index`), so the
-            # next run's stage 0 cannot reuse an event the previous run already
-            # consumed. Sharing them would let one event satisfy two stages of two
-            # different runs, which is how "happened twice" turns into "happened
-            # once, counted twice".
+            # THE CURSOR ADVANCES ACROSS REPEATS, and it is re-based from
+            # `last_matched_index` so a repeat starts where the previous one
+            # ended.
+            #
+            # KNOWN GAP, NOT A CLAIM: stage 0 is the CANDIDATE anchor and is
+            # checked once, ABOVE this loop, so repeats 2..N do not re-test it.
+            # `runs=2` with stage 0 true only ONCE still matches, which is not
+            # EQL's semantics -- "happened twice" means the first event occurred
+            # twice. An earlier attempt to re-check stage 0 per repeat was
+            # reverted because it broke the genuine-two-repeats case, and
+            # shipping a half-verified fix is worse than shipping a known gap.
+            # It needs the stage-0 scan and the `consumed`/dedupe interaction
+            # designed together, with both directions under test.
             cursor = last_matched_index + 1
             #
             # `runs` IS READ HERE, which is the point. This is the third field in
@@ -926,80 +933,80 @@ def eval_pattern(node: Pattern, rows: list[Row],
                         continue
                     found = False
                     saw_untimed_match = False
-                # UNORDERED SEARCHES THE WHOLE GROUP, NOT JUST WHAT FOLLOWS.
-                #
-                # An EQL `sample` has no order: its stages match events wherever
-                # they sit in the group. The forward walk below would require
-                # stage order to equal row order, which is exactly what
-                # unordered denies. So when `ordered` is False, each stage scans
-                # every unconsumed row instead. Ordered patterns take the
-                # original path byte-for-byte -- this branch cannot change what
-                # a sequence means, because no sequence reaches it.
-                if not node.ordered:
-                    for scan in range(len(group)):
-                        if scan in consumed_idx:
-                            continue
-                        if _stage_matches(stage, group[scan], ctx):
-                            consumed.append(group[scan])
-                            consumed_idx.add(scan)
-                            last_matched_index = scan
-                            found = True
+                    # UNORDERED SEARCHES THE WHOLE GROUP, NOT JUST WHAT FOLLOWS.
+                    #
+                    # An EQL `sample` has no order: its stages match events wherever
+                    # they sit in the group. The forward walk below would require
+                    # stage order to equal row order, which is exactly what
+                    # unordered denies. So when `ordered` is False, each stage scans
+                    # every unconsumed row instead. Ordered patterns take the
+                    # original path byte-for-byte -- this branch cannot change what
+                    # a sequence means, because no sequence reaches it.
+                    if not node.ordered:
+                        for scan in range(len(group)):
+                            if scan in consumed_idx:
+                                continue
+                            if _stage_matches(stage, group[scan], ctx):
+                                consumed.append(group[scan])
+                                consumed_idx.add(scan)
+                                last_matched_index = scan
+                                found = True
+                                break
+                        if not found:
+                            ok = False
                             break
-                    if not found:
+                        continue
+                    while cursor < len(group):
+
+                        candidate = group[cursor]
+                        candidate_time = times[cursor]
+                        cursor += 1
+                        if window_end is not None and candidate_time is not None \
+                                and candidate_time > window_end:
+                            # Past the window. `ordered` means the list is sorted, so
+                            # nothing later can be inside it either. With no window
+                            # (`within=None`) this never fires -- every candidate is
+                            # eligible by time, which is what unbounded means.
+                            ok = False
+                            break
+                        if _stage_matches(stage, candidate, ctx):
+                            # A MATCHING EVENT WITH NO USABLE TIME IS UNDECIDABLE,
+                            # NOT A MATCH. Whether this row falls inside the window
+                            # cannot be established, so it cannot count as the
+                            # stage. It is SKIPPED rather than ending the search,
+                            # because a later row with a real timestamp may still
+                            # match -- the undecidability poisons this candidate,
+                            # not every one after it. If nothing timed ever
+                            # matches, the caveat below says so instead of the
+                            # loop quietly treating it as in-window.
+                            if candidate_time is None:
+                                saw_untimed_match = True
+                            else:
+                                consumed.append(candidate)
+                                last_matched_index = cursor - 1
+                                found = True
+                                break
+
+                    if not ok or not found:
+                        # The same undecidability the window start gets, one stage
+                        # later. An un-timestamped row that satisfied the stage means
+                        # the answer for this candidate is unknowable, not negative:
+                        # refusing the candidate silently would be a false negative,
+                        # and matching on it would be a guess. So it is named.
+                        if not found and saw_untimed_match:
+                            ctx.add(Caveat(
+                                "PATTERN_UNDECIDABLE_TIME",
+                                "a later event of a candidate sequence has no usable "
+                                "timestamp, so whether it falls inside the window "
+                                "cannot be established and this candidate was not "
+                                "decided", 1))
                         ok = False
                         break
-                    continue
-                while cursor < len(group):
 
-                    candidate = group[cursor]
-                    candidate_time = times[cursor]
-                    cursor += 1
-                    if window_end is not None and candidate_time is not None \
-                            and candidate_time > window_end:
-                        # Past the window. `ordered` means the list is sorted, so
-                        # nothing later can be inside it either. With no window
-                        # (`within=None`) this never fires -- every candidate is
-                        # eligible by time, which is what unbounded means.
-                        ok = False
-                        break
-                    if _stage_matches(stage, candidate, ctx):
-                        # A MATCHING EVENT WITH NO USABLE TIME IS UNDECIDABLE,
-                        # NOT A MATCH. Whether this row falls inside the window
-                        # cannot be established, so it cannot count as the
-                        # stage. It is SKIPPED rather than ending the search,
-                        # because a later row with a real timestamp may still
-                        # match -- the undecidability poisons this candidate,
-                        # not every one after it. If nothing timed ever
-                        # matches, the caveat below says so instead of the
-                        # loop quietly treating it as in-window.
-                        if candidate_time is None:
-                            saw_untimed_match = True
-                        else:
-                            consumed.append(candidate)
-                            last_matched_index = cursor - 1
-                            found = True
-                            break
-
-                if not ok or not found:
-                    # The same undecidability the window start gets, one stage
-                    # later. An un-timestamped row that satisfied the stage means
-                    # the answer for this candidate is unknowable, not negative:
-                    # refusing the candidate silently would be a false negative,
-                    # and matching on it would be a guess. So it is named.
-                    if not found and saw_untimed_match:
-                        ctx.add(Caveat(
-                            "PATTERN_UNDECIDABLE_TIME",
-                            "a later event of a candidate sequence has no usable "
-                            "timestamp, so whether it falls inside the window "
-                            "cannot be established and this candidate was not "
-                            "decided", 1))
-                    ok = False
-                    break
-
-            # THE FAILURE CHECK SITS AT THE `start_index` LEVEL, ON PURPOSE. An
-            # earlier version of the `runs` loop put this `continue` one level too
-            # deep, so `continue` bound to the REPEAT loop instead: a candidate
-            # that failed simply ran out of repeats and fell through to the
+                # THE FAILURE CHECK SITS AT THE `start_index` LEVEL, ON PURPOSE. An
+                # earlier version of the `runs` loop put this `continue` one level too
+                # deep, so `continue` bound to the REPEAT loop instead: a candidate
+                # that failed simply ran out of repeats and fell through to the
             # `until` check and the append, i.e. a FAILED candidate was recorded
             # as a match. With `runs=1` there is no next repeat, so the fall-
             # through was unconditional. Three existing "should not match" tests

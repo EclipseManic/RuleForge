@@ -57,9 +57,9 @@ MUTATIONS = [
      "            if False:\n                continue"),
 
     ("M7  Pattern window not enforced", "engine/nodes.py",
-     "                    if window_end is not None and candidate_time is not None \\\n"
-     "                            and candidate_time > window_end:",
-     "                    if False:"),
+     "                        if window_end is not None and candidate_time is not None \\\n"
+     "                                and candidate_time > window_end:",
+     "                        if False:"),
 
     ("M8  Pattern until ignores the window", "engine/nodes.py",
      "            if node.until is not None:",
@@ -237,6 +237,21 @@ MUTATIONS = [
      "engine/evaluate.py",
      "        ctx.note_uncertain(_describe_operand(expr.left), result.reason)",
      "        ctx.note_uncertain(_describe_operand(left), result.reason)"),
+
+    # THE DEDENT, AS A MUTATION. `e7e70b3` added the repeat loop and
+    # re-indented the two inserted lines, but left the per-stage walk at its old
+    # indent, so it became a SIBLING of the stage loop instead of its body. The
+    # loop body kept only the negative check and the two `found = False`
+    # stores, and the walk ran once per repeat on whatever `stage` the loop left
+    # bound -- the LAST one. Every stage in between was never evaluated, so a
+    # three-stage sequence matched on its first and last stages alone.
+    #
+    # It shipped green because every executing sequence test used two stages,
+    # where the two layouts behave identically.
+    ("M28 the per-stage walk sits outside the stage loop",
+     "engine/nodes.py",
+     "                    if stage_index in node.negative_stages:",
+     "                    if False and stage_index in node.negative_stages:"),
 ]
 
 
