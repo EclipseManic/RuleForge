@@ -985,6 +985,28 @@ class Pattern:
     #: 0 is refused: it would mean the pattern matches whenever it does NOT
     #: occur, which is not a weaker rule but an inverted one.
     runs: int = 1
+    #: INDICES OF STAGES THAT MUST NOT OCCUR -- a negative step.
+    #:
+    #: EQL's `![ ... ]` is a stage in the sequence whose polarity is inverted:
+    #: the rule matches when everything before it happened AND the named event
+    #: did not, inside the window. The stage stays in `stages` because it is part
+    #: of the sequence's shape and counts toward the minimum, but the evaluator
+    #: does not require it to match; the absence itself is checked by `until`.
+    #:
+    #: IT IS DATA, LIKE `drops`, `runs`, AND `kind`, for the same reason. A `!`
+    #: sits OUTSIDE the brackets of a step, so a parser reading only inside them
+    #: drops it SILENTLY -- and a dropped `!` does not weaken a rule, it INVERTS
+    #: it: "this happened and that did not" becomes "this happened", matching
+    #: strictly more than the analyst wrote, with no error and no caveat.
+    #:
+    #: Storing INDICES rather than a parallel boolean tuple keeps the two in step
+    #: by construction: a separate per-stage flag list can drift out of length
+    #: with `stages`, and the drift would be silent. Indices are range-checked in
+    #: `__post_init__` instead, so a wrong one is refused rather than ignored.
+    #:
+    #: Empty by default, which means every stage is required -- the behaviour
+    #: YARA-L has always had. Adding the field cannot re-break a rule.
+    negative_stages: tuple[int, ...] = ()
     #: Which field orders the sequence. REQUIRED for an ordered pattern, and never
     #: inferred. Guessing which column is the timestamp is how a sequence gets
     #: ordered by something unrelated, which changes which events count as "then".
@@ -1022,6 +1044,33 @@ class Pattern:
                 f"runs={self.runs} is not a repeat count of at least 1. Zero "
                 f"would mean the pattern matches when it does NOT occur, which "
                 f"is an inverted rule rather than a weaker one. Refused.", "Pattern")
+        # NEGATIVE STAGES ARE RANGE-CHECKED, so a wrong index is refused rather
+        # than ignored. An index of 0 is refused too: there would be nothing for
+        # the missing event to be missing FROM, and matching anyway would invert
+        # the rule rather than weaken it.
+        seen_negative: set[int] = set()
+        for index in self.negative_stages:
+            if not isinstance(index, int) or not 0 <= index < len(self.stages):
+                raise Refusal(
+                    "PATTERN_NEGATIVE_STAGE_OUT_OF_RANGE",
+                    f"negative stage {index!r} does not name a stage: this "
+                    f"pattern has {len(self.stages)}. A negative index would "
+                    f"silently veto nothing, which reads as \"no exclusion\" "
+                    f"rather than as a mistake.", "Pattern")
+            if index in seen_negative:
+                raise Refusal(
+                    "PATTERN_NEGATIVE_STAGE_DUPLICATE",
+                    f"stage {index} is marked negative twice. Refused rather "
+                    f"than deduplicated, since a repeat says something about "
+                    f"the rule that a set would quietly throw away.", "Pattern")
+            seen_negative.add(index)
+        if 0 in seen_negative:
+            raise Refusal(
+                "PATTERN_NEGATIVE_STAGE_FIRST",
+                "a sequence cannot start with a negative step: there is no "
+                "preceding event for the named one to be missing after. "
+                "Refused rather than matched, which would invert the rule.",
+                "Pattern")
         if self.ordered and self.time_field is None:
             raise Refusal(
                 "PATTERN_REQUIRES_TIME_FIELD",

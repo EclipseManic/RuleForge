@@ -910,7 +910,20 @@ def eval_pattern(node: Pattern, rows: list[Row],
             for _repeat in range(node.runs):
                 if not ok:
                     break
-                for stage in node.stages[1:]:
+                for stage_index, stage in enumerate(node.stages[1:],
+                                                   start=1):
+                    if stage_index in node.negative_stages:
+                        # A NEGATIVE STAGE IS NOT REQUIRED TO OCCUR. It stays in
+                        # `stages` so the sequence keeps its shape, but matching
+                        # it is not a condition -- the rule asserts its ABSENCE,
+                        # and that is checked by `until` over the window.
+                        #
+                        # Requiring it instead would turn "this happened and
+                        # that did not" into "this happened AND that happened",
+                        # which is the exact inverse of the claim.
+                        found = True
+                        saw_untimed_match = False
+                        continue
                     found = False
                     saw_untimed_match = False
                 # UNORDERED SEARCHES THE WHOLE GROUP, NOT JUST WHAT FOLLOWS.

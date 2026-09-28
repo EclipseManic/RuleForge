@@ -39,6 +39,18 @@ class EqlSequenceStep:
     category: str
     condition: str
     by: tuple[str, ...] = ()
+    #: A `![ ... ]` MISSING-EVENT STEP: this event must NOT occur.
+    #:
+    #: THIS IS DATA, AND THAT IS THE POINT. A `!` before a `[` sits OUTSIDE the
+    #: brackets, and a parser that only reads inside them drops it SILENTLY --
+    #: which does not weaken the rule, it INVERTS it. A dropped `!` turns "this
+    #: happened and that did not" into "this happened", which matches strictly
+    #: more than the analyst wrote, with no error and no caveat.
+    #:
+    #: So the polarity travels on the step rather than being re-derived later by
+    #: string-matching the source text. Same discipline as `Derive.drops` and
+    #: `Pattern.runs`: the thing that knows the meaning records it once.
+    negative: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,6 +376,24 @@ def _parse_sequence(text: str) -> EqlSequence:
                             context="until")
         rest = steps_text
 
+    # A SEQUENCE CANNOT START WITH `![ ... ]`, and it is checked HERE rather than
+    # left to the per-step path. There is nothing for the named event to be
+    # missing FROM, and honouring it would INVERT the rule rather than weaken it.
+    #
+    # It is checked at this level because the step splitter cannot see it
+    # reliably: a leading `!` sits before the first `[`, and the `with`-clause
+    # handling re-attaches the bracket, so the bang can end up inside the
+    # brackets where `body.startswith("!")` is false and the polarity is lost.
+    # Relying on that would make the check pass for the wrong reason on some
+    # inputs and the right reason on others.
+    if rest.lstrip().startswith("!"):
+        raise Refusal(
+            "EQL_MISSING_EVENT_CANT_BE_FIRST",
+            "a sequence cannot START with `![ ... ]`: there is no preceding "
+            "event for the named one to be missing after. Matching it anyway "
+            "would invert the rule rather than weaken it, so it is refused.",
+            DIALECT)
+
     steps = _parse_steps(rest)
     if not steps:
         raise Refusal("EQL_SEQUENCE_NO_STEPS",
@@ -478,8 +508,16 @@ def _find_step_close(body: str) -> int:
 
 
 def _parse_step(text: str, allow_bang: bool, context: str):
-    """One `[ category where condition ] [by ...]`, or a refused `![ ... ]`."""
+    """One `[ category where condition ] [by ...]`, optionally `![ ... ]`.
+
+    A leading `!` sets `negative` on the step. It is the ONLY place the `!` is
+    interpreted, and the flag is the only thing downstream that reads it -- so
+    there is no window in which the polarity exists in the source text but not
+    in the parsed structure, which is exactly the window in which a rule gets
+    silently inverted.
+    """
     body = text.strip()
+    negative = False
     if body.lower().startswith("by "):
         # A per-step `by` that the splitter left dangling: it follows a `]`,
         # so it arrives here as its own segment rather than as a trailer. Same
@@ -496,15 +534,22 @@ def _parse_step(text: str, allow_bang: bool, context: str):
     if body.startswith("!"):
         if not allow_bang:
             raise Refusal("EQL_UNTIL_MISSING_EVENT",
-                          "`until ![ ... ]` negates the expiry, which the IR "
-                          "cannot express. Refused rather than dropped.",
+                          "`until ![ ... ]` negates the expiry, which is a "
+                          "different construct from a negative STEP: it would "
+                          "mean \"and no absence either\", which is not what "
+                          "anyone writes. Refused rather than dropped.", DIALECT)
+        # A NEGATIVE STEP, CARRIED AS `negative=True` RATHER THAN REFUSED. It
+        # used to be refused outright, which meant the one EQL construct an
+        # analyst reaches for constantly -- \"this process started and no exit
+        # event followed\" -- could not be written at all. The `!` is now data
+        # on the step, so a dropped `!` is no longer possible.
+        body = body[1:].strip()
+        negative = True
+        if not body:
+            raise Refusal("EQL_STEP_MALFORMED",
+                          "`!` with no `[ category where condition ]` after it. "
+                          "Refused rather than treated as a bare negation.",
                           DIALECT)
-        raise Refusal(
-            "EQL_MISSING_EVENT_NOT_LOWERED",
-            "`![ ... ]` matches the ABSENCE of an event, and `Pattern` has no "
-            "negative step -- nor does it have anywhere to put the mandatory "
-            "`maxspan` that comes with one. Refused rather than dropped, "
-            "because dropping a negative step inverts the rule.", DIALECT)
     if not (body.startswith("[") and "]" in body):
         raise Refusal("EQL_STEP_MALFORMED",
                       f"a {context} step is `[ category where condition ]`.",
@@ -555,4 +600,5 @@ def _parse_step(text: str, allow_bang: bool, context: str):
             "would join on the wrong fields and over-match. Use "
             "`sequence by ...` for a shared key, or a single `by` naming the "
             "same field on every step.", DIALECT)
-    return EqlSequenceStep(category=category, condition=parts[2].strip())
+    return EqlSequenceStep(category=category, condition=parts[2].strip(),
+                            negative=negative)

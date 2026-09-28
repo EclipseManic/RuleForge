@@ -216,6 +216,17 @@ MUTATIONS = [
      "            continue",
      "        if window_end is not None and moment > window_end:\n"
      "            return False"),
+
+    # A DROPPED `!` IS THE WORST FAILURE IN THIS TOOL. A `!` sits OUTSIDE a
+    # step's brackets, so a parser reading only inside them loses it silently
+    # -- and that does not weaken the rule, it INVERTS it: "this happened and
+    # that did not" becomes "this happened", matching strictly more than the
+    # analyst wrote, with no error and no caveat. The mutation makes every
+    # negative stage a required one.
+    ("M26 a negative stage is required to occur instead of excluded",
+     "engine/nodes.py",
+     "                    if stage_index in node.negative_stages:",
+     "                    if False and stage_index in node.negative_stages:"),
 ]
 
 

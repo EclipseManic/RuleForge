@@ -95,12 +95,63 @@ def _lower_sequence(sequence, rule_id: str) -> tuple[RuleIR, list[dict]]:
         # stages: rendering `until [any where ...]` for an `until [process
         # where ...]` would silently widen the expiry.
         until = _stage_condition(sequence.until)
+    # A TRAILING `![ ... ]` IS THE `until` VETO, AND THE WINDOW SCOPE IS RIGHT.
+    # "A process event happened and no exit event followed, inside maxspan" is
+    # the same claim as `until`, expressed as a step: no row in the window may
+    # satisfy the condition. So the trailing negative step lowers onto the same
+    # mechanism, and `until_scope` is the WINDOW scope rather than EQL's
+    # "between" -- the veto genuinely ranges over the whole window, which is the
+    # point of a missing-event step. A "between" scope would let an exit event
+    # after the sequence completed pass straight through, which is the opposite
+    # of what `![ ... ]` means.
+    #
+    # A NEGATIVE STEP ANYWHERE ELSE IS REFUSED, and the reason is structural: a
+    # negative step in the MIDDLE would need a window anchored at the preceding
+    # positive step, and `Pattern` has one window for the whole pattern. Emitting
+    # a veto over the wrong range would match MORE than the analyst wrote.
+    negatives = [index for index, step in enumerate(sequence.steps)
+                 if step.negative]
+    negative_stages: tuple[int, ...] = ()
+    if negatives:
+        last = len(sequence.steps) - 1
+        if negatives != [last]:
+            raise Refusal(
+                "EQL_MISSING_EVENT_MUST_BE_LAST",
+                f"a `![ ... ]` step must be the LAST step of a sequence. One at "
+                f"position {negatives[0]} would need its own time window, "
+                f"anchored at the step before it, and this rule has a single "
+                f"`maxspan` for the whole pattern -- so a middle `!` would be "
+                f"checked over the wrong range and would match events the "
+                f"analyst never excluded. Refused rather than widened.", DIALECT)
+        if until is not None:
+            raise Refusal(
+                "EQL_MISSING_EVENT_AND_UNTIL_BOTH",
+                "this sequence has both a trailing `![ ... ]` and an `until "
+                "[...]`. Both veto, over the same window, and the rule does not "
+                "say which wins when they disagree. Refused rather than "
+                "picking one -- dropping either changes which rows match.",
+                DIALECT)
+        if negatives[0] == 0:
+            raise Refusal(
+                "EQL_MISSING_EVENT_CANT_BE_FIRST",
+                "a sequence cannot START with `![ ... ]`: there would be "
+                "nothing for the missing event to be missing FROM. Refused "
+                "rather than matched, which would invert the rule.", DIALECT)
+        until = _stage_condition(sequence.steps[last])
+        # THE STAGE STAYS IN `stages`, marked negative. Removing it would leave
+        # one stage, which `Pattern` refuses (`PATTERN_NEEDS_TWO_STAGES`) --
+        # correctly, since "a process happened and no exit followed" is a
+        # two-part rule. Keeping it and marking its polarity gives the stage its
+        # place in the sequence's shape without requiring it to occur.
+        negative_stages = (last,)
     nodes = (
         Read(id="read", selector=SourceSelector(name="any")),
         Pattern(id="pattern", input="read", stages=stages,
                 within=Duration(_span_seconds(sequence.maxspan)),
-                key=key, until=until, until_scope="between",
+                key=key, until=until,
+                until_scope="window" if negatives else "between",
                 ordered=True, time_field="@timestamp",
+                negative_stages=negative_stages,
                 # `runs=N` -> `Pattern.runs`, which the evaluator READS. The
                 # absent clause is `None` here and 1 on the node, so a rule with
                 # no `runs` gets the identical default YARA-L always had.

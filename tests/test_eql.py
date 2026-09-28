@@ -544,13 +544,105 @@ class EverythingElseIsRefusedByName(unittest.TestCase):
         self.assertEqual(caught.exception.code, "EQL_MAXSPAN_TWICE")
 
     def test_a_missing_event_step_is_refused(self):
-        """`![ ... ]` matches an absence. Dropping it would invert the rule."""
+        """A `![ ... ]` IN THE MIDDLE is refused, with the range named.
+
+        It is no longer refused wholesale -- a trailing negative step lowers, and
+        it is the one construct an analyst reaches for constantly. But a
+        negative step in the MIDDLE needs a window anchored at the step before
+        it, and `Pattern` has ONE window for the whole pattern. Vetoing over the
+        whole window instead would exclude events the analyst never excluded,
+        which matches LESS than written -- the opposite failure from a dropped
+        `!`, and just as wrong.
+        """
         with self.assertRaises(Refusal) as caught:
-            parse_eql('sequence with maxspan=1h\n'
-                      '  [ file where true ]\n'
-                      '  ![ process where true ]')
+            lower_eql(parse_eql('sequence with maxspan=1h\n'
+                                 '  [ file where true ]\n'
+                                 '  ![ process where true ]\n'
+                                 '  [ network where true ]'))
         self.assertEqual(caught.exception.code,
-                         "EQL_MISSING_EVENT_NOT_LOWERED")
+                         "EQL_MISSING_EVENT_MUST_BE_LAST")
+
+    def test_a_missing_event_step_LOWERS_and_is_honoured(self):
+        """A trailing `![ ... ]` is the `until` veto over the WINDOW.
+
+        "A process event happened and no exit followed, inside maxspan" is the
+        claim. Executed, because the `!` is the whole point of the construct and
+        a round trip would be satisfied by a rule that dropped it.
+        """
+        from engine import Verdict, evaluate
+        source = ('sequence by host with maxspan=10m\n'
+                  '  [ process where true ]\n'
+                  '  ![ process where event.type == "exit" ]')
+        ir, _ = lower_eql(parse_eql(source))
+        self.assertEqual(len([n for n in ir.nodes
+                              if type(n).__name__ == "Emit"]), 1,
+                         "a dangling output would make the rule unevaluable")
+        with_exit = [{"host": "h1", "event.category": "process",
+                      "@timestamp": 0, "event.type": "start"},
+                     {"host": "h1", "event.category": "process",
+                      "@timestamp": 30, "event.type": "exit"}]
+        without_exit = [{"host": "h1", "event.category": "process",
+                         "@timestamp": 0, "event.type": "start"}]
+        self.assertIs(evaluate(ir, with_exit).verdict, Verdict.NO_MATCH,
+                      "an exit event inside the window excludes the sequence")
+        self.assertIs(evaluate(ir, without_exit).verdict, Verdict.MATCHED,
+                      "no exit event inside the window, so the sequence stands")
+
+    def test_a_missing_event_step_uses_the_WINDOW_scope(self):
+        """Not the "between" scope an `until [...]` clause uses.
+
+        A missing-event step ranges over the WHOLE window: an exit event after
+        the sequence completed still contradicts "no exit followed". Under
+        "between" it would pass straight through, which is the opposite of what
+        `![ ... ]` means.
+        """
+        from engine.ir import Pattern
+        source = ('sequence with maxspan=10m\n'
+                  '  [ process where true ]\n'
+                  '  ![ process where event.type == "exit" ]')
+        ir, _ = lower_eql(parse_eql(source))
+        node = next(n for n in ir.nodes if isinstance(n, Pattern))
+        self.assertEqual(node.until_scope, "window")
+        self.assertIsNotNone(node.until)
+
+    def test_a_missing_event_step_round_trips(self):
+        """`![ ... ]` is rendered BACK with its bang.
+
+        Omitting it would emit a rule that matches when the exit event IS
+        present -- the exact inverse -- and it would look perfectly normal.
+        """
+        source = ('sequence with maxspan=10m\n'
+                  '  [ process where true ]\n'
+                  '  ![ process where event.type == "exit" ]')
+        rendered = _round_trip(source)
+        self.assertIn("![", rendered,
+                      "the bang must survive the round trip or the rendered "
+                      "rule asserts the opposite of what was written")
+        self.assertIn('event.type == "exit"', rendered)
+
+    def test_a_sequence_that_is_ONLY_a_missing_event_is_refused(self):
+        """Nothing to be missing FROM. A `!` in first position has no preceding
+        event to anchor its absence to, and matching anyway would invert it.
+
+        The assertion is that the query is REFUSED, not which code refuses it.
+        A leading `!` can be caught by the explicit check in `_parse_sequence` or
+        by the step parser never producing a negative first step, and pinning
+        one of those would make a harmless refactor look like a behaviour
+        change. What must never happen is this lowering successfully.
+        """
+        with self.assertRaises(Refusal):
+            lower_eql(parse_eql('sequence with maxspan=10m\n'
+                                 '  ![ process where true ]'))
+
+    def test_a_missing_event_AND_an_until_clause_is_refused(self):
+        """Both veto over the same window. The rule does not say which wins."""
+        with self.assertRaises(Refusal) as caught:
+            lower_eql(parse_eql('sequence with maxspan=1h\n'
+                                 '  [ file where true ]\n'
+                                 '  ![ process where true ]\n'
+                                 '  until [ network where true ]'))
+        self.assertEqual(caught.exception.code,
+                         "EQL_MISSING_EVENT_AND_UNTIL_BOTH")
 
     def test_a_per_step_by_is_refused(self):
         """`Pattern.key` is global; EQL allows different fields per step."""

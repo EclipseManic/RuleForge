@@ -81,11 +81,16 @@ def _render_pattern(pattern: Any) -> str:
     runs = getattr(pattern, "runs", 1)
     if runs != 1:
         lines[0] += f" with runs={runs}"
-    for stage in pattern.stages:
+    for index, stage in enumerate(pattern.stages):
         if len(stage) != 1:
             raise Refusal("EQL_RENDER_PATTERN_STAGE",
                           "a sequence stage holds one event condition here.",
                           DIALECT)
+        # A NEGATIVE STAGE IS RENDERED BY THE `until` BRANCH BELOW, not here,
+        # because the lowerer stores it once (as the veto it is) rather than
+        # twice. Rendering it in both places emitted the step twice.
+        if index in getattr(pattern, "negative_stages", ()):
+            continue
         # The category was folded into the condition at lowering time as
         # `event.category == "<name>"`. Reading it back out is what makes the
         # round trip exact; rendering every step as `[any where ...]` would
@@ -100,6 +105,25 @@ def _render_pattern(pattern: Any) -> str:
                 category, condition = name, rest
         lines.append(f"  [{category} where {render_expr(condition)}]")
     if getattr(pattern, "until", None) is not None:
+        # A MISSING-EVENT STEP LOWERED ONTO `until` IS RENDERED AS THE STEP, not
+        # as an `until` clause. The two are semantically the same here, but the
+        # analyst wrote `![ ... ]` and round-tripping to a different construct
+        # invites the reader to wonder whether something was lost. It is
+        # distinguished by the `window` scope: a missing-event step ranges over
+        # the whole window, which is exactly what `until` with no `between`
+        # means.
+        if getattr(pattern, "until_scope", "window") == "window" \
+                and getattr(pattern, "negative_stages", ()):
+            condition = pattern.until
+            category = "any"
+            if isinstance(condition, BoolOp) and condition.op == "and" \
+                    and len(condition.operands) == 2:
+                first, rest = condition.operands
+                name = _category_name(first)
+                if name is not None:
+                    category, condition = name, rest
+            lines.append(f"  ![{category} where {render_expr(condition)}]")
+            return "\n".join(lines)
         condition = pattern.until
         category = "any"
         if isinstance(condition, BoolOp) and condition.op == "and" \
