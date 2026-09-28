@@ -65,6 +65,30 @@ def render(ir: RuleIR) -> str:
                 and hasattr(expr.ref, "full") else str(expr)
             out.append(f"| rename {old} as {alias}")
             continue
+        if kind == "Derive" and getattr(node, "kind", "") == "eval":
+            # `| name := operand`. Only single-operand assigns lower, so a
+            # multi-assignment or computed value here came from somewhere else
+            # and is refused rather than rendered as a bare `:=` that would
+            # compute something different.
+            if len(node.assignments) != 1:
+                raise Refusal(
+                    "CQL_RENDER_ASSIGN_NOT_SINGLE",
+                    "an eval here holds one assignment; anything else is "
+                    "refused rather than flattened.", DIALECT)
+            alias, expr = node.assignments[0]
+            # Strings stay QUOTED on the right of `:=`, even single-token
+            # ones. Elsewhere a bare token and a quoted string mean the same
+            # (`a = lit` compares against the string "lit"), but here they
+            # differ completely: `x := lit` copies FIELD lit, while
+            # `x := "lit"` assigns the CONSTANT. Rendering the constant bare
+            # would turn a fixed value into a field read -- a different rule
+            # that fails open on rows where the field is absent.
+            if isinstance(expr, Literal) and isinstance(expr.value, str):
+                rhs = f'"{expr.value}"'
+            else:
+                rhs = render_expr(expr)
+            out.append(f"| {alias} := {rhs}")
+            continue
         raise Refusal(
             "CQL_RENDER_NODE_UNSUPPORTED",
             f"a {kind} cannot appear in this CQL slice. Rendering it as a "
@@ -90,6 +114,10 @@ def render_expr(expr: Any, nested: bool = False) -> str:
                       "here. Refused rather than misrendered.", DIALECT)
     if isinstance(expr, Comparison):
         return f"{_field(expr.left)} {expr.op} {_value(expr.right)}"
+    if isinstance(expr, FieldExpr):
+        return _field(expr)
+    if isinstance(expr, Literal):
+        return _value(expr)
     raise Refusal("CQL_RENDER_EXPR_UNSUPPORTED",
                   f"a {type(expr).__name__} has no CQL spelling in the "
                   f"lowered subset.", DIALECT)

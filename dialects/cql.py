@@ -44,14 +44,27 @@ class CqlRename:
 
 
 @dataclass(frozen=True, slots=True)
+class CqlAssign:
+    """`| name := expr` where expr is a field, a quoted string, or a number.
+
+    Arithmetic (`a+b`), concatenation (`f+"x"`), and function calls are real
+    CQL but need expression shapes this lowering does not build -- so the RHS
+    is one operand and anything else is refused by name, not approximated.
+    """
+    name: str
+    expr: str
+
+
+@dataclass(frozen=True, slots=True)
 class CqlQuery:
-    """A CQL filter with pipes. Slice 1 allowed only `table`; slice 2 adds
-    `sort` and `rename`. Each pipe appears at most once and in pipeline order
-    -- the parser preserves the order the analyst wrote."""
+    """A CQL filter with pipes. `table`, `sort` and `rename` lower; `:=`
+    assigns one field, string, or number. Each pipe appears at most once and
+    in pipeline order -- the parser preserves the order the analyst wrote."""
     filt: str
     table: tuple[str, ...] = ()
     sort: CqlSort | None = None
     rename: CqlRename | None = None
+    assign: CqlAssign | None = None
 
 
 def parse_cql(text: str) -> CqlQuery:
@@ -79,8 +92,23 @@ def parse_cql(text: str) -> CqlQuery:
     table: tuple[str, ...] = ()
     sort: CqlSort | None = None
     rename: CqlRename | None = None
+    assign: CqlAssign | None = None
     for pipe in segments[1:]:
         text = pipe.strip()
+        # `:=` FIRST, BEFORE THE PAREN CHECK. An assignment RHS may contain a
+        # paren inside a string (`x := "a(b"`), and the `(` branch below is not
+        # quote-aware -- it would misread the string's paren as a function
+        # call. `_find_assign` only matches `:=` outside strings and parens,
+        # so a `:=` inside a value cannot misroute the other way either.
+        at = _find_assign(text)
+        if at >= 0:
+            if assign is not None:
+                raise Refusal("CQL_ASSIGN_TWICE",
+                              "two `| :=` stages; the second overwrites what "
+                              "the first assigned. Refused rather than "
+                              "silently kept.", DIALECT)
+            assign = _parse_assign(text[:at], text[at + 3:])
+            continue
         # Function-call pipes (`sort(...)`) vs space-separated pipes (`table`,
         # `rename`). Split on `(` first: a pipe whose name contains `(` is a
         # call, and anything after the closing paren is refused rather than
@@ -143,10 +171,77 @@ def parse_cql(text: str) -> CqlQuery:
             raise Refusal(
                 "CQL_PIPE_NOT_LOWERED",
                 f"`| {name}` is a real CQL command, but only `| table`, "
-                f"`| sort`, and `| rename` lower today. Refused by name rather "
-                f"than dropped -- dropping a pipe stage silently changes which "
-                f"rows come back.", DIALECT)
-    return CqlQuery(filt=filt, table=table, sort=sort, rename=rename)
+                f"`| sort`, `| rename`, and `| :=` lower today. Refused by "
+                f"name rather than dropped -- dropping a pipe stage silently "
+                f"changes which rows come back.", DIALECT)
+    return CqlQuery(filt=filt, table=table, sort=sort, rename=rename,
+                    assign=assign)
+
+
+def _find_assign(text: str) -> int:
+    """Index of a top-level `:=`, or -1.
+
+    Top-level means outside strings AND outside parens: a `:=` inside
+    `sort(a:=b)` would be a different construct, and one inside `"a:=b"` is
+    data. Either misroute silently changes the rule, so both are excluded.
+    """
+    depth = 0
+    quote: str | None = None
+    index = 0
+    while index < len(text) - 1:
+        char = text[index]
+        if quote is not None:
+            if char == quote:
+                quote = None
+        elif char in ("'", '"'):
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif depth == 0 and char == ":" and text[index + 1] == "=":
+            return index
+        index += 1
+    return -1
+
+
+def _parse_assign(name: str, expr: str) -> CqlAssign:
+
+    """`| name := expr` where expr is one field, string, or number.
+
+    Arithmetic, concatenation, and function calls are real CQL on the right
+    side, and each needs expression shapes this lowering does not build. So
+    the RHS must be a single operand -- anything with an operator, a paren, or
+    a second token is refused with what it is, not approximated as the first
+    piece of it.
+    """
+    name, expr = name.strip(), expr.strip()
+    if not name or not expr:
+        raise Refusal("CQL_ASSIGN_MALFORMED",
+                      f"`| {name} := {expr}` is not `name := expr`. An "
+                      f"assignment needs both sides.", DIALECT)
+    _check_field_name(name, "assign target")
+    # One operand: a quoted string, a number, or a bare field. Anything else
+    # -- `a+b`, `f("x")`, `a+"x"` -- is a bigger expression wearing the shape
+    # of a value, and taking its first token would silently compute something
+    # the analyst did not write.
+    if len(expr) >= 2 and expr[0] == expr[-1] and expr[0] in ("'", '"'):
+        return CqlAssign(name=name, expr=expr)
+    try:
+        float(expr)
+        return CqlAssign(name=name, expr=expr)
+    except ValueError:
+        pass
+    if expr and " " not in expr and all(
+            part.isidentifier() or part.replace("_", "").isalnum()
+            for part in expr.replace("#", "").replace("@", "").split(".")):
+        return CqlAssign(name=name, expr=expr)
+    raise Refusal(
+        "CQL_ASSIGN_EXPRESSION_NOT_LOWERED",
+        f"`| {name} := {expr}` computes something -- arithmetic, concatenation, "
+        f"or a function call -- and this lowering builds single operands, not "
+        f"expressions. Refused rather than approximated as its first piece.",
+        DIALECT)
 
 
 def _check_field_name(column: str, what: str) -> None:

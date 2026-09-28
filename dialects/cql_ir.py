@@ -73,6 +73,18 @@ def lower(query: CqlQuery, rule_id: str = "rule") -> tuple[RuleIR, list[dict]]:
                                           FieldExpr(FieldRef(old))),),
                             projects=False, kind="rename"))
         current = "rename"
+    if query.assign is not None:
+        # `| name := operand`: the new column is ADDED and everything else is
+        # KEPT, which is `eval` semantics, not `rename`. Getting these two
+        # backwards is the exact bug the SPL renderer once shipped (`eval`
+        # rendered as `rename`, dropping the original column), so the kind
+        # here is asserted by test, not left to memory.
+        nodes.append(Derive(id="assign", input=current,
+                            assignments=((query.assign.name,
+                                          _assign_value(
+                                              query.assign.expr)),),
+                            projects=False, kind="eval"))
+        current = "assign"
     if query.table:
         nodes.append(Derive(id="derive", input=current,
                             assignments=tuple(
@@ -83,6 +95,34 @@ def lower(query: CqlQuery, rule_id: str = "rule") -> tuple[RuleIR, list[dict]]:
     nodes.append(Emit(id="out", input=current))
     return (RuleIR(rule_id=rule_id, nodes=tuple(nodes), output="out",
                    title="CQL filter", metadata={"dialect": DIALECT}), [])
+
+
+def _assign_value(expr: str) -> Any:
+    """An assign RHS back into an IR expression.
+
+    Mirrors the parser's contract exactly: one quoted string, one number, or
+    one bare field. Anything else was refused at parse time, so reaching here
+    with anything else means the parser and lowerer disagree -- which is
+    refused rather than papered over, because silently computing a different
+    value is the failure this whole file exists to prevent.
+    """
+    text = expr.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        return Literal(value=text[1:-1])
+    try:
+        return Literal(value=int(text))
+    except ValueError:
+        pass
+    try:
+        return Literal(value=float(text))
+    except ValueError:
+        pass
+    if text and " " not in text:
+        bare = text[1:] if text.startswith("#") else text
+        return FieldExpr(FieldRef(bare))
+    raise Refusal("CQL_ASSIGN_EXPRESSION_NOT_LOWERED",
+                  f":= {text} is not a single field, string, or number.",
+                  DIALECT)
 
 
 def _condition(text: str) -> Any:

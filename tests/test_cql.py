@@ -201,6 +201,68 @@ class SortAndRenameLower(unittest.TestCase):
         self.assertEqual(outcome.refusal["code"], "CQL_PIPE_NOT_LOWERED")
 
 
+class AssignLowersAsEval(unittest.TestCase):
+    """`| name := operand` ADDS a column and keeps the rest -- `eval`
+    semantics, not `rename`. Getting these backwards drops the original
+    column, which is the exact bug the SPL renderer once shipped."""
+
+    def test_field_copy_round_trips(self):
+        self.assertEqual(_round_trip("a = 1 | x := b"), "a = 1 | x := b")
+
+    def test_string_constant_stays_quoted(self):
+        """`x := lit` copies FIELD lit; `x := "lit"` assigns the CONSTANT.
+        Rendering the constant bare would turn a fixed value into a field
+        read -- a different rule that fails open where the field is absent."""
+        self.assertEqual(_round_trip('a = 1 | x := "lit"'),
+                         'a = 1 | x := "lit"')
+
+    def test_number_round_trips(self):
+        self.assertEqual(_round_trip("a = 1 | x := 5"), "a = 1 | x := 5")
+
+    def test_assign_is_eval_not_rename(self):
+        """Structural: the node must say `eval`, because `rename` REMOVES the
+        original column and `eval` KEEPS it. A later term reading the original
+        works under one and finds nothing under the other."""
+        from engine.ir import Derive
+        ir, _ = lower_cql(parse_cql("a = 1 | x := b"))
+        derives = [n for n in ir.nodes if isinstance(n, Derive)]
+        self.assertEqual(len(derives), 1)
+        self.assertEqual(derives[0].kind, "eval")
+
+    def test_arithmetic_rhs_is_refused(self):
+        with self.assertRaises(Refusal) as caught:
+            parse_cql("a = 1 | x := a + b")
+        # `a + b` contains no paren/quote issue; the refusal comes from the
+        # operand check. Either code below names the real reason.
+        self.assertIn(caught.exception.code,
+                      ("CQL_ASSIGN_EXPRESSION_NOT_LOWERED",))
+
+    def test_function_rhs_is_refused(self):
+        with self.assertRaises(Refusal) as caught:
+            parse_cql("a = 1 | x := f(y)")
+        self.assertIn(caught.exception.code,
+                      ("CQL_ASSIGN_EXPRESSION_NOT_LOWERED",
+                       "CQL_PIPE_NOT_LOWERED"))
+
+    def test_double_assign_is_refused(self):
+        with self.assertRaises(Refusal) as caught:
+            parse_cql("a = 1 | x := 1 | y := 2")
+        self.assertEqual(caught.exception.code, "CQL_ASSIGN_TWICE")
+
+    def test_a_paren_inside_a_string_does_not_misroute(self):
+        """`x := "a(b"` has a paren inside the value. The `(` branch is not
+        quote-aware, so `:=` is checked first -- otherwise the string's paren
+        misreads as a function call."""
+        self.assertEqual(_round_trip('a = 1 | x := "a(b"'),
+                         'a = 1 | x := "a(b"')
+
+    def test_no_artifact_is_produced_for_an_expression_rhs(self):
+        outcome = jobs.author("logscale", "a = 1 | x := a + b", "r1")
+        self.assertFalse(outcome.rendered)
+        self.assertEqual(outcome.refusal["code"],
+                         "CQL_ASSIGN_EXPRESSION_NOT_LOWERED")
+
+
 class MembershipLowersAsDisjunction(unittest.TestCase):
     """`in(field, [...])` IS a disjunction -- `field` equal to any one of the
     values -- so it lowers exactly onto `BoolOp("or", ...)` with no new node
