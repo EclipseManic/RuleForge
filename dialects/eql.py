@@ -55,10 +55,62 @@ class EqlSequence:
 
 
 @dataclass(frozen=True, slots=True)
+class EqlSample:
+    """A `sample by k1, k2 steps...` -- unordered events sharing join keys.
+
+    At least one `by` key (EQL requires it) and at most five filters (EQL caps
+    it). No `maxspan`, no `until`, no `runs`: `sample` takes none of those, so
+    any of them here is a syntax error rather than a refused feature.
+    """
+    by: tuple[str, ...]
+    steps: tuple[EqlSequenceStep, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class EqlQuery:
-    """Slice 1 parses single events; slice 2 adds sequences."""
+    """Slice 1 parses single events; slice 2 adds sequences; sample is here."""
     event: EqlEvent | None = None
     sequence: EqlSequence | None = None
+    sample: EqlSample | None = None
+
+
+def _parse_sample(text: str) -> EqlSample:
+    """Parse `sample by k1, k2 [cat where cond] ...`.
+
+    `sample` shares the step syntax with `sequence` -- categories, conditions,
+    the 5-filter cap -- but not the window machinery. There is deliberately no
+    `maxspan`/`until`/`runs` handling here: EQL does not allow them on `sample`,
+    so accepting any would be inventing syntax, not lowering it.
+    """
+    rest = text[len("sample"):].strip()
+    if not rest.lower().startswith("by "):
+        raise Refusal(
+            "EQL_SAMPLE_NEEDS_BY",
+            "`sample` requires at least one `by` join key -- without shared "
+            "keys it is just unrelated events, which is a no-op disguised as "
+            "a rule. Refused rather than rendered as one.", DIALECT)
+    segment, _, rest = rest.partition("[")
+    by = tuple(f.strip() for f in segment[3:].split(",") if f.strip())
+    if not by:
+        raise Refusal("EQL_SAMPLE_BY_EMPTY",
+                      "`sample by` with no fields joins on nothing.", DIALECT)
+    for name in by:
+        if not all(part.isidentifier() for part in name.split(".")):
+            raise Refusal("EQL_JOIN_KEY_NOT_A_NAME",
+                          f"`{name}` is not a plain dotted field name.",
+                          DIALECT)
+    rest = "[" + rest
+    steps = _parse_steps(rest)
+    if not steps:
+        raise Refusal("EQL_SAMPLE_NO_STEPS",
+                      "`sample` with no event steps matches nothing.", DIALECT)
+    if len(steps) > 5:
+        raise Refusal(
+            "EQL_SAMPLE_TOO_MANY_FILTERS",
+            f"`sample` takes at most 5 filters and this has {len(steps)}. The "
+            f"6th would silently not filter, so it is refused rather than "
+            f"truncated.", DIALECT)
+    return EqlSample(by=by, steps=tuple(steps))
 
 
 #: The event categories Elastic documents. `any` matches every category.
@@ -83,13 +135,8 @@ def parse_eql(text: str) -> EqlQuery:
     if keyword == "sequence":
         return EqlQuery(sequence=_parse_sequence(stripped))
     if keyword == "sample":
+        return EqlQuery(sample=_parse_sample(stripped))
 
-        raise Refusal(
-            "EQL_SAMPLE_NOT_LOWERED",
-            "`sample` matches an unordered set of events sharing join keys, "
-            "which is `Pattern` with `ordered=False` -- but that lowering is "
-            "not written yet. A single `[ category where condition ]` does "
-            "lower today.", DIALECT)
     # A `|` ANYWHERE at the top level is pipe syntax, not just a first word
     # literally reading "pipe". `[file where true] | head 5` starts with `[`,
     # so the keyword check above never fires and it fell through to the generic

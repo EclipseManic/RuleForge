@@ -823,34 +823,75 @@ def eval_pattern(node: Pattern, rows: list[Row],
             # THE WINDOW IS A REAL BOUND. `within` was accepted, validated, and
             # referenced nowhere, so "credential access then privileged logon
             # within 10 minutes" matched across any gap whatsoever.
-            start_time = times[start_index]
-            if start_time is None:
-                ctx.add(Caveat(
-                    "PATTERN_UNDECIDABLE_TIME",
-                    "the first event of a candidate sequence has no usable "
-                    "timestamp, so the window cannot be established and this "
-                    "candidate was not decided", 1))
-                continue
-            window_end = start_time + node.within.seconds
+            # NO WINDOW, NO WINDOW CHECKS. `within=None` means unbounded -- an
+            # EQL `sample` has no `maxspan` -- so there is no start time to
+            # establish and no end to fall past. The start_time requirement
+            # above is skipped for the same reason: it exists to bound the
+            # window, and with no window there is nothing to bound.
+            # `window_end=None` flows into the two checks below, both of which
+            # treat None as "no bound" rather than as zero.
+            if node.within is None:
+                window_end = None
+            else:
+                start_time = times[start_index]
+                if start_time is None:
+                    ctx.add(Caveat(
+                        "PATTERN_UNDECIDABLE_TIME",
+                        "the first event of a candidate sequence has no usable "
+                        "timestamp, so the window cannot be established and this "
+                        "candidate was not decided", 1))
+                    continue
+                window_end = start_time + node.within.seconds
 
             consumed: list[Row] = [start_row]
             # Index of the last row that matched a stage, tracked as it goes:
             # group.index(consumed[-1]) later is O(n) and wrong when a row
             # appears twice, and a veto range from a wrong index is a wrong rule.
             last_matched_index = start_index
+            # Indices already consumed, for the unordered search below. A set,
+            # because the same row must not satisfy two stages -- matching one
+            # event against every stage would make a single row look like a
+            # whole sample.
+            consumed_idx = {start_index}
             ok = True
             cursor = start_index + 1
             for stage in node.stages[1:]:
                 found = False
                 saw_untimed_match = False
+                # UNORDERED SEARCHES THE WHOLE GROUP, NOT JUST WHAT FOLLOWS.
+                #
+                # An EQL `sample` has no order: its stages match events wherever
+                # they sit in the group. The forward walk below would require
+                # stage order to equal row order, which is exactly what
+                # unordered denies. So when `ordered` is False, each stage scans
+                # every unconsumed row instead. Ordered patterns take the
+                # original path byte-for-byte -- this branch cannot change what
+                # a sequence means, because no sequence reaches it.
+                if not node.ordered:
+                    for scan in range(len(group)):
+                        if scan in consumed_idx:
+                            continue
+                        if _stage_matches(stage, group[scan], ctx):
+                            consumed.append(group[scan])
+                            consumed_idx.add(scan)
+                            last_matched_index = scan
+                            found = True
+                            break
+                    if not found:
+                        ok = False
+                        break
+                    continue
                 while cursor < len(group):
 
                     candidate = group[cursor]
                     candidate_time = times[cursor]
                     cursor += 1
-                    if candidate_time is not None and candidate_time > window_end:
+                    if window_end is not None and candidate_time is not None \
+                            and candidate_time > window_end:
                         # Past the window. `ordered` means the list is sorted, so
-                        # nothing later can be inside it either.
+                        # nothing later can be inside it either. With no window
+                        # (`within=None`) this never fires -- every candidate is
+                        # eligible by time, which is what unbounded means.
                         ok = False
                         break
                     if _stage_matches(stage, candidate, ctx):

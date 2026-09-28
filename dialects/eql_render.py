@@ -54,14 +54,11 @@ def render(ir: RuleIR) -> str:
 def _render_pattern(pattern: Any) -> str:
     """A `Pattern` back to `sequence` text.
 
-    Only the shapes slice 2 lowers are renderable: ordered stages, a real
-    `within`, an optional global `key`, and an optional `until`. Anything else
+    Only the shapes the lowerer produces are renderable. Anything else
     is refused rather than flattened, for the same reason an `Aggregate` is.
     """
     if not getattr(pattern, "ordered", True):
-        raise Refusal("EQL_RENDER_UNORDERED_PATTERN",
-                      "this pattern is unordered, which is `sample` territory, "
-                      "and `sample` is not lowered yet.", DIALECT)
+        return _render_sample(pattern)
     lines = []
     if getattr(pattern, "key", ()):
         lines.append("sequence by " + ", ".join(
@@ -131,6 +128,47 @@ def _category_name(expr: Any) -> str | None:
     right = expr.right
     value = right.value if isinstance(right, Literal) else right
     return value if isinstance(value, str) else None
+
+
+def _render_sample(pattern: Any) -> str:
+    """An unordered, windowless `Pattern` back to `sample by ...` text.
+
+    Only the shape the lowerer produces is renderable: `ordered=False`,
+    `within=None`, a non-empty `key`, and no `until`. Anything else is refused
+    rather than flattened into a `sample`, because a windowed or ordered
+    pattern is not a sample and rendering it as one would drop the window or
+    the order.
+    """
+    if getattr(pattern, "within", None) is not None:
+        raise Refusal("EQL_RENDER_SAMPLE_WITH_WINDOW",
+                      "this unordered pattern has a window, which `sample` "
+                      "does not take. Refused rather than dropped.", DIALECT)
+    if getattr(pattern, "until", None) is not None:
+        raise Refusal("EQL_RENDER_SAMPLE_WITH_UNTIL",
+                      "this unordered pattern has an expiry, which `sample` "
+                      "does not take. Refused rather than dropped.", DIALECT)
+    key = getattr(pattern, "key", ())
+    if not key:
+        raise Refusal("EQL_RENDER_SAMPLE_NO_KEY",
+                      "`sample` requires at least one `by` join key.",
+                      DIALECT)
+    lines = ["sample by " + ", ".join(
+        ref.name if hasattr(ref, "name") else str(ref) for ref in key)]
+    for stage in pattern.stages:
+        if len(stage) != 1:
+            raise Refusal("EQL_RENDER_PATTERN_STAGE",
+                          "a sample filter holds one event condition here.",
+                          DIALECT)
+        condition = stage[0]
+        category = "any"
+        if isinstance(condition, BoolOp) and condition.op == "and" \
+                and len(condition.operands) == 2:
+            first, rest = condition.operands
+            name = _category_name(first)
+            if name is not None:
+                category, condition = name, rest
+        lines.append(f"  [{category} where {render_expr(condition)}]")
+    return "\n".join(lines)
 
 
 def _format_span(seconds: int) -> str:

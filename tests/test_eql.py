@@ -300,11 +300,76 @@ class EverythingElseIsRefusedByName(unittest.TestCase):
         self.assertEqual(caught.exception.code,
                          "EQL_PER_STEP_BY_NOT_LOWERED")
 
-    def test_sample_is_refused_with_the_missing_piece_named(self):
+class SamplesLowerOntoUnorderedPatterns(unittest.TestCase):
+    """`sample by keys steps...` is an unordered, windowless, key-grouped set
+    of events -- which is `Pattern` with `ordered=False`, `within=None`, and
+    `key` from `by`. No `maxspan` (samples take none), no `until` (not
+    allowed), no `time_field` (unordered needs none, and guessing one would
+    order the match by an unrelated column)."""
+
+    def test_a_sample_round_trips(self):
+        self.assertEqual(
+            _round_trip('sample by host\n'
+                        '  [ file where file.extension == "exe" ]\n'
+                        '  [ process where true ]'),
+            'sample by host\n'
+            '  [file where file.extension == "exe"]\n'
+            '  [process where true]')
+
+    def test_multiple_keys_round_trip(self):
+        self.assertEqual(
+            _round_trip('sample by host, os\n'
+                        '  [ file where file.extension == "exe" ]\n'
+                        '  [ process where true ]'),
+            'sample by host, os\n'
+            '  [file where file.extension == "exe"]\n'
+            '  [process where true]')
+
+    def test_step_categories_survive(self):
+        rendered = _round_trip(
+            'sample by host\n'
+            '  [ file where file.extension == "exe" ]\n'
+            '  [ network where true ]')
+        self.assertIn("[file where", rendered)
+        self.assertIn("[network where", rendered)
+        self.assertNotIn("[any where", rendered)
+
+    def test_sample_without_by_is_refused(self):
+        """Without shared keys a sample is unrelated events -- a no-op."""
         with self.assertRaises(Refusal) as caught:
-            parse_eql("sample by host\n"
-                      '  [ file where file.extension == "exe" ]')
-        self.assertEqual(caught.exception.code, "EQL_SAMPLE_NOT_LOWERED")
+            parse_eql('sample\n'
+                      '  [ file where true ]')
+        self.assertEqual(caught.exception.code, "EQL_SAMPLE_NEEDS_BY")
+
+    def test_more_than_five_filters_is_refused(self):
+        """EQL caps samples at 5 filters; the 6th would silently not filter."""
+        with self.assertRaises(Refusal) as caught:
+            parse_eql('sample by host\n'
+                      '  [ file where true ]\n'
+                      '  [ process where true ]\n'
+                      '  [ network where true ]\n'
+                      '  [ dns where true ]\n'
+                      '  [ registry where true ]\n'
+                      '  [ library where true ]')
+        self.assertEqual(caught.exception.code,
+                         "EQL_SAMPLE_TOO_MANY_FILTERS")
+
+    def test_sample_executes_unordered(self):
+        """Order-independent: the same events in reverse chronological order
+        still match, because a sample has no order to violate."""
+        from engine import Verdict, evaluate
+        ir, _ = lower_eql(parse_eql(
+            'sample by host\n'
+            '  [ file where file.extension == "exe" ]\n'
+            '  [ process where true ]'))
+        rows = [
+            {"event.category": "process", "host": "h1", "@timestamp": 100},
+            {"event.category": "file", "file.extension": "exe",
+             "host": "h1", "@timestamp": 0},
+        ]
+        result = evaluate(ir, rows)
+        self.assertIs(result.verdict, Verdict.MATCHED,
+                      "a sample matches regardless of event order")
 
     def test_the_wildcard_operator_is_refused(self):
         with self.assertRaises(Refusal) as caught:

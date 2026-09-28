@@ -884,7 +884,14 @@ class Pattern:
     id: str
     input: str
     stages: tuple[tuple[Any, ...], ...]
-    within: Duration
+    #: The window, or None for UNBOUNDED. A `sequence` always has a `maxspan`,
+    #: so `within` is always set for one -- but EQL `sample` matches an
+    #: unordered set of events with no time bound at all, and there is no
+    #: duration that means "no bound" (`within=0` would mean "same timestamp",
+    #: which is a different rule). None means the evaluator skips every
+    #: window check rather than inventing one. YARA-L and every other current
+    #: producer passes an explicit window, so nothing that works today changes.
+    within: Duration | None = None
     key: tuple[FieldRef, ...] = ()
     until: Any = None
     #: WHAT RANGE `until` IS CHECKED OVER. The two dialects that use this node
@@ -953,6 +960,14 @@ class Pattern:
                 f"'between'. A misspelled scope would otherwise behave like the "
                 f"default and silently veto over the wrong range, which is the "
                 f"same failure as not having the field at all.", "Pattern")
+        if self.until is not None and self.until_scope == "window" \
+                and self.within is None:
+            raise Refusal(
+                "PATTERN_UNTIL_NEEDS_WINDOW",
+                "a `window`-scope `until` vetoes anywhere inside the window, "
+                "and with no window there is nothing to be inside of. Either "
+                "give the pattern a window or use the `between` scope, which "
+                "needs only the matched events.", "Pattern")
         if self.ordered and self.time_field is None:
             raise Refusal(
                 "PATTERN_REQUIRES_TIME_FIELD",

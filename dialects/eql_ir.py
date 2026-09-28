@@ -42,9 +42,12 @@ from engine.values import Refusal
 
 
 def lower(query: EqlQuery, rule_id: str = "rule") -> tuple[RuleIR, list[dict]]:
-    """A single event -> `Read` -> `Filter` -> `Emit`; a sequence -> `Pattern`."""
+    """A single event -> `Read` -> `Filter` -> `Emit`; a sequence or a sample
+    -> `Pattern`."""
     if query.sequence is not None:
         return _lower_sequence(query.sequence, rule_id)
+    if query.sample is not None:
+        return _lower_sample(query.sample, rule_id)
     event = query.event
     assert event is not None
     condition = _condition(event.condition)
@@ -102,6 +105,30 @@ def _lower_sequence(sequence, rule_id: str) -> tuple[RuleIR, list[dict]]:
     )
     return (RuleIR(rule_id=rule_id, nodes=nodes, output="out",
                    title=f"sequence of {len(stages)} events",
+                   metadata={"dialect": DIALECT}), [])
+
+
+def _lower_sample(sample, rule_id: str) -> tuple[RuleIR, list[dict]]:
+    """`sample by keys steps...` onto `Pattern` with `ordered=False`.
+
+    The mapping: stages from the steps (categories folded in, exactly as for
+    sequences), `key` from `by`, `ordered=False`, `within=None` (no time bound
+    -- EQL samples can run on data with no timestamp at all), and no `until`
+    (EQL does not allow one on `sample`). `time_field` stays unset because an
+    unordered pattern needs none, and guessing one would order the match by an
+    unrelated column.
+    """
+    stages = tuple((_stage_condition(step),) for step in sample.steps)
+    key = tuple(FieldRef(name) for name in sample.by)
+    nodes = (
+        Read(id="read", selector=SourceSelector(name="any")),
+        Pattern(id="pattern", input="read", stages=stages, within=None,
+                key=key, until=None, ordered=False),
+        Emit(id="out", input="pattern"),
+    )
+    return (RuleIR(rule_id=rule_id, nodes=nodes, output="out",
+                   title=f"sample of {len(stages)} events by "
+                         f"{', '.join(sample.by)}",
                    metadata={"dialect": DIALECT}), [])
 
 
