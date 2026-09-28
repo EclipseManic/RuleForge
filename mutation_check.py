@@ -197,6 +197,25 @@ MUTATIONS = [
      "engine/nodes.py",
      "            for _repeat in range(node.runs):",
      "            for _repeat in range(1):"),
+
+    # MED-4. The `until` veto used to `return False` on the first row past the
+    # window end -- an early exit that is only valid when the group's rows are
+    # in TIME order. An unordered pattern's rows are in ARRIVAL order, so the
+    # scan stopped early and MISSED a veto that was inside the window, letting a
+    # rule reading "and no logout in that window" fire anyway. `continue` is the
+    # entire fix, and the test is why it can be verified: an unordered
+    # window-scope `until` is now refused by the node, so this mutation needs a
+    # hand-built node to be observable at all.
+    ("M25 until veto early-exits on the first out-of-window row",
+     "engine/nodes.py",
+     "        if window_end is not None and moment > window_end:\n"
+     "            # `continue`, NOT `return False`. This single keyword is the whole\n"
+     "            # bug: the group's order is not the timeline's order unless the\n"
+     "            # pattern is ordered, so an out-of-window row says nothing about the\n"
+     "            # rows after it.\n"
+     "            continue",
+     "        if window_end is not None and moment > window_end:\n"
+     "            return False"),
 ]
 
 

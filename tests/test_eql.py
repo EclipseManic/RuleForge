@@ -208,6 +208,139 @@ class SequencesExecuteWithEqlUntilSemantics(unittest.TestCase):
                       "the expiry comes after the sequence completed, so "
                       "under EQL the match stands")
 
+    def test_an_UNORDERED_pattern_does_not_early_exit_the_until_veto(self):
+        """MED-4, and the case that makes it observable.
+
+        The `until` veto used to `return False` the moment it saw a row whose
+        timestamp was past the window end. That early exit is only valid if the
+        group's rows are in TIME order. An unordered pattern's rows are in
+        ARRIVAL order, so a row past the window sitting in the middle of the
+        array would abort the scan while a matching row still sat behind it --
+        and a rule reading "and no logout in that window" would fire anyway.
+
+        The rows below are deliberately out of time order: t=50 is past the
+        10-second window end, and the logout that must veto is at t=20, sitting
+        AFTER it in the array. With the early exit the veto is never reached;
+        with `continue` it is. Same rows, same rule, opposite answers, and only
+        an unordered pattern distinguishes them -- an ordered group would sort
+        itself first and hide the bug entirely.
+        """
+        from engine import Verdict, evaluate
+        from engine.ir import (Comparison, Duration, Emit, FieldExpr, FieldRef,
+                               Literal, Pattern, Read, RuleIR, SourceSelector)
+        veto = Comparison("=", FieldExpr(FieldRef("kind")), Literal("logout"))
+        node = Pattern(
+            id="p", input="r",
+            stages=((Comparison("=", FieldExpr(FieldRef("kind")),
+                                Literal("open")),),
+                    (Comparison("=", FieldExpr(FieldRef("kind")),
+                                Literal("close")),)),
+            within=Duration(10), time_field="ts", ordered=False,
+            until=veto, until_scope="window")
+        ir = RuleIR(rule_id="t", nodes=(
+            Read(id="r", selector=SourceSelector(name="any")),
+            node, Emit(id="out", input="p")), output="out", title="t")
+        # ARRIVAL order, and the timestamps are what make this bite: the window
+        # is [0, 10]. t=50 is PAST it and sits early in the array; the logout at
+        # t=8 is INSIDE it and sits after. An early exit at t=50 would decide the
+        # veto before ever reaching t=8.
+        unordered = [{"kind": "open", "ts": 0}, {"kind": "close", "ts": 50},
+                     {"kind": "x", "ts": 3}, {"kind": "logout", "ts": 8},
+                     {"kind": "close", "ts": 5}]
+        result = evaluate(ir, unordered)
+        self.assertIs(result.verdict, Verdict.NO_MATCH,
+                      "a logout at t=8 is inside the 10s window from t=0, so "
+                      "the sequence is vetoed; an early exit on the t=50 row "
+                      "would have missed it and matched")
+
+    def test_the_until_veto_still_fires_when_the_row_IS_out_of_window(self):
+        """The other direction, so `continue` cannot become "never veto".
+
+        A logout OUTSIDE the window must not veto: "no logout within 10 minutes"
+        is not "no logout ever", and treating it as the latter would narrow the
+        rule and hide real sequences.
+        """
+        from engine import Verdict, evaluate
+        from engine.ir import (Comparison, Duration, Emit, FieldExpr, FieldRef,
+                               Literal, Pattern, Read, RuleIR, SourceSelector)
+        veto = Comparison("=", FieldExpr(FieldRef("kind")), Literal("logout"))
+        node = Pattern(
+            id="p", input="r",
+            stages=((Comparison("=", FieldExpr(FieldRef("kind")),
+                                Literal("open")),),
+                    (Comparison("=", FieldExpr(FieldRef("kind")),
+                                Literal("close")),)),
+            within=Duration(10), time_field="ts", ordered=False,
+            until=veto, until_scope="window")
+        ir = RuleIR(rule_id="t", nodes=(
+            Read(id="r", selector=SourceSelector(name="any")),
+            node, Emit(id="out", input="p")), output="out", title="t")
+        ordered_rows = [{"kind": "open", "ts": 0}, {"kind": "close", "ts": 5},
+                        {"kind": "logout", "ts": 900}]
+        self.assertIs(evaluate(ir, ordered_rows).verdict, Verdict.MATCHED,
+                      "a logout at t=900 is far outside the 10s window, so it "
+                      "must not veto")
+
+    def test_the_between_scope_still_works_on_an_unordered_pattern(self):
+        """The refusal must not be over-broad. `between` bounds the veto by the
+        MATCHED EVENTS rather than the clock, so it needs no ordering, and it is
+        the scope an unordered pattern should use. EQL `sample` has no `until`
+        at all today, so this is the shape a future one would take."""
+        from engine.ir import Comparison, FieldExpr, FieldRef, Pattern
+        node = Pattern(id="p", input="r",
+                       stages=((Literal(True),), (Literal(True),)),
+                       within=None, ordered=False,
+                       until=Comparison("=", FieldExpr(FieldRef("x")),
+                                        Literal(1)),
+                       until_scope="between")
+        self.assertEqual(node.until_scope, "between")
+        self.assertFalse(node.ordered)
+
+    def test_a_sequence_is_EXECUTED_end_to_end_not_only_lowered(self):
+        """The coverage hole that let a real bug through 869 green tests.
+
+        Adding `runs=` to the `Pattern(...)` tuple dropped the trailing `Emit`
+        node, so every sequence had a dangling `output` and evaluated to
+        `NOT_EVALUATED` -- and the whole suite stayed green, because the EQL
+        tests asserted the IR node LIST and the rendered text, and nothing
+        between a lowerer and a renderer executes a rule.
+
+        So this asserts a sequence actually produces rows, and that a failing
+        sequence produces none. Without it, a dropped node, a wrong `output`, or
+        an evaluator that returns nothing all look identical to "lowering
+        succeeded".
+        """
+        from engine import Verdict, evaluate
+        rows = [{"event.category": "file", "@timestamp": 0,
+                 "file.extension": "exe"},
+                {"event.category": "process", "@timestamp": 100}]
+
+        matching, _ = lower_eql(parse_eql(
+            'sequence with maxspan=15m\n'
+            '  [ file where file.extension == "exe" ]\n'
+            '  [ process where true ]'))
+        result = evaluate(matching, [dict(r) for r in rows])
+        self.assertIs(result.verdict, Verdict.MATCHED)
+        self.assertEqual(len(result.rows), 1,
+                         "the sequence must produce a row, and the IR must "
+                         "name a node that exists to emit it")
+
+        # And the negative, so a rule that matches everything cannot pass by
+        # simply emitting: a sequence whose second stage cannot be satisfied
+        # must produce NO ROWS. The assertion is on the row count rather than
+        # the verdict, because the verdict taxonomy here is noisier than this
+        # test's purpose -- a row carrying the engine's internal `_absent`
+        # sentinel makes a decided non-match come back NOT_EVALUATED, which is
+        # a separate question about caveat propagation.
+        nonmatching, _ = lower_eql(parse_eql(
+            'sequence with maxspan=15m\n'
+            '  [ file where file.extension == "exe" ]\n'
+            '  [ process where event.type == "creation" ]'))
+        self.assertEqual(len(evaluate(nonmatching,
+                                      [dict(r) for r in rows]).rows), 0,
+                         "a sequence whose stages cannot all be satisfied must "
+                         "not emit a row")
+
     def test_an_expiry_between_the_matches_expires_it(self):
         """The second stage names only the LATER process row, so the expiry
         row sits strictly between the two matched rows. A `where true` stage

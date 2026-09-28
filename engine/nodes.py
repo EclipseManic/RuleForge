@@ -1303,15 +1303,46 @@ def _any_satisfies(condition: Any, group: list[Row], low: int, high: int,
 
 
 def _window_satisfies(condition: Any, group: list[Row], times: list[Decimal | None],
-                      start_index: int, window_end: Decimal,
+                      start_index: int, window_end: Decimal | None,
                       ctx: EvaluationContext) -> bool:
-    """Does any row inside [start_index, window_end] satisfy `condition`?"""
+    """Does any row inside [start_index, window_end] satisfy `condition`?
+
+    ORDER-INDEPENDENT, AND THAT IS THE FIX. This used to `return False` as soon
+    as it saw a row whose timestamp was past `window_end`, which is an EARLY EXIT
+    that is only valid if `times` is ascending. An `ordered=False` group -- an
+    EQL `sample`, or any unordered pattern -- is in row order, not time order, so
+    the first row past the window could sit in the middle of the array with a
+    matching row still ahead of it. The scan stopped early and the veto was
+    MISSED: a rule reading "and no logout in that window" would fire even though
+    a logout sat inside the window.
+
+    That is MED-4, and it was latent rather than live for a defensible reason: no
+    lowerer can currently reach this branch with an unordered group. EQL is the
+    only producer that sets `until`, and it always sets `ordered=True` with
+    `until_scope="between"`, which uses `_any_satisfies` and never comes here.
+    The `window` scope is the default and YARA-L's, and YARA-L sets no `until` at
+    all. So this was reachable only by hand -- which is precisely the kind of
+    thing that becomes live the moment someone wires `until` into a second
+    lowerer, and the fix belongs here rather than in a comment warning people off.
+
+    `window_end=None` (an unbounded pattern) means every row from `start_index`
+    onwards is inside the window, since there is no window to fall past. The
+    `until`-scope validation on `Pattern` already refuses a `window`-scope `until`
+    with no window, so this is defence in depth, not a new behaviour.
+    """
     for offset in range(start_index, len(group)):
         moment = times[offset]
         if moment is None:
+            # An un-timestamped row cannot be placed inside a window, so it is
+            # not evidence either way. Skipping it is the same choice the
+            # candidate walk makes, and it is the one that cannot invent a veto.
             continue
-        if moment > window_end:
-            return False
+        if window_end is not None and moment > window_end:
+            # `continue`, NOT `return False`. This single keyword is the whole
+            # bug: the group's order is not the timeline's order unless the
+            # pattern is ordered, so an out-of-window row says nothing about the
+            # rows after it.
+            continue
         if _stage_matches((condition,), group[offset], ctx):
             return True
     return False
