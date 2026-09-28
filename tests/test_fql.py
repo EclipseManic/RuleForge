@@ -86,6 +86,26 @@ class PrecedenceAndGrouping(unittest.TestCase):
         """`hostname:'a+b'` is one term whose value contains the separator."""
         self.assertEqual(_round_trip("hostname:'a+b'"), "hostname:'a+b'")
 
+    def test_a_quoted_and_is_not_cql(self):
+        """THE BUG. The CQL-shape gate scanned raw text, so a VALUE containing
+        the word was refused as the other language. The gate now runs on the
+        text with quoted regions blanked, like the splitter behind it."""
+        self.assertEqual(_round_trip("hostname:'a and b'"),
+                         "hostname:'a and b'")
+
+    def test_a_quoted_or_is_not_cql(self):
+        self.assertEqual(_round_trip("hostname:'a or b'"),
+                         "hostname:'a or b'")
+
+    def test_a_quoted_pipe_is_not_cql(self):
+        self.assertEqual(_round_trip("hostname:'a|b'"), "hostname:'a|b'")
+
+    def test_a_real_pipe_is_still_refused_as_cql(self):
+        """The gate must still fire outside quotes, or the two languages mix."""
+        with self.assertRaises(Refusal) as caught:
+            parse_fql('hostname:"x" | table a')
+        self.assertEqual(caught.exception.code, "FQL_NOT_CQL")
+
 
 class EverythingElseIsRefusedByName(unittest.TestCase):
     def test_cql_pipes_are_refused_as_cql(self):
@@ -123,10 +143,21 @@ class EverythingElseIsRefusedByName(unittest.TestCase):
             lower_fql(parse_fql(text))
         self.assertEqual(caught.exception.code, "FQL_TOO_MANY_PROPERTIES")
 
+    def test_a_grouped_twenty_first_property_is_refused(self):
+        """BOTH SIDES RECURSE. An earlier `count_terms` recursed only on the
+        `,` side, so `a+(b,c)` counted 2 instead of 3 -- and nineteen flat
+        terms plus `(f19,f20)` counted 20, putting 21 properties past a guard
+        whose docstring says the 21st silently stops filtering server-side."""
+        self.assertEqual(count_terms("a:'1'+(b:'2',c:'3')"), 3)
+        attack = "+".join(f"f{i}:'v'" for i in range(19)) + "+(f19:'v',f20:'v')"
+        self.assertEqual(count_terms(attack), MAX_PROPERTIES + 1)
+        with self.assertRaises(Refusal) as caught:
+            lower_fql(parse_fql(attack))
+        self.assertEqual(caught.exception.code, "FQL_TOO_MANY_PROPERTIES")
+
     def test_exactly_twenty_properties_still_works(self):
         text = "+".join(f"f{i}:'v'" for i in range(MAX_PROPERTIES))
-        self.assertEqual(
-            jobs.author("falcon", text, "r1").rendered.replace("'", "'"), text)
+        self.assertEqual(jobs.author("falcon", text, "r1").rendered, text)
 
     def test_no_artifact_is_produced_for_cql_input(self):
         outcome = jobs.author("falcon", 'hostname = "x"', "r1")

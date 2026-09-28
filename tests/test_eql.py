@@ -115,6 +115,51 @@ class SequencesLowerOntoPattern(unittest.TestCase):
         self.assertIn("[network where", rendered)
         self.assertNotIn("[any where", rendered)
 
+    def test_a_bracket_inside_a_string_does_not_end_the_step(self):
+        """THE BUG. The splitter found blocks quote-aware, but the closer took
+        `body.index("]")` -- the first one, even inside a string. So a condition
+        ending in `"]"` truncated there and the rest misread as a `by` trailer,
+        refusing with EQL_PER_STEP_BY_NOT_LOWERED for a rule with no `by`."""
+        self.assertEqual(
+            _round_trip('sequence with maxspan=15m\n'
+                        '  [ file where name == "]" ]\n'
+                        '  [ process where true ]'),
+            'sequence with maxspan=15m\n'
+            '  [file where name == "]"]\n'
+            '  [process where true]')
+
+    def test_a_pipe_is_refused_by_name_not_generically(self):
+        """`[file where true] | head 5` starts with `[`, so the first-word
+        keyword check never fires. The top-level `|` check names it."""
+        with self.assertRaises(Refusal) as caught:
+            parse_eql('[ file where true ] | head 5')
+        self.assertEqual(caught.exception.code, "EQL_PIPE_NOT_LOWERED")
+
+    def test_a_pipe_inside_a_string_is_not_a_pipe(self):
+        self.assertEqual(
+            _round_trip('sequence with maxspan=15m\n'
+                        '  [ file where name == "a|b" ]\n'
+                        '  [ process where true ]'),
+            'sequence with maxspan=15m\n'
+            '  [file where name == "a|b"]\n'
+            '  [process where true]')
+
+    def test_a_leading_until_is_refused_by_name(self):
+        with self.assertRaises(Refusal) as caught:
+            parse_eql('until [ process where true ]')
+        self.assertEqual(caught.exception.code, "EQL_UNTIL_WITHOUT_SEQUENCE")
+
+    def test_an_until_missing_event_is_refused(self):
+        """GAP-7 CLOSED. `until ![ ... ]` negates the expiry, which the IR
+        cannot express. The branch fired correctly when probed, but no test
+        pinned it -- flipping `allow_bang` kept the suite green. Now pinned."""
+        with self.assertRaises(Refusal) as caught:
+            parse_eql('sequence with maxspan=15m\n'
+                      '  [ file where true ]\n'
+                      '  [ process where true ]\n'
+                      '  until ![ process where true ]')
+        self.assertEqual(caught.exception.code, "EQL_UNTIL_MISSING_EVENT")
+
     def test_a_sequence_without_maxspan_is_refused_at_lowering(self):
         """`Pattern.within` is required and there is no unbounded spelling.
         Using 0 for "no bound" would mean "same timestamp", which is a

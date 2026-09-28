@@ -86,6 +86,26 @@ def parse_eql(text: str) -> EqlQuery:
             "which is `Pattern` with `ordered=False` -- but that lowering is "
             "not written yet. A single `[ category where condition ]` does "
             "lower today.", DIALECT)
+    # A `|` ANYWHERE at the top level is pipe syntax, not just a first word
+    # literally reading "pipe". `[file where true] | head 5` starts with `[`,
+    # so the keyword check above never fires and it fell through to the generic
+    # "not a single event" message. Same for a leading `until`, which is a
+    # sequence tail without its sequence. Both are recognised here because the
+    # module docstring already claims they are -- and a docstring claiming a
+    # refusal exists when it does not is the same false-claim class as
+    # everything else this project deletes.
+    if _has_top_level_pipe(stripped):
+        raise Refusal(
+            "EQL_PIPE_NOT_LOWERED",
+            "this uses `|` pipes, which chain commands the way SPL does. Only "
+            "single events and `sequence` lower today. Refused by name rather "
+            "than read as either half.", DIALECT)
+    if keyword == "until":
+        raise Refusal(
+            "EQL_UNTIL_WITHOUT_SEQUENCE",
+            "`until [...]` is a sequence tail without its sequence. It expires "
+            "a sequence that is not here, so there is nothing to attach it to. "
+            "Write the full `sequence ... until ...`.", DIALECT)
     if keyword in ("join", "pipe"):
         raise Refusal(
             "EQL_JOIN_NOT_LOWERED",
@@ -122,6 +142,29 @@ def parse_eql(text: str) -> EqlQuery:
                       "a no-op disguised as a rule. Refused rather than "
                       "rendered as one.", DIALECT)
     return EqlQuery(event=EqlEvent(category=category, condition=condition))
+
+
+def _has_top_level_pipe(text: str) -> bool:
+    """True if `|` appears at bracket depth 0 outside strings.
+
+    A `|` inside a quoted value (`name == "a|b"`) or inside brackets is data,
+    not a pipe. Only the top-level one chains commands.
+    """
+    depth = 0
+    quote: str | None = None
+    for char in text:
+        if quote is not None:
+            if char == quote:
+                quote = None
+        elif char in ("'", '"'):
+            quote = char
+        elif char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+        elif char == "|" and depth == 0:
+            return True
+    return False
 
 
 def _parse_sequence(text: str) -> EqlSequence:
@@ -282,6 +325,33 @@ def _parse_steps(text: str) -> list:
 
 
 
+def _find_step_close(body: str) -> int:
+    """Index of the `[`-matching `]`, skipping quoted regions.
+
+    The step splitter that calls this is quote-aware when FINDING blocks, but
+    this used to take `body.index("]")` -- the first one, even inside a string.
+    So `[file where name == "]" ]` truncated the condition at the string's
+    bracket and misread the rest as a `by` trailer, refusing with
+    EQL_PER_STEP_BY_NOT_LOWERED for a rule with no `by` in it. Same bug, one
+    layer down from the splitter that was already fixed.
+    """
+    quote: str | None = None
+    escaped = False
+    for index, char in enumerate(body):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif char in ("'", '"'):
+            quote = char
+        elif char == "]":
+            return index
+    return -1
+
+
 def _parse_step(text: str, allow_bang: bool, context: str):
     """One `[ category where condition ] [by ...]`, or a refused `![ ... ]`."""
     body = text.strip()
@@ -310,7 +380,11 @@ def _parse_step(text: str, allow_bang: bool, context: str):
         raise Refusal("EQL_STEP_MALFORMED",
                       f"a {context} step is `[ category where condition ]`.",
                       DIALECT)
-    close = body.index("]")
+    close = _find_step_close(body)
+    if close < 0:
+        raise Refusal("EQL_STEP_MALFORMED",
+                      f"a {context} step is `[ category where condition ]`.",
+                      DIALECT)
     inner, trailer = body[1:close].strip(), body[close + 1:].strip()
     parts = inner.split(None, 2)
     if len(parts) < 3 or parts[1].lower() != "where":

@@ -44,8 +44,16 @@ def parse_fql(text: str) -> FqlQuery:
     # THE TWO LANGUAGES MUST NOT MIX. CQL's `field = "value"`, its pipes, and
     # its word operators are all refused here with the confusion named, because
     # a combined grammar would accept strings valid in neither language.
-    lowered = stripped.lower()
-    if "|" in stripped:
+    #
+    # THE CHECKS RUN ON THE TEXT WITH QUOTED REGIONS BLANKED. FQL values are
+    # single-quoted and may contain anything -- `hostname:'a and b'` is one
+    # term whose VALUE contains the word, and refusing it as CQL made valid
+    # values unrepresentable. The lowerer's own splitter is quote-aware for the
+    # same reason; the gate in front of it has to be too, or the gate is
+    # stricter than the grammar it guards.
+    bare = _without_quotes(stripped)
+    lowered = bare.lower()
+    if "|" in bare:
         raise Refusal(
             "FQL_NOT_CQL",
             "this contains `|`, which is CQL pipeline syntax, not FQL. FQL is "
@@ -57,10 +65,34 @@ def parse_fql(text: str) -> FqlQuery:
             "this contains `AND`/`OR` as words, which is CQL syntax, not FQL. "
             "FQL uses `+` for AND and `,` for OR. Refused rather than read as "
             "either.", DIALECT)
-    if "=" in stripped and ":" not in stripped:
+    if "=" in bare and ":" not in bare:
         raise Refusal(
             "FQL_NOT_CQL",
             "this contains `=` without `:`, which is CQL comparison syntax, "
             "not FQL. FQL comparisons are `property:[operator]value`. Refused "
             "rather than read as either.", DIALECT)
     return FqlQuery(text=stripped)
+
+
+def _without_quotes(text: str) -> str:
+    """`text` with single-quoted regions blanked, so the CQL-shape checks
+    cannot fire inside a value. A backslash escapes the next character, so an
+    escaped quote does not end the region early."""
+    out: list[str] = []
+    quote = False
+    escaped = False
+    for char in text:
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == "'":
+                quote = False
+            out.append(" ")
+        elif char == "'":
+            quote = True
+            out.append(" ")
+        else:
+            out.append(char)
+    return "".join(out)

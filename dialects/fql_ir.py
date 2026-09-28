@@ -200,12 +200,25 @@ def count_terms(text: str) -> int:
 
     Parenthesised groups recurse naturally: `(a+b),(c+d)` is two OR-branches
     holding two terms each, for four total.
+
+    BOTH SIDES RECURSE, AND THAT IS THE FIX. An earlier version recursed only
+    on the `,` side, so an AND-group holding an OR-group -- `a+(b,c)` -- counted
+    2 instead of 3: the parenthesised `(b,c)` was one "term". Nineteen flat
+    terms plus `(f19,f20)` counted 20 and lowered, putting 21 properties past a
+    guard whose own docstring says the 21st silently stops filtering
+    server-side.
     """
     total = 0
     for or_branch in _split_top_level(text, ","):
-        branch = or_branch.strip()
-        if branch.startswith("(") and branch.endswith(")"):
-            total += count_terms(branch[1:-1])
-        else:
-            total += max(1, len(_split_top_level(branch, "+")))
+        total += _count_and(or_branch.strip())
     return total
+
+
+def _count_and(branch: str) -> int:
+    """Leaf terms in one `+`-joined branch, recursing into parens."""
+    if branch.startswith("(") and branch.endswith(")"):
+        return count_terms(branch[1:-1])
+    parts = _split_top_level(branch, "+")
+    if len(parts) <= 1:
+        return 1
+    return sum(_count_and(part.strip()) for part in parts)

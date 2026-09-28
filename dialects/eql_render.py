@@ -110,9 +110,15 @@ def _render_pattern(pattern: Any) -> str:
 def _category_name(expr: Any) -> str | None:
     """`event.category == "<name>"` back to `<name>`, else None.
 
-    Returns None for anything that is not exactly that shape, so a user-written
-    `event.category == "file"` buried inside a larger condition is not mistaken
-    for a folded step category.
+    HONEST LIMITATION, STATED NOT HIDDEN: this matches ANY two-operand `and`
+    whose first operand has that shape -- including a user-written
+    `[any where event.category == "file" and a == 1]`, which renders as
+    `[file where a == 1]`. That is semantically equivalent (no widening, no
+    narrowing), but the round trip is not stable: rendering the output again
+    gives the same text, yet the input's explicit `any` is gone. An earlier
+    version of this docstring claimed a buried user filter "is not mistaken";
+    it is, for exactly that shape, and claiming otherwise is how a cosmetic
+    difference becomes a trust problem later.
     """
     if not isinstance(expr, Comparison) or expr.op != "=":
         return None
