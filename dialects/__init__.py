@@ -42,6 +42,11 @@ from dialects.fql import parse_fql
 from dialects.fql_ir import MAX_PROPERTIES as FQL_MAX_PROPERTIES
 from dialects.fql_ir import lower as lower_fql
 from dialects.fql_render import render as render_fql
+from dialects.cql import DIALECT as CQL_DIALECT
+from dialects.cql import LANGUAGE as CQL_LANGUAGE
+from dialects.cql import parse_cql
+from dialects.cql_ir import lower as lower_cql
+from dialects.cql_render import render as render_cql
 from dialects.wazuh import DIALECT as WAZUH_DIALECT
 from dialects.wazuh import LANGUAGE as WAZUH_LANGUAGE
 from dialects.wazuh import parse_wazuh
@@ -65,6 +70,8 @@ __all__ = [
     "EQL_DIALECT", "EQL_LANGUAGE",
     "parse_fql", "lower_fql", "render_fql",
     "FQL_DIALECT", "FQL_LANGUAGE", "FQL_MAX_PROPERTIES",
+    "parse_cql", "lower_cql", "render_cql",
+    "CQL_DIALECT", "CQL_LANGUAGE",
     "TARGETS",
 ]
 

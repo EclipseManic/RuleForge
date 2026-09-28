@@ -34,12 +34,14 @@ from dialects import (
     SPL_DIALECT,
     EQL_DIALECT,
     FQL_DIALECT,
+    CQL_DIALECT,
     TARGETS,
     WAZUH_DIALECT,
     YARAL_DIALECT,
     lower_aql,
     lower_eql,
     lower_fql,
+    lower_cql,
     lower_kql,
     lower_spl,
     lower_wazuh,
@@ -47,12 +49,14 @@ from dialects import (
     parse_aql,
     parse_eql,
     parse_fql,
+    parse_cql,
     parse_kql,
     parse_wazuh,
     parse_yaral,
     render_aql,
     render_eql,
     render_fql,
+    render_cql,
     render_kql,
     render_spl,
     render_wazuh,
@@ -145,6 +149,10 @@ def _lower_fql_text(text: str, rule_id: str, **_: Any):
     return lower_fql(parse_fql(text), rule_id)
 
 
+def _lower_cql_text(text: str, rule_id: str, **_: Any):
+    return lower_cql(parse_cql(text), rule_id)
+
+
 
 #: Re-exported so the web layer reads one module. `TARGETS` lists every syntax
 #: this project must eventually handle; `DIALECTS` is the subset that works
@@ -179,6 +187,10 @@ DIALECTS: dict[str, dict[str, Any]] = {
     "falcon": {
         "label": "CrowdStrike FQL (flat filter)", "dialect": FQL_DIALECT,
         "lower_text": _lower_fql_text, "render": render_fql,
+    },
+    "logscale": {
+        "label": "CrowdStrike CQL (filter + table)", "dialect": CQL_DIALECT,
+        "lower_text": _lower_cql_text, "render": render_cql,
     },
 }
 
