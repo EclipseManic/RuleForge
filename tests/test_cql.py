@@ -263,6 +263,77 @@ class AssignLowersAsEval(unittest.TestCase):
                          "CQL_ASSIGN_EXPRESSION_NOT_LOWERED")
 
 
+class StageOrderIsTheWritersOrder(unittest.TestCase):
+    """Pipes lower IN WRITTEN ORDER, because each transforms the previous one's
+    output.
+
+    This is a regression for a real shipped bug. The query model held one
+    optional slot per pipe kind and the lowerer emitted them in a fixed order,
+    so `| table a,b | sort(x)` -- project, then order by a column that SURVIVED
+    the projection -- rendered as `| sort(x) | table a,b`, a different rule that
+    can order by a column the analyst's own query had already dropped. The
+    parser docstring even claimed order was preserved while the code did the
+    opposite, which is worse than an undocumented bug: a false claim about an
+    invariant.
+
+    The discriminating test is the one whose output CHANGES with the order, not
+    one that happens to render the same either way.
+    """
+
+    def test_project_then_sort_keeps_that_order(self):
+        self.assertEqual(_round_trip("a = 1 | table a,b | sort(x)"),
+                         "a = 1 | table a, b | sort(x)")
+
+    def test_sort_then_project_keeps_that_order_too(self):
+        self.assertEqual(_round_trip("a = 1 | sort(x) | table a,b"),
+                         "a = 1 | sort(x) | table a, b")
+
+    def test_node_order_matches_written_order(self):
+        """Structural, not just textual: the IR must chain in the written
+        order too, because a renderer that only looks right while the graph is
+        wrong still returns different rows."""
+        from engine.ir import Arrange, Derive
+        ir, _ = lower_cql(parse_cql("a = 1 | table a,b | sort(x)"))
+        self.assertLess([n.id for n in ir.nodes].index("derive1"),
+                        [n.id for n in ir.nodes].index("arrange2"))
+        stages = {n.id: n for n in ir.nodes}
+        self.assertIsInstance(stages["derive1"], Derive)
+        self.assertIsInstance(stages["arrange2"], Arrange)
+        # And the arrange must CONSUME the projection, not run beside it.
+        self.assertEqual(stages["arrange2"].input, "derive1")
+
+    def test_four_stage_order_is_preserved(self):
+        self.assertEqual(
+            _round_trip("a = 1 | table a,b | x := 1 | sort(a) | rename b as c"),
+            "a = 1 | table a, b | x := 1 | sort(a) | rename b as c")
+
+    def test_assign_before_table_keeps_the_assigned_column(self):
+        """`x := 1 | table a,x` keeps `x`; the reverse projects a column that
+        does not exist yet and is a different query."""
+        self.assertEqual(_round_trip("a = 1 | x := 1 | table a,x"),
+                         "a = 1 | x := 1 | table a, x")
+
+    def test_repeated_pipe_of_a_kind_is_still_refused(self):
+        """The refactor from slots to a list must not have quietly widened
+        what is accepted: a second `| sort` still rewrites the first."""
+        for source, code in (("a = 1 | sort(x) | sort(y)", "CQL_SORT_TWICE"),
+                             ("a = 1 | table a | table b", "CQL_TABLE_TWICE"),
+                             ("a = 1 | rename a as b | rename b as c",
+                              "CQL_RENAME_TWICE"),
+                             ("a = 1 | x := 1 | y := 2",
+                              "CQL_ASSIGN_TWICE")):
+            with self.assertRaises(Refusal) as caught:
+                parse_cql(source)
+            self.assertEqual(caught.exception.code, code, source)
+
+    def test_no_artifact_is_produced_when_order_would_be_rewritten(self):
+        """The refusal must survive the rewrite: a rule whose pipes come back
+        in a different order is worse than a refusal."""
+        outcome = jobs.author("logscale", "a = 1 | sort(x) | sort(y)", "r1")
+        self.assertFalse(outcome.rendered)
+        self.assertEqual(outcome.refusal["code"], "CQL_SORT_TWICE")
+
+
 class MembershipLowersAsDisjunction(unittest.TestCase):
     """`in(field, [...])` IS a disjunction -- `field` equal to any one of the
     values -- so it lowers exactly onto `BoolOp("or", ...)` with no new node

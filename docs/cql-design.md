@@ -61,19 +61,49 @@ IR vocabulary built for SPL applies almost directly:
 
 | CQL | IR | Status |
 |---|---|---|
-| `field = "value"`, `#tag=...`, `@ts > ...` | `Filter` | same as SPL search terms |
-| `AND` / `OR` / `NOT` | `BoolOp` / `Not` | same precedence work as SPL `where` |
-| `field = *` (exists) | presence test | engine already has exists/is_not_null |
-| `field = "a*"` (wildcard) | `Call(matches_regex)` | needs glob-to-regex, refused until then |
-| `field=/re/i` (regex) | `Call(matches_regex)` | have it |
-| `x := expr` | `Derive(kind="eval")` | have it |
-| `\| table a, b` | `Derive(kind="fields")` | have it |
-| `\| sort(f)` | `Arrange` | have it, direction as a parameter |
-| `\| rename a as b` | `Derive(kind="rename")` | have it |
-| `\| join k [ search ... ]` | `Join` + sub-search | IR has Join; SPL renderer has the sub-search path |
-| `in(field, [...])` | — | **missing**: membership test |
-| `count()`, `timechart()`, aggregates | `Aggregate` | have the node; per-function mapping needed |
-| `now() - 24h` | `TimeRef`/`Duration` | have the types |
+| `field = "value"`, `#tag=...`, `@ts > ...` | `Filter` | shipped |
+| `AND` / `OR` / `NOT` | `BoolOp` / `Not` | shipped; NOT > AND > OR |
+| `field = *` (exists) | presence test | refused — `CQL_EXISTS_NOT_LOWERED` |
+| `field = "a*"` (wildcard) | `Call(matches_regex)` | refused — `CQL_WILDCARD_NOT_LOWERED` |
+| `field=/re/i` (regex) | `Call(matches_regex)` | refused — `CQL_REGEX_NOT_LOWERED` |
+| `now()`, `now() - 24h` | `TimeRef`/`Duration` | refused — would freeze an instant into the rule |
+| `x := operand` | `Derive(kind="eval")` | shipped, SINGLE OPERAND only (field, quoted string, or number) |
+| `x := oldField + "_suffix"` | `Derive(kind="eval")` | **refused** — `CQL_ASSIGN_EXPRESSION_NOT_LOWERED` |
+| `\| table a, b` | `Derive(kind="fields")` | shipped |
+| `\| sort(f)` | `Arrange` | shipped, ascending + optional `limit=` |
+| `\| rename a as b` | `Derive(kind="rename")` | shipped |
+| `\| join k [ search ... ]` | `Join` + sub-search | **not lowered yet** — IR has Join; SPL renderer has the sub-search path |
+| `in(field, [...])` | `BoolOp("or", equalities)` | shipped, lowered EXACTLY as a disjunction |
+| `count()`, `timechart()`, aggregates | `Aggregate` | **not lowered yet** — have the node; per-function mapping needed |
+
+The two header examples above are deliberately NOT both shipped. The pipeline
+sample at the top of this file uses `newField := oldField + "_suffix"`, which is
+an expression; the slice takes a single operand and refuses the rest by name.
+That refusal is the correct behaviour, not a missing feature to be papered over.
+
+### The shape traps this slice already hit
+
+- **THE RIGHT OF `:=` IS NOT A COMPARISON.** `x := lit` copies the FIELD named
+  `lit`; `x := "lit"` assigns the CONSTANT. Everywhere else in CQL a bare token
+  and a quoted string mean the same thing, so a renderer that normalises quotes
+  everywhere else quietly turns a fixed value into a field read here — a rule
+  that fails open on rows where that field is absent. The renderer quotes string
+  literals specifically on this path. (A *filter* comparison is unaffected:
+  `a = lit` already means "equals the string lit".)
+- **`:=` MUST BE SCANNED BEFORE ANY PAREN CHECK, quote- and paren-aware.** An
+  assignment RHS may contain a paren *inside a string* (`x := "a(b"`), and a
+  naive `(` split misreads that as a function call. A `:=` inside a value, or
+  inside parens, must not misroute the other way either.
+
+### Stage ORDER is load-bearing, so it is STORED
+
+`CqlQuery` holds `stages: tuple[CqlStage, ...]` — one ordered list, not one
+optional slot per pipe kind. The slot version emitted every non-table pipe
+before `| table`, so `| table a,b | sort(x)` (project, then order by a column
+that survived the projection) became `| sort(x) | table a,b`: a different rule
+that can order by a column the analyst's own query had already dropped. The
+parse looked right, the node chain looked plausible, and the suite stayed green
+— which is why `mutation_check.py` M16 now pins it.
 
 FQL (the API form) is SMALLER: one flat boolean filter with `+`/`,`/`()`.
 It lowers to a single `Filter` and nothing else. It is the natural slice 1,

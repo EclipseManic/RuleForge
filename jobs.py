@@ -189,7 +189,12 @@ DIALECTS: dict[str, dict[str, Any]] = {
         "lower_text": _lower_fql_text, "render": render_fql,
     },
     "logscale": {
-        "label": "CrowdStrike CQL (filter + table)", "dialect": CQL_DIALECT,
+        # The label IS the contract: it must name the slice that actually
+        # works, no more and no less. It said "filter + table" while sort,
+        # rename, `:=`, and `in()` had all landed, which understates the tool
+        # and would send an analyst looking for refusals that do not exist.
+        "label": "CrowdStrike CQL (filter + table/sort/rename/:=/in)",
+        "dialect": CQL_DIALECT,
         "lower_text": _lower_cql_text, "render": render_cql,
     },
 }

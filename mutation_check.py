@@ -57,7 +57,8 @@ MUTATIONS = [
      "            if False:\n                continue"),
 
     ("M7  Pattern window not enforced", "engine/nodes.py",
-     "                    if candidate_time is not None and candidate_time > window_end:",
+     "                    if window_end is not None and candidate_time is not None \\\n"
+     "                            and candidate_time > window_end:",
      "                    if False:"),
 
     ("M8  Pattern until ignores the window", "engine/nodes.py",
@@ -103,6 +104,17 @@ MUTATIONS = [
      "    except (TypeError, ValueError, ArithmeticError, AttributeError,\n"
      "            RecursionError, IndexError, KeyError) as exc:",
      "    except ():\n        raise\n    except (ZeroDivisionError,) as exc:"),
+
+    # THE SHIPPED CQL ORDERING BUG, AS A PERMANENT MUTATION. `| table a,b |
+    # sort(x)` used to be emitted as `| sort(x) | table a,b`, because the
+    # query held one slot per pipe kind and the lowerer emitted a fixed order.
+    # The parse and the node chain looked right and the suite stayed green,
+    # so this is the exact case that only a mutation can pin.
+    ("M16 CQL pipes emitted in a fixed order, not the written one",
+     "dialects/cql_ir.py",
+     "    for index, stage in enumerate(query.stages):",
+     "    for index, stage in enumerate(sorted(\n"
+     "            query.stages, key=lambda s: 1 if isinstance(s, CqlTable) else 0)):"),
 ]
 
 

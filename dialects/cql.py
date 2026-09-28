@@ -56,15 +56,34 @@ class CqlAssign:
 
 
 @dataclass(frozen=True, slots=True)
+class CqlTable:
+    """`| table c1, c2` -- PROJECT: the result keeps only these columns, in
+    this order. A `CqlTable` is a stage, not a property of the query, because
+    where it sits in the pipe chain changes what the later stages can see."""
+    columns: tuple[str, ...]
+
+
+#: Every pipe stage this lowering understands. A stage is a `|` in the analyst's
+#: query, and stages lower IN WRITTEN ORDER -- so this is a union of shapes, not
+#: a list of features the query optionally has.
+CqlStage = CqlTable | CqlSort | CqlRename | CqlAssign
+
+
+@dataclass(frozen=True, slots=True)
 class CqlQuery:
-    """A CQL filter with pipes. `table`, `sort` and `rename` lower; `:=`
-    assigns one field, string, or number. Each pipe appears at most once and
-    in pipeline order -- the parser preserves the order the analyst wrote."""
+    """A CQL filter plus its pipe stages, IN THE ORDER THEY WERE WRITTEN.
+
+    WHY AN ORDERED LIST AND NOT ONE SLOT PER PIPE. This was four separate
+    optional fields (`table`, `sort`, `rename`, `assign`) and the lowerer
+    emitted them in a fixed order. That is a silent correctness bug, not a
+    style one: `| table a,b | sort(x)` -- project, then order by a column that
+    SURVIVED the projection -- was lowered to sort FIRST, so the sort could
+    order by a column the analyst's own query had already dropped, and the
+    rendered rule no longer said what they wrote. The stages are a sequence
+    because each one transforms its input; a fixed order cannot express that.
+    """
     filt: str
-    table: tuple[str, ...] = ()
-    sort: CqlSort | None = None
-    rename: CqlRename | None = None
-    assign: CqlAssign | None = None
+    stages: tuple[CqlStage, ...] = ()
 
 
 def parse_cql(text: str) -> CqlQuery:
@@ -89,10 +108,13 @@ def parse_cql(text: str) -> CqlQuery:
         raise Refusal("CQL_EMPTY_FILTER",
                       "a query starting with `|` has no filter, which matches "
                       "everything -- a no-op disguised as a rule.", DIALECT)
-    table: tuple[str, ...] = ()
-    sort: CqlSort | None = None
-    rename: CqlRename | None = None
-    assign: CqlAssign | None = None
+    # ONE LIST, IN WRITTEN ORDER. See `CqlQuery` for why the order is the
+    # whole point rather than a convenience. `seen` still refuses a repeated
+    # pipe, because a second `| sort` or `| rename` is a rewrite of the first
+    # and this slice does not model the rewrite -- but the refusal is about
+    # REPETITION, not position.
+    stages: list[CqlStage] = []
+    seen: set[str] = set()
     for pipe in segments[1:]:
         text = pipe.strip()
         # `:=` FIRST, BEFORE THE PAREN CHECK. An assignment RHS may contain a
@@ -102,12 +124,10 @@ def parse_cql(text: str) -> CqlQuery:
         # so a `:=` inside a value cannot misroute the other way either.
         at = _find_assign(text)
         if at >= 0:
-            if assign is not None:
-                raise Refusal("CQL_ASSIGN_TWICE",
-                              "two `| :=` stages; the second overwrites what "
-                              "the first assigned. Refused rather than "
-                              "silently kept.", DIALECT)
-            assign = _parse_assign(text[:at], text[at + 3:])
+            _claim(stages, seen, "assign", "CQL_ASSIGN_TWICE",
+                   "two `| :=` stages; the second overwrites what the first "
+                   "assigned. Refused rather than silently kept.")
+            stages.append(_parse_assign(text[:at], text[at + 3:]))
             continue
         # Function-call pipes (`sort(...)`) vs space-separated pipes (`table`,
         # `rename`). Split on `(` first: a pipe whose name contains `(` is a
@@ -123,39 +143,34 @@ def parse_cql(text: str) -> CqlQuery:
                     f"Refused rather than guessed.", DIALECT)
             args = rest[:-1].strip()
             if name == "sort":
-                if sort is not None:
-                    raise Refusal("CQL_SORT_TWICE",
-                                  "two `| sort` stages; the second reorders "
-                                  "what the first ordered. Refused rather "
-                                  "than silently kept.", DIALECT)
-                sort = _parse_sort_args(args)
+                _claim(stages, seen, "sort", "CQL_SORT_TWICE",
+                       "two `| sort` stages; the second reorders what the "
+                       "first ordered. Refused rather than silently kept.")
+                stages.append(_parse_sort_args(args))
                 continue
             raise Refusal(
                 "CQL_PIPE_NOT_LOWERED",
                 f"`| {name}(...)` is a real CQL command, but only `| table`, "
-                f"`| sort`, and `| rename` lower today. Refused by name rather "
-                f"than dropped.", DIALECT)
+                f"`| sort`, `| rename`, and `| :=` lower today. Refused by name "
+                f"rather than dropped.", DIALECT)
         name, _, args = text.partition(" ")
         name, args = name.lower(), args.strip()
         if name == "table":
-            if table:
-                raise Refusal("CQL_TABLE_TWICE",
-                              "two `| table` stages join nothing new; the "
-                              "second is refused rather than silently kept.",
-                              DIALECT)
-            table = tuple(f.strip() for f in args.split(",") if f.strip())
-            if not table:
+            _claim(stages, seen, "table", "CQL_TABLE_TWICE",
+                   "two `| table` stages join nothing new; the second is "
+                   "refused rather than silently kept.")
+            columns = tuple(f.strip() for f in args.split(",") if f.strip())
+            if not columns:
                 raise Refusal("CQL_TABLE_EMPTY",
                               "`| table` with no columns projects nothing.",
                               DIALECT)
-            for column in table:
+            for column in columns:
                 _check_field_name(column, "column")
+            stages.append(CqlTable(columns=columns))
         elif name == "rename":
-            if rename is not None:
-                raise Refusal("CQL_RENAME_TWICE",
-                              "two `| rename` stages; the second renames what "
-                              "the first renamed. Refused rather than silently "
-                              "kept.", DIALECT)
+            _claim(stages, seen, "rename", "CQL_RENAME_TWICE",
+                   "two `| rename` stages; the second renames what the first "
+                   "renamed. Refused rather than silently kept.")
             old, sep, new = args.partition(" as ")
             old, new = old.strip(), new.strip()
             if not sep or not old or not new:
@@ -166,7 +181,7 @@ def parse_cql(text: str) -> CqlQuery:
                     DIALECT)
             _check_field_name(old, "rename source")
             _check_field_name(new, "rename target")
-            rename = CqlRename(old=old, new=new)
+            stages.append(CqlRename(old=old, new=new))
         else:
             raise Refusal(
                 "CQL_PIPE_NOT_LOWERED",
@@ -174,8 +189,19 @@ def parse_cql(text: str) -> CqlQuery:
                 f"`| sort`, `| rename`, and `| :=` lower today. Refused by "
                 f"name rather than dropped -- dropping a pipe stage silently "
                 f"changes which rows come back.", DIALECT)
-    return CqlQuery(filt=filt, table=table, sort=sort, rename=rename,
-                    assign=assign)
+    return CqlQuery(filt=filt, stages=tuple(stages))
+
+
+def _claim(stages: list[CqlStage], seen: set[str], kind: str, code: str,
+           why: str) -> None:
+    """Refuse a REPEATED pipe of the same kind, once, by name.
+
+    A set rather than four `is not None` checks, because the stages are now a
+    list and "have I already seen one" is the only question the refusal asks.
+    """
+    if kind in seen:
+        raise Refusal(code, why, DIALECT)
+    seen.add(kind)
 
 
 def _find_assign(text: str) -> int:

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from dialects.cql import CqlQuery, DIALECT
+from dialects.cql import CqlAssign, CqlQuery, CqlRename, CqlSort, CqlTable, DIALECT
 from engine.ir import (
     Arrange,
     BoolOp,
@@ -50,51 +50,77 @@ def lower(query: CqlQuery, rule_id: str = "rule") -> tuple[RuleIR, list[dict]]:
         Filter(id="filter", input="read", condition=condition),
     ]
     current = "filter"
-    if query.sort is not None:
-        # `| sort(field[, limit=N])` is ascending with an optional cap -- the
-        # only form this parser accepts, so there is no direction to lose.
-        field = query.sort.field
-        if field.startswith("#"):
-            field = field[1:]
-        nodes.append(Arrange(id="arrange", input=current,
-                             order_by=((FieldRef(field), "asc"),),
-                             limit=query.sort.limit))
-        current = "arrange"
-    if query.rename is not None:
-        # `| rename old as new`: the original column is GONE afterwards, so a
-        # later term reading the old name finds nothing. That is what `rename`
-        # means (unlike `eval`, which keeps both), and the renderer must say
-        # `rename`, not `eval`, for the same reason.
-        old = query.rename.old
-        if old.startswith("#"):
-            old = old[1:]
-        nodes.append(Derive(id="rename", input=current,
-                            assignments=((query.rename.new,
-                                          FieldExpr(FieldRef(old))),),
-                            projects=False, kind="rename"))
-        current = "rename"
-    if query.assign is not None:
-        # `| name := operand`: the new column is ADDED and everything else is
-        # KEPT, which is `eval` semantics, not `rename`. Getting these two
-        # backwards is the exact bug the SPL renderer once shipped (`eval`
-        # rendered as `rename`, dropping the original column), so the kind
-        # here is asserted by test, not left to memory.
-        nodes.append(Derive(id="assign", input=current,
-                            assignments=((query.assign.name,
-                                          _assign_value(
-                                              query.assign.expr)),),
-                            projects=False, kind="eval"))
-        current = "assign"
-    if query.table:
-        nodes.append(Derive(id="derive", input=current,
-                            assignments=tuple(
-                                (column, FieldExpr(FieldRef(column)))
-                                for column in query.table),
-                            projects=True, kind="fields"))
-        current = "derive"
+    # ONE PASS, IN WRITTEN ORDER. The previous version had one optional slot
+    # per pipe kind and emitted them in a fixed order, which turned
+    # `| table a,b | sort(x)` into `| sort(x) | table a,b` -- a different rule
+    # that can order by a column the projection had already dropped. Each
+    # stage consumes the previous one's output, so the only faithful emission
+    # order is the one the analyst wrote.
+    for index, stage in enumerate(query.stages):
+        if isinstance(stage, CqlSort):
+            # `| sort(field[, limit=N])` is ascending with an optional cap --
+            # the only form this parser accepts, so there is no direction to
+            # lose.
+            field = stage.field
+            if field.startswith("#"):
+                field = field[1:]
+            node_id = _stage_id("arrange", index)
+            nodes.append(Arrange(id=node_id, input=current,
+                                 order_by=((FieldRef(field), "asc"),),
+                                 limit=stage.limit))
+        elif isinstance(stage, CqlRename):
+            # `| rename old as new`: the original column is GONE afterwards, so
+            # a later term reading the old name finds nothing. That is what
+            # `rename` means (unlike `eval`, which keeps both), and the
+            # renderer must say `rename`, not `eval`, for the same reason.
+            old = stage.old
+            if old.startswith("#"):
+                old = old[1:]
+            node_id = _stage_id("rename", index)
+            nodes.append(Derive(id=node_id, input=current,
+                                assignments=((stage.new,
+                                              FieldExpr(FieldRef(old))),),
+                                projects=False, kind="rename"))
+        elif isinstance(stage, CqlAssign):
+            # `| name := operand`: the new column is ADDED and everything else
+            # is KEPT, which is `eval` semantics, not `rename`. Getting these
+            # two backwards is the exact bug the SPL renderer once shipped
+            # (`eval` rendered as `rename`, dropping the original column), so
+            # the kind here is asserted by test, not left to memory.
+            node_id = _stage_id("assign", index)
+            nodes.append(Derive(id=node_id, input=current,
+                                assignments=((stage.name,
+                                              _assign_value(stage.expr)),),
+                                projects=False, kind="eval"))
+        elif isinstance(stage, CqlTable):
+            node_id = _stage_id("derive", index)
+            nodes.append(Derive(id=node_id, input=current,
+                                assignments=tuple(
+                                    (column, FieldExpr(FieldRef(column)))
+                                    for column in stage.columns),
+                                projects=True, kind="fields"))
+        else:  # pragma: no cover -- a new stage type must be lowered, not skipped
+            raise Refusal(
+                "CQL_STAGE_NOT_LOWERED",
+                f"a {type(stage).__name__} stage has no lowering. Refused "
+                f"rather than dropped -- a dropped pipe stage silently changes "
+                f"which rows come back.", DIALECT)
+        current = nodes[-1].id
     nodes.append(Emit(id="out", input=current))
     return (RuleIR(rule_id=rule_id, nodes=tuple(nodes), output="out",
                    title="CQL filter", metadata={"dialect": DIALECT}), [])
+
+
+def _stage_id(base: str, index: int) -> str:
+    """A unique node id per stage.
+
+    Index-suffixed rather than the bare `base`, because two stages of the same
+    kind are refused at parse time -- but the id has to stay unique for a
+    DIFFERENT reason too: node ids address the graph, and a duplicate id would
+    make `| table` after `| table`-shaped stages ambiguous. A reviewer reading
+    `arrange2` also knows instantly that stage order is now load-bearing.
+    """
+    return f"{base}{index + 1}"
 
 
 def _assign_value(expr: str) -> Any:

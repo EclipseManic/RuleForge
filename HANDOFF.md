@@ -344,16 +344,17 @@ assume a fresh eye is cheaper than the next round's findings.
 
 ### Open, in severity order -- verified against the tree, not carried forward
 
-**Verified state: 782 passed, 4 skipped, 3 warnings, ruff clean, all 15 mutations caught, at b9104af.**
+**Verified state: 831 passed, 4 skipped, 3 warnings, ruff clean, all 16 mutations caught (M7 re-armed, M16 added) -- see the CQL ordering note below.**
 
 Everything round 9 listed except the EQL/CQL gap is FIXED and committed, each
 mutation-verified: eventstats refused, `tstats`-first ordering, the `Not`
 depth arm, the `name`-arm sweep, the anti-drift reflection over all fields with
 Package probed, the selector latch closing after the first filter, the
 undecidable mid-window timestamp, prestats/signed-count/`bare_search`,
-COUNT(x), the backwards subpipeline `rename`, and the M8 retargeting (all 15
-mutations caught). Then EQL slices 1+2, FQL slice 1, EQL `runs=1`, round-10
-fixes, and the registry anti-drift landed on top. What remains:
+COUNT(x), the backwards subpipeline `rename`, and the M8 retargeting. Then EQL
+slices 1+2, FQL slice 1, EQL `runs=1`, round-10 fixes, the registry anti-drift,
+CQL `sort`/`rename`/`in()`/`:=`, and the CQL stage-ordering fix landed on top.
+What remains:
 
 1. **EQL: with runs=2+, ! missing-event, per-step `by`.** Done since: single
    events, sequence with by/maxspan/until/runs=1, and sample (unordered
@@ -363,19 +364,52 @@ fixes, and the registry anti-drift landed on top. What remains:
    step plus its mandatory maxspan; per-step `by` needs `key` to stop being
    global (do not fake it). `sequence` without `maxspan` is refused (no
    unbounded spelling). See `docs/eql-design.md`.
-2. **CQL pipeline stages.** FQL (flat filters) is done. The LogScale pipes --
-   | table, | sort, | rename, :=, | join with sub-search, aggregates,
-   in() -- map onto existing SPL-shaped nodes, but the renderer work must be
-   SHARED with the SPL stage builder, not written a third time. The two
-   existing copies already drifted twice. 
-ow() must be evaluated at lower
-   time, never frozen into a literal. See docs/cql-design.md.
+2. **CQL pipeline stages -- MOSTLY SHIPPED NOW, NOT ALL OF IT.** FQL (flat
+   filters) is done, and so are the LogScale pipes `| table`, `| sort`,
+   `| rename`, `:=` (single operand), and `in()`. What is NOT lowered:
+   `| join` with a sub-search, and the aggregate functions. Those map onto
+   nodes that already exist, but the renderer work must be SHARED with the SPL
+   stage builder rather than written a third time -- the two existing copies
+   have already drifted twice. `now()` must be evaluated at lower time, never
+   frozen into a literal, and is refused until then. See docs/cql-design.md,
+   whose status table is now checked against real refusals rather than intent.
+
 3. **Four POSIX assertions have never executed.** Permission-bit tests and the
    directory `fsync`,  written on Windows. The Windows halves are exercised;
    run the file on Linux before trusting that half at all.
-4. **Round 10 review.** Nine rounds, every one found real defects behind green.
-   The newest unreviewed code is dialects/eql*.py, dialects/fql*.py, and
-   the until_scope evaluator branch.
+4. **A review round, and a guard that had quietly stopped guarding.** Eleven
+   rounds now, every one found real defects behind a green suite. Two things
+   from the CQL ordering fix, both of which belong in a handoff because neither
+   shows up in a test count:
+
+   - **A mutation that had been SKIPPED, not passed.** M7 ("Pattern window not
+     enforced") reported `SKIPPED (pattern not found - cannot verify)` while the
+     summary line still said mutations were all caught. Its anchor text predated
+     the `within=None` work that added a `window_end is not None and` guard in
+     front of it, so the window-enforcement check had not actually been verified
+     for some time. A SKIPPED mutation must be read as a failure -- that is the
+     whole class of bug this harness exists to catch, committed as a pass.
+   - **A docstring that documented an invariant the code did not keep.**
+     `CqlQuery` claimed the parser preserved pipeline order while the lowerer
+     emitted a fixed order, so `| table a,b | sort(x)` rendered inverted. The
+     claim was more damaging than the bug: it made the bug invisible to review.
+     M16 now pins the order, and the ordered-`stages` model is what `join` and
+     aggregates must extend rather than a new slot.
+
+5. **`#tag` is spelled three ways in one query, and it predates the ordering
+   fix.** `#tag = 1 | table #tag, x | sort(#tag)` round-trips as
+   `tag = 1 | table #tag, x | sort(tag)`: the filter drops the `#`, `| table`
+   keeps it, `| sort` drops it. In CQL `#name` is a TAG/COLUMN and bare `name`
+   is an EVENT FIELD, so the round trip is not cosmetic -- it names a different
+   field in the filter than the analyst wrote. This is a vendor-semantics
+   question, not a mechanical one: the answer differs per position, so it needs
+   a deliberate decision per position (does `| table #tag` even mean the tag?
+   does `| sort(tag)` mean the event field?) rather than one blanket rule. Left
+   untouched on purpose -- deciding it wrong in either direction changes rules.
+
+6. **Unreviewed surface.** An independent review pass over the CQL ordering
+   change is in flight; EQL `runs=2+`, `!`, and per-step `by` remain
+   unreviewed, as do the FQL and `until_scope` branches.
 
 ### Still the biggest functional gap
 
