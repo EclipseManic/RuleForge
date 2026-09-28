@@ -43,11 +43,15 @@ class EqlSequenceStep:
 
 @dataclass(frozen=True, slots=True)
 class EqlSequence:
-    """A `sequence [by ...] [with maxspan=...] steps... [until ...]`."""
+    """A `sequence [by ...] [with maxspan=...|with runs=...] steps... [until ...]`."""
     by: tuple[str, ...]
     maxspan: str | None
     steps: tuple[EqlSequenceStep, ...]
     until: EqlSequenceStep | None
+    #: `with runs=N`. Only `1` lowers -- one run IS the pattern, so there is
+    #: nothing to repeat. Anything higher needs a repeat count `Pattern` does
+    #: not have, and is refused where it is parsed.
+    runs: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +171,45 @@ def _has_top_level_pipe(text: str) -> bool:
     return False
 
 
+def _split_with_clauses(segment: str) -> list[str]:
+    """`with maxspan=15m with runs=1` -> `["maxspan=15m", "runs=1"]`.
+
+    Each clause starts at a top-level `with` (outside strings). Without this,
+    the whole segment reads as one clause and `maxspan` becomes the literal
+    string "15m with runs=1", which fails duration parsing with a message
+    about a duration the analyst never wrote.
+    """
+    clauses: list[str] = []
+    depth = 0
+    quote: str | None = None
+    start = 0
+    index = 0
+    lowered = segment.lower()
+    while index < len(segment):
+        char = segment[index]
+        if quote is not None:
+            if char == quote:
+                quote = None
+        elif char in ("'", '"'):
+            quote = char
+        elif char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+        elif depth == 0 and lowered.startswith("with ", index) \
+                and (index == 0 or not segment[index - 1].isalnum()):
+            if index > start:
+                clauses.append(segment[start:index].strip())
+            start = index + len("with ")
+            index += len("with ")
+            continue
+        index += 1
+    tail = segment[start:].strip()
+    if tail:
+        clauses.append(tail)
+    return [c for c in clauses if c]
+
+
 def _parse_sequence(text: str) -> EqlSequence:
     """Parse `sequence [by ...] [with maxspan=...|with runs=...] steps [until ...]`.
 
@@ -178,6 +221,7 @@ def _parse_sequence(text: str) -> EqlSequence:
     rest = text[len("sequence"):].strip()
     by: tuple[str, ...] = ()
     maxspan: str | None = None
+    runs: int | None = None
 
     # `sequence by f1, f2` -- shared join keys. Consumed before `with`, because
     # Elastic's grammar puts `by` first and a `by` after `with` belongs to a step.
@@ -207,26 +251,52 @@ def _parse_sequence(text: str) -> EqlSequence:
                               f"Joining on a different field joins different "
                               f"events.", DIALECT)
 
-    # `with maxspan=...` or `with runs=...`.
-    if rest.lower().startswith("with "):
+    # `with maxspan=...` and/or `with runs=...`, in either order. EQL allows
+    # both on one sequence, and they arrive in ONE segment (everything up to
+    # the first `[`), so the segment is split into clauses first -- otherwise
+    # `maxspan=15m with runs=1` reads as a duration literally named
+    # "15m with runs=1".
+    while rest.lower().startswith("with "):
         segment, _, rest = rest.partition("[")
-        clause = segment[5:].strip()
-        if clause.lower().startswith("maxspan="):
-            maxspan = clause[len("maxspan="):].strip()
-            if not maxspan:
-                raise Refusal("EQL_MAXSPAN_EMPTY",
-                              "`with maxspan=` with no duration bounds nothing.",
-                              DIALECT)
-        elif clause.lower().startswith("runs="):
-            raise Refusal(
-                "EQL_RUNS_NOT_LOWERED",
-                "`with runs=` requires N consecutive repeats of the pattern, "
-                "and `Pattern` has no repeat count. Refused rather than "
-                "matched once.", DIALECT)
-        else:
-            raise Refusal("EQL_WITH_UNKNOWN",
-                          f"`with {clause}` is not `maxspan=` or `runs=`. "
-                          f"Refused rather than guessed.", DIALECT)
+        for clause in _split_with_clauses(segment):
+            if clause.lower().startswith("maxspan="):
+                if maxspan is not None:
+                    raise Refusal("EQL_MAXSPAN_TWICE",
+                                  "`with maxspan=` twice joins nothing new; the "
+                                  "second is refused rather than silently kept "
+                                  "alongside the first.", DIALECT)
+                maxspan = clause[len("maxspan="):].strip()
+                if not maxspan:
+                    raise Refusal("EQL_MAXSPAN_EMPTY",
+                                  "`with maxspan=` with no duration bounds "
+                                  "nothing.", DIALECT)
+            elif clause.lower().startswith("runs="):
+                # `with runs=1` MEANS "MATCH ONCE", WHICH IS THE PATTERN ITSELF.
+                #
+                # `runs=N` requires N consecutive repeats, and `Pattern` has no
+                # repeat count -- but `runs=1` requires exactly one run, which is
+                # what a plain sequence already is. So 1 is accepted and carried
+                # through (the lowerer ignores it, because one run needs no extra
+                # semantics), and only 2+ is refused. A non-integer is refused too,
+                # because a repeat count that is not a number is not a count.
+                raw = clause[len("runs="):].strip()
+                if not raw.isdigit() or int(raw) < 1:
+                    raise Refusal(
+                        "EQL_RUNS_NOT_A_COUNT",
+                        f"`with runs={raw}` is not a positive integer, so it "
+                        f"cannot count repeats. Refused rather than guessed.",
+                        DIALECT)
+                if int(raw) > 1:
+                    raise Refusal(
+                        "EQL_RUNS_NOT_LOWERED",
+                        f"`with runs={raw}` requires {raw} consecutive repeats "
+                        f"of the pattern, and `Pattern` has no repeat count. "
+                        f"Refused rather than matched once.", DIALECT)
+                runs = 1
+            else:
+                raise Refusal("EQL_WITH_UNKNOWN",
+                              f"`with {clause}` is not `maxspan=` or `runs=`. "
+                              f"Refused rather than guessed.", DIALECT)
         rest = "[" + rest
 
     # `until [...]` trails the steps. Split it off before parsing steps so a
@@ -245,7 +315,8 @@ def _parse_sequence(text: str) -> EqlSequence:
         raise Refusal("EQL_SEQUENCE_NO_STEPS",
                       "`sequence` with no event steps matches nothing.",
                       DIALECT)
-    return EqlSequence(by=by, maxspan=maxspan, steps=tuple(steps), until=until)
+    return EqlSequence(by=by, maxspan=maxspan, steps=tuple(steps), until=until,
+                       runs=runs)
 
 
 def _find_top_level(text: str, keyword: str) -> int:

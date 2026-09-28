@@ -241,6 +241,47 @@ class EverythingElseIsRefusedByName(unittest.TestCase):
                       '  [ process where true ]')
         self.assertEqual(caught.exception.code, "EQL_RUNS_NOT_LOWERED")
 
+    def test_runs_one_lowers_exactly(self):
+        """`with runs=1` MEANS "MATCH ONCE", WHICH IS THE PATTERN ITSELF. One
+        run needs no repeat semantics, so it lowers exactly and renders
+        without the clause -- which is semantically identical, not a silent
+        drop like the other cases in this project. Only 2+ is refused."""
+        for source in ('sequence with maxspan=15m with runs=1\n'
+                       '  [ file where file.extension == "exe" ]\n'
+                       '  [ process where true ]',
+                       'sequence with runs=1 with maxspan=15m\n'
+                       '  [ file where file.extension == "exe" ]\n'
+                       '  [ process where true ]'):
+            with self.subTest(source=source[:40]):
+                self.assertEqual(
+                    _round_trip(source),
+                    'sequence with maxspan=15m\n'
+                    '  [file where file.extension == "exe"]\n'
+                    '  [process where true]')
+
+    def test_runs_zero_and_non_integer_are_refused(self):
+        """A repeat count that is not a positive integer is not a count."""
+        for source in ('sequence with runs=0\n'
+                       '  [ file where true ]\n'
+                       '  [ process where true ]',
+                       'sequence with runs=many\n'
+                       '  [ file where true ]\n'
+                       '  [ process where true ]'):
+            with self.subTest(source=source[:30]):
+                with self.assertRaises(Refusal) as caught:
+                    parse_eql(source)
+                self.assertEqual(caught.exception.code,
+                                 "EQL_RUNS_NOT_A_COUNT")
+
+    def test_double_maxspan_is_refused(self):
+        """Two `with maxspan=` clauses join nothing new; the second is refused
+        rather than silently kept alongside the first."""
+        with self.assertRaises(Refusal) as caught:
+            parse_eql('sequence with maxspan=15m with maxspan=1h\n'
+                      '  [ file where true ]\n'
+                      '  [ process where true ]')
+        self.assertEqual(caught.exception.code, "EQL_MAXSPAN_TWICE")
+
     def test_a_missing_event_step_is_refused(self):
         """`![ ... ]` matches an absence. Dropping it would invert the rule."""
         with self.assertRaises(Refusal) as caught:
