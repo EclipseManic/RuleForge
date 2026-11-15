@@ -1,0 +1,49 @@
+# RuleForge -- generated files and one machine's local state.
+#
+# The tool has no dependencies and no build step, so this file is short on
+# purpose. Everything below is either regenerated on demand or belongs to the
+# person running the tool, never to the repository.
+
+# Runtime state. `data/` is where the workbench keeps saved rule history; it
+# is this machine's work, not the project's content. The directory itself is
+# kept (data/.gitkeep) because `default_store_path()` expects it to exist.
+data/*.sqlite3
+data/*.sqlite3-journal
+data/*.sqlite3-wal
+data/*.sqlite3-shm
+data/*.db
+
+# Bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Working notes and transcripts. Never part of the tool.
+session-*.md
+*-session.txt
+*.log
+
+# Assistant working state
+.oxcode-memory/

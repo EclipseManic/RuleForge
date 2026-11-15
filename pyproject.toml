@@ -1,0 +1,27 @@
+# Project metadata for RuleForge.
+#
+# THE TOOL IS NOT INSTALLED, IT IS RUN. From the repository root:
+#
+#     python run.py            start the browser workbench
+#     python run.py verify     the test suite, then the corpus sweep
+#
+# There is no build step and no package to install: the modules sit in
+# `engine/` and import each other directly.
+
+
+[project]
+name = "ruleforge"
+version = "0.1.0"
+description = "A detection rule workbench for enterprise SIEM detection rules."
+requires-python = ">=3.10"
+
+# Deliberately empty, and not an oversight to be filled in later. RuleForge is
+# stdlib-only: the engine, every dialect and the whole test suite import nothing
+# outside the standard library, which is what lets it run unmodified inside a
+# locked-down SOC where `pip install` is not available. Adding an entry here is
+# an architectural decision, not a convenience.
+dependencies = []
+
+# 3.10 is the floor because the dataclasses carry `slots=True`, which 3.9 does
+# not accept. Nothing here uses a 3.11+ feature, so the floor is the real one
+# rather than a guess.

@@ -1,0 +1,5 @@
+This directory holds `history.sqlite3`, the append-only rule history the
+workbench writes at runtime. It is deliberately kept in the repository and its
+contents are not: `default_store_path()` in `ruleforge/store.py` resolves to
+this directory, so it has to exist, but the database itself is one machine's
+work. Set `RULEFORGE_HOME` to put it somewhere else.
