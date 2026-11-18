@@ -264,6 +264,18 @@ def _regex_dialect(tag: str) -> str:
     return "pcre2" if tag == "pcre2" else "os_regex"
 
 
+#: PCRE2's inline case-insensitivity flag. OSRegex has no equivalent, so this
+#: is the ONLY way a folded pattern can be written into a Wazuh rule.
+_FOLD_FLAG: Final = "(?i)"
+
+
+def _unfold(pattern: str) -> tuple[str, bool]:
+    """Split a leading `(?i)` off a pattern, and say whether it was there."""
+    if pattern.startswith(_FOLD_FLAG):
+        return pattern[len(_FOLD_FLAG):], True
+    return pattern, False
+
+
 def _matcher_predicate(element: Any, tag: str) -> Expr:
     negate, value = _negated(element)
     if not value:
@@ -279,9 +291,10 @@ def _matcher_predicate(element: Any, tag: str) -> Expr:
         # A plain substring over the raw log line. This one DOES evaluate here.
         return Comparison("contains", FieldRef("full_log"), Literal(value),
                           negate=negate)
+    pattern, nocase = _unfold(value)
     return Comparison(
         "matches", FieldRef("full_log"),
-        Regex(value, dialect=_regex_dialect(tag)), negate=negate,
+        Regex(pattern, dialect=_regex_dialect(tag), nocase=nocase), negate=negate,
     )
 
 
@@ -304,6 +317,20 @@ def _field_predicate(element: Any, tag: str) -> Expr:
             "WAZUH_MATCHER_EMPTY",
             f"`<{tag}>` is empty, so it tests nothing and matches every event.",
             "lower",
+        )
+
+    # `type="pcre2"` is a real PCRE2 matcher and the only place Wazuh can carry
+    # a case fold (`(?i)`). Reading it as OS-Regex would run the flag as a
+    # literal group, so the attribute is honoured before the syntax heuristic
+    # below gets a chance to misread the value.
+    kind = (element.get("type") or "").strip().lower()
+    if kind in ("pcre2", "osregex", "os_regex"):
+        pattern, nocase = _unfold(value)
+        return Comparison(
+            "matches", FieldRef.parse(name),
+            Regex(pattern, dialect="pcre2" if kind == "pcre2" else "os_regex",
+                  nocase=nocase),
+            negate=negate,
         )
 
     # Wazuh treats these values as OS-Regex unless they are plainly literal.
@@ -766,19 +793,32 @@ def _render_comparison(expr: Comparison, lines: list[str], *, negate: bool) -> N
     name = expr.left.full
 
     if isinstance(expr.right, Regex):
-        tag = "pcre2" if expr.right.dialect == "pcre2" else "regex"
+        # A folded pattern has to be PCRE2. OS-Regex has no flag syntax, and
+        # dropping the fold narrows the rule in silence; POSIX ERE is a subset
+        # of PCRE2, so promoting the element is safe.
+        tag = "pcre2" if (expr.right.dialect == "pcre2" or expr.right.nocase) else "regex"
+        pattern = _escape(expr.right.pattern)
+        if expr.right.nocase:
+            pattern = _FOLD_FLAG + pattern
         if name == "full_log":
-            lines.append(f"  <{tag}{attribute}>{_escape(expr.right.pattern)}</{tag}>")
+            lines.append(f"  <{tag}{attribute}>{pattern}</{tag}>")
         else:
             element = _BY_FIELD.get(name)
             if element:
-                lines.append(
-                    f"  <{element}{attribute}>{_escape(expr.right.pattern)}</{element}>"
-                )
+                if tag == "pcre2":
+                    raise Refusal(
+                        "WAZUH_RENDER_PCRE2_ELEMENT",
+                        f"`<{element}>` is an OS-Regex element and has no PCRE2 "
+                        f"form, so `{render_expr(expr.right)}` cannot be "
+                        f"written against it.",
+                        "render",
+                    )
+                lines.append(f"  <{element}{attribute}>{pattern}</{element}>")
             else:
+                type_attr = ' type="pcre2"' if tag == "pcre2" else ""
                 lines.append(
-                    f'  <field name="{_escape(name)}"{attribute}>'
-                    f"{_escape(expr.right.pattern)}</field>"
+                    f'  <field name="{_escape(name)}"{type_attr}{attribute}>'
+                    f"{pattern}</field>"
                 )
         return
 
@@ -806,10 +846,49 @@ def _render_comparison(expr: Comparison, lines: list[str], *, negate: bool) -> N
         )
     value = _escape(expr.right.value)
 
-    if expr.op == "contains" and name == "full_log":
-        lines.append(f"  <match{attribute}>{value}</match>")
+    # The substring family, with the fold Wazuh actually has.
+    #
+    # `<field>` is OS-Regex and case-SENSITIVE, so an ignore-case test written
+    # as one narrows the rule without saying so. `<field type="pcre2">` is the
+    # only matcher that can carry `(?i)`, and it is used exactly when a fold is
+    # needed, so an exact-case rule keeps the plain element.
+    anchors = {
+        "contains": "", "contains_cs": "",
+        "startswith": "^", "startswith_cs": "^",
+        "endswith": "$", "endswith_cs": "$",
+    }
+    if expr.op in anchors:
+        anchor = anchors[expr.op]
+        if name == "full_log":
+            if expr.nocase:
+                lines.append(
+                    f"  <pcre2{attribute}>{_FOLD_FLAG}{anchor}{value}</pcre2>"
+                )
+            else:
+                lines.append(f"  <match{attribute}>{anchor}{value}</match>")
+            return
+        element = _BY_FIELD.get(name)
+        if element:
+            if expr.nocase:
+                raise Refusal(
+                    "WAZUH_RENDER_NOCASE_ELEMENT",
+                    f"`<{element}>` is an OS-Regex element and cannot ignore "
+                    f"case. Rendering this would make the rule exact-case.",
+                    "render",
+                )
+            lines.append(f"  <{element}{attribute}>{anchor}{value}</{element}>")
+        elif expr.nocase:
+            lines.append(
+                f'  <field name="{_escape(name)}" type="pcre2"{attribute}>'
+                f"{_FOLD_FLAG}{anchor}{value}</field>"
+            )
+        else:
+            lines.append(
+                f'  <field name="{_escape(name)}"{attribute}>{anchor}{value}</field>'
+            )
         return
-    if expr.op in ("==", "contains"):
+
+    if expr.op == "==":
         element = _BY_FIELD.get(name)
         if element:
             lines.append(f"  <{element}{attribute}>{value}</{element}>")
@@ -1120,6 +1199,13 @@ def render_wazuh(rule: Rule) -> str:
         lines.append(
             f"    <description>{_escape(annotations.description)}</description>"
         )
+    if annotations.title and annotations.title != annotations.description:
+        # Wazuh has no element for the rule's NAME, and the description is the
+        # only text it shows an analyst. A comment is how a ruleset records one,
+        # and it is what makes `carries_annotations` true rather than a claim
+        # the renderer does not honour.
+        title = _escape(annotations.title).replace("--", "- -")
+        lines.append(f"  <!-- title: {title} -->")
     for _, techniques in annotations.mitre_attack:
         if techniques:
             lines.append("    <mitre>")

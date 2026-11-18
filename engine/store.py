@@ -252,9 +252,18 @@ class Dataset:
         try:
             digest = hashlib.sha256(self.events_json.encode("utf-8")).hexdigest()
             payload = json.loads(self.events_json)
-            if digest != self.content_hash or payload.get("schema") != 1:
-                raise ValueError("hash or schema mismatch")
-            decoded = _decode_json_value(payload["events"])
+            if digest != self.content_hash:
+                raise ValueError("hash mismatch")
+            if isinstance(payload, dict) and payload.get("schema") == 1:
+                decoded = _decode_json_value(payload["events"])
+            elif isinstance(payload, list):
+                # Rows written before the tagged envelope stored the event list
+                # directly. The hash still covers that text, so these are as
+                # verifiable as a current row -- refusing them would condemn a
+                # user's existing evidence for its age, not its contents.
+                decoded = payload
+            else:
+                raise ValueError("schema mismatch")
             if (not isinstance(decoded, list) or len(decoded) != self.event_count
                     or not all(isinstance(event, dict) for event in decoded)):
                 raise ValueError("event count or type mismatch")

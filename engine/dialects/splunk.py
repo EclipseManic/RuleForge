@@ -1608,6 +1608,56 @@ _RENDER_OPS: Final[dict[str, str]] = {
 }
 
 
+#: SPL's `LIKE` is a SQL wildcard test: `%` is any run, `_` is one character.
+#:
+#: Both are therefore METACHARACTERS, and a literal one in the rule's value has
+#: to be escaped. It was not, so `contains "%"` rendered as `LIKE "%%%"` and
+#: `contains "_"` as `LIKE "%_%"` -- patterns that match EVERY row. A rule
+#: written to find one literal character became a rule that alerts on
+#: everything, and reported success. AQL's renderer escaped these correctly, so
+#: this was a per-renderer omission rather than a misunderstanding.
+def _like_escape(text: str) -> str:
+    out: list[str] = []
+    for char in text:
+        if char in "\\%_":
+            out.append("\\")
+        out.append(char)
+    return "".join(out)
+
+
+def _like_body(operator: str, value: str, nocase: bool = False) -> str:
+    """The LIKE pattern for a substring test, with the value escaped.
+
+    `*` is used as the internal wildcard marker by the caller's table and is
+    translated to `%` here, AFTER escaping, so a literal `%` in the value can
+    never be mistaken for the wildcard the renderer itself added.
+    """
+    wildcards = {
+        "contains": "%{0}%", "startswith": "{0}%", "endswith": "%{0}",
+    }[operator]
+    escaped = _like_escape(value).replace('"', '\\"')
+    if nocase:
+        # The subject is lowercased by `_like_subject`, so the pattern has to
+        # be folded too. Folding only one side makes an uppercase character in
+        # the pattern unmatchable, which is how an exclusion silently stops
+        # excluding.
+        escaped = escaped.lower()
+    return wildcards.format(escaped).replace("*", "%")
+
+
+def _like_subject(expr: Any) -> str:
+    """The left side of a LIKE test, lowercased when the fold is requested.
+
+    SPL's `LIKE` is case-SENSITIVE. A case-insensitive substring test is
+    therefore written as `lower(field) LIKE "...lowercased pattern..."`, which
+    is the idiom Splunk's own documentation uses. Without it the fold was
+    dropped entirely: `contains "ENC"` became `match(CommandLine, "ENC")`, an
+    exact-case test, so every lowercase `-enc` command line was missed.
+    """
+    subject = _render_expression(expr.left)
+    return f"lower({subject})" if expr.nocase else subject
+
+
 def _render_expression(expr: Expr) -> str:
     """An expression as SPL eval syntax.
 
@@ -1637,7 +1687,11 @@ def _render_expression(expr: Expr) -> str:
             )
         return expr.full
     if isinstance(expr, Regex):
-        return f'"{expr.pattern}"'
+        # Splunk's `match()` is PCRE, so `(?i)` is the inline fold. Dropping it
+        # here turned a case-insensitive test into an exact-case one: `=~ "ENC"`
+        # (KQL's ignore-case equality) rendered as a case-sensitive pattern and
+        # stopped matching `-enc` command lines.
+        return f'"(?i){expr.pattern}"' if expr.nocase else f'"{expr.pattern}"'
     if isinstance(expr, Not):
         return f"NOT ({_render_expression(expr.operand)})"
     if isinstance(expr, BoolOp):
@@ -1670,9 +1724,14 @@ def _render_expression(expr: Expr) -> str:
                     f"side is not a pattern.",
                     "render",
                 )
+            # `(?i)` is PCRE's inline fold and `match()` is PCRE, so this is the
+            # only place the fold can go. It used to be dropped here, which
+            # made `=~ "ENC"` (KQL's ignore-case equality) a case-SENSITIVE
+            # pattern on export.
+            fold = "(?i)" if pattern.nocase else ""
             body = (
                 f"match({_render_expression(expr.left)}, "
-                f'"{pattern.pattern}")'
+                f'"{fold}{pattern.pattern}")'
             )
             negated = expr.negate ^ (expr.op == "!~")
             return f"NOT {body}" if negated else body
@@ -1690,8 +1749,8 @@ def _render_expression(expr: Expr) -> str:
                     "render",
                 )
             body = (
-                f"{_render_expression(expr.left)} LIKE "
-                f'"{wildcards.format(str(right.value)).replace("*", "%")}"'
+                f"{_like_subject(expr)} LIKE "
+                f'"{_like_body(expr.op, str(right.value), expr.nocase)}"'
             )
             # The INFIX spelling, matching how a `like` comparison renders a
             # few lines down. The function form `like(f, "%x")` was used here

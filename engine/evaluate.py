@@ -585,7 +585,14 @@ def _screen_portable(pattern: str) -> None:
                 index = close + 1
                 continue
             raise Refusal("REGEX_DIALECT_SPECIFIC", _PORTABLE_REFUSALS["{"], "regex")
-        if char not in _PORTABLE_LITERALS:
+        # Non-ASCII is a LITERAL in every engine behind these dialects: none of
+        # them gives `é`, `ж` or `日` a metacharacter meaning, so a pattern
+        # containing one means the same thing everywhere. Refusing it made
+        # `contains "héllo"` unimportable -- and, worse, unimportable in its
+        # OWN dialect, because the case fold used to force every substring test
+        # through the regex screen. A path like `C:\Users\José` could not be
+        # read in at all.
+        if char not in _PORTABLE_LITERALS and ord(char) < 128:
             raise Refusal(
                 "REGEX_DIALECT_SPECIFIC",
                 f"`{char}` is not in the portable subset this engine executes, so "

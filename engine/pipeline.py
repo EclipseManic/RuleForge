@@ -153,6 +153,12 @@ class _State:
     context: Context = dc_field(default_factory=Context)
     #: Binding names, so a Read that names one reads THAT binding's rows.
     bindings: set[str] = dc_field(default_factory=set)
+    #: Whether anything in this rule depends on a timestamp.
+    #:
+    #: Every dialect names a default time field, so warning that the sample
+    #: lacks it put TIME_FIELD_NOT_FOUND on rules with no time logic at all --
+    #: noise on every rule, which is how a real caveat gets ignored.
+    timed: bool = False
 
     def put(self, stage: str, rows: list[Row]) -> None:
         self.rows[stage] = rows
@@ -183,7 +189,7 @@ def evaluate(
     analyst will quote in a ticket.
     """
     ctx = Context(budget=budget or Budget())
-    state = _State(context=ctx)
+    state = _State(context=ctx, timed=_needs_timestamps(rule))
     result = EvaluationResult()
 
     try:
@@ -552,7 +558,7 @@ def _eval_read(node: Read, seed: list[Row], state: _State) -> list[Row]:
                 # noise on every stage after the first.
                 carried += 1
         rows.append(row)
-    if node.time_field and stamped == 0 and carried == 0 and rows_in:
+    if state.timed and node.time_field and stamped == 0 and carried == 0 and rows_in:
         state.context.caveats.append(
             Caveat(
                 "TIME_FIELD_NOT_FOUND",

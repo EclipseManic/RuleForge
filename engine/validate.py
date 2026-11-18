@@ -298,6 +298,12 @@ def _require_predicate(expr: Expr, where: str) -> None:
             f"`{expr.scoped}` matches every row where the field is present and "
             f"is not empty. Say what you mean -- `{expr.full} == \"something\"`.",
             "validate",
+            # Structured, so the page can point at the row that failed instead
+            # of printing a sentence about a condition nobody can locate.
+            node=where,
+            field=expr.full,
+            condition=expr.scoped,
+            alternatives=("==", "contains", "startswith", "is not null"),
         )
     _walk_expression(expr, 0)
 

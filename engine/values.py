@@ -257,6 +257,19 @@ class Refusal(Exception):
     code: str
     message: str
     where: str = ""
+    #: The condition that failed, and its parts, as DATA.
+    #:
+    #: `where` is a breadcrumb ("render", "parse") and says nothing about
+    #: WHICH condition was refused. The UI could therefore only show the
+    #: message: it could not highlight the offending row in the form, and it
+    #: could not offer "did you mean" alternatives, because there was nothing
+    #: structured to offer them from. A refusal an analyst cannot act on is a
+    #: refusal they work around by editing the rule until the error goes away.
+    node: str = ""
+    field: str = ""
+    operator: str = ""
+    condition: str = ""
+    alternatives: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         Exception.__init__(self, self.message)
@@ -267,8 +280,43 @@ class Refusal(Exception):
     def __repr__(self) -> str:
         return f"Refusal({self.code!r}, {self.message!r}, {self.where!r})"
 
-    def as_dict(self) -> dict[str, str]:
-        return {"code": self.code, "message": self.message, "where": self.where}
+    def about(
+        self,
+        *,
+        node: str = "",
+        field: str = "",
+        operator: str = "",
+        condition: str = "",
+        alternatives: tuple[str, ...] = (),
+    ) -> "Refusal":
+        """Attach structured context, keeping anything already set.
+
+        Called at the seam where a refusal is raised about a specific
+        condition, so raise sites stay one line and the context travels with
+        the exception instead of being rebuilt by every caller.
+        """
+        return Refusal(
+            self.code,
+            self.message,
+            self.where,
+            node=node or self.node,
+            field=field or self.field,
+            operator=operator or self.operator,
+            condition=condition or self.condition,
+            alternatives=alternatives or self.alternatives,
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "message": self.message,
+            "where": self.where,
+            "node": self.node,
+            "field": self.field,
+            "operator": self.operator,
+            "condition": self.condition,
+            "alternatives": list(self.alternatives),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -379,10 +427,66 @@ def as_number(value: Any) -> Decimal | None:
 # Comparison
 # ---------------------------------------------------------------------------
 
-COMPARISON_OPS: Final[frozenset[str]] = frozenset(
-    {"==", "!=", "<", "<=", ">", ">=", "=~", "!~", "contains", "in", "contains_any",
-     "contains_all", "startswith", "endswith", "matches", "like", "ilike"}
-)
+#: THE operator vocabulary. One set, one spelling, one meaning.
+#:
+#: There used to be four copies of this list -- here, `kql.SPEC.operators`, the
+#: browser's `ir.js`, and each dialect's private `_RENDER_OPS` -- and they had
+#: already drifted: `=~`/`!~` existed in some and not others, `has` was folded
+#: into `contains` in one table and missing from the rest. A dialect that could
+#: spell an operator the model did not have produced a parse that silently
+#: stopped at the operator; a dialect that lacked one produced a render that
+#: silently dropped the condition.
+#:
+#: `has` is here as its own operator, not an alias for `contains`, because it is
+#: a TERM test: `has "powershell"` does not match `xpowershellx` and `contains`
+#: does. Folding one into the other changed what the rule matched in both
+#: directions depending on which way the conversion went.
+COMPARISON_OPS: Final[frozenset[str]] = frozenset({
+    "==", "!=", "<", "<=", ">", ">=",
+    # Pattern tests.
+    "=~", "!~", "matches", "like", "ilike",
+    # Substring tests. All three honour `Comparison.nocase`.
+    "contains", "startswith", "endswith",
+    # Term test: whole-token, not substring.
+    "has",
+    # Membership and multi-value tests.
+    "in", "contains_any", "contains_all", "has_any", "has_all",
+})
+
+#: Operators whose right-hand side is a list rather than a single value.
+LIST_OPS: Final[frozenset[str]] = frozenset({
+    "in", "contains_any", "contains_all", "has_any", "has_all",
+})
+
+#: The operators the condition FORM may offer, which is a narrower set than the
+#: IR accepts.
+#:
+#: Two of them are missing on purpose, and both were reachable from the form
+#: before this list existed:
+#:
+#: * `contains_any` / `contains_all` cannot be read back by the KQL parser, so
+#:   choosing one produced `CONDITION_IS_A_FIELD` -- a refusal that blamed the
+#:   FIELD for an operator the parser had silently skipped.
+#: * `matches` needs a Regex on the right-hand side, and the form builds a
+#:   literal. Offering it produced a comparison no renderer could read.
+#:
+#: An imported rule may still carry any of `COMPARISON_OPS`; the form must show
+#: what it cannot build rather than dropping it. `tests/test_api.py` pins this
+#: set against what the parser actually accepts.
+AUTHORABLE_OPS: Final[frozenset[str]] = frozenset({
+    "==", "!=", "<", "<=", ">", ">=",
+    "contains", "startswith", "endswith", "has",
+    "in", "has_any", "has_all",
+    "like", "ilike",
+    "=~", "!~",
+})
+
+#: Operators that are substring/term/equality tests and so can carry a case
+#: fold. A fold on an ordering (`<`, `>`) is meaningless and is refused.
+FOLDABLE_OPS: Final[frozenset[str]] = frozenset({
+    "contains", "startswith", "endswith", "has", "contains_any",
+    "contains_all", "has_any", "has_all", "==", "!=", "in", "like", "ilike",
+})
 
 
 @dataclass(frozen=True, slots=True)

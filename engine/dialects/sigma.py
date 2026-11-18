@@ -746,7 +746,16 @@ def _field_predicate(
             # answer Sigma's `field: null` deserves.
             terms.append(Call("is_null", (field,)))
             continue
-        terms.append(Comparison(operator, field, _literal(single)))
+        # Sigma's `|contains`, `|startswith` and `|endswith` are
+        # case-INSENSITIVE by specification, and `|cased` is the modifier that
+        # turns the fold off. Without this, importing a Sigma rule produced an
+        # exact-case comparison, so exporting it again narrowed the detection
+        # -- silently, in six of the eight targets.
+        terms.append(Comparison(
+            operator, field, _literal(single),
+            nocase=operator in ("contains", "startswith", "endswith")
+            and "cased" not in modifiers,
+        ))
 
     if len(terms) == 1:
         return terms[0]
@@ -1348,7 +1357,18 @@ def lower_sigma(text: str, rule_id: str = "rule") -> tuple[Rule, list[Diagnostic
 # ---------------------------------------------------------------------------
 
 
+class _Raw(str):
+    """Text already in YAML body form; `_quote` must pass it through.
+
+    A membership list is a YAML STRUCTURE, not a scalar, so it cannot go
+    through the scalar quoter: quoting it produced
+    `User: '[''alice'', ''bob'']'`, one string literal containing brackets.
+    """
+
+
 def _quote(value: Any) -> str:
+    if isinstance(value, _Raw):
+        return str(value)
     """A scalar as YAML. Quoted whenever bare would change its meaning."""
     if value is None:
         return "null"
@@ -1420,20 +1440,145 @@ def _groupable_pair(expr: Expr) -> tuple[str, Any] | None:
         return None
     if not isinstance(expr.left, FieldRef) or not isinstance(expr.right, Literal):
         return None
-    key, value = _render_value(expr.left, expr.right, expr.op)
+    key, value = _render_value(
+        expr.left, expr.right, expr.op, nocase=expr.nocase
+    )
     return key, value
 
 
-def _render_value(field: FieldRef, right: Expr, operator: str) -> tuple[str, Any]:
-    """An IR comparison back to a `Field|modifier: value` pair."""
+def _sigma_wildcards(text: str) -> str:
+    """A SQL/glob pattern as Sigma's own wildcard syntax.
+
+    Sigma spells its wildcards `*` and `?`. A `like` pattern arrives carrying
+    SQL's `%` and `_`, and writing those through unchanged produced a Sigma
+    selection matching a LITERAL percent sign -- a rule that looks right, is
+    valid YAML, and can never fire. The two spellings have to be translated,
+    not copied.
+
+    A literal `*`, `?` or backslash in the source is escaped with a backslash,
+    which is Sigma's own escape, so the translation cannot invent a wildcard
+    the author did not write.
+    """
+    out: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and index + 1 < len(text):
+            # `\%` and `\_` mean the literal character; everything else keeps
+            # its backslash so a Windows path survives.
+            following = text[index + 1]
+            if following in "%_":
+                out.append("\\" + following)
+            else:
+                out.append("\\\\" + following)
+            index += 2
+            continue
+        if char == "%":
+            out.append("*")
+        elif char == "_":
+            out.append("?")
+        elif char in "*?":
+            out.append("\\" + char)
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out)
+
+
+#: Sigma modifiers whose comparison is CASE-INSENSITIVE by the specification.
+_SUFFIX_NOCASE: Final[dict[str, str]] = {
+    "contains": "|contains",
+    "startswith": "|startswith",
+    "endswith": "|endswith",
+}
+
+#: The same three with `|cased`, which turns the fold OFF.
+#:
+#: Both halves matter. Importing `User|contains: bob` and writing it back
+#: without `|cased` is correct; importing an exact-case test and writing it
+#: back WITHOUT `|cased` silently WIDENS it.
+_SUFFIX_EXACT: Final[dict[str, str]] = {
+    "contains": "|contains|cased",
+    "startswith": "|startswith|cased",
+    "endswith": "|endswith|cased",
+}
+
+
+def _render_value(
+    field: FieldRef, right: Expr, operator: str, nocase: bool = False
+) -> tuple[str, Any]:
+    """An IR comparison back to a `Field|modifier: value` pair.
+
+    `!=` is deliberately refused here rather than defaulted. Sigma has no
+    per-field negation -- it negates a whole named selection in `condition:` --
+    so `_split_condition` rewrites a `!=` conjunct into `Not(== ...)` before
+    this is reached. Letting `!=` fall through the old `.get(operator, "")`
+    default is exactly how `CommandLine != "x"` rendered as `CommandLine: x`:
+    a filter written to EXCLUDE an event became a detection that fires on it.
+    """
+    if operator == "!=":
+        raise Refusal(
+            "SIGMA_RENDER_NEGATED_OPERATOR",
+            f"`{render_expr(right)}` is compared with `!=`, and Sigma has no "
+            f"per-field negation. It negates a whole selection in "
+            f"`condition:`, so this comparison has to move there rather than "
+            f"be written as a field test.",
+            "render",
+        )
+    if operator in ("like", "ilike"):
+        if not isinstance(right, Literal):
+            raise Refusal(
+                "SIGMA_RENDER_VALUE",
+                f"`{render_expr(right)}` is a wildcard pattern, and Sigma "
+                f"writes a wildcard inside the value itself, so it needs a "
+                f"constant.",
+                "render",
+            )
+        # A `like` pattern is a GLOB: `%` is any run and `_` is one character.
+        # Sigma's are `*` and `?`. Copying the pattern across unchanged wrote
+        # a literal percent sign into the rule, so it could never fire.
+        return field.full, _sigma_wildcards(str(right.value))
+    if operator == "in" and isinstance(right, ListExpr):
+        # Sigma spells membership as a YAML list under one key -- the exact
+        # shape this module's own reader lowers back to `in`. Refusing it
+        # meant a rule the reader accepts could not be written back out.
+        values: list[Any] = []
+        for item in right.items:
+            if not isinstance(item, Literal):
+                raise Refusal(
+                    "SIGMA_RENDER_VALUE",
+                    f"`{render_expr(item)}` is inside a membership list, and "
+                    f"Sigma's list holds constants only.",
+                    "render",
+                )
+            values.append(item.value)
+        return field.full, _Raw(
+            "[" + ", ".join(_quote(v) for v in values) + "]"
+        )
+    if operator in ("has", "has_any", "has_all", "contains_any", "contains_all"):
+        raise Refusal(
+            "SIGMA_RENDER_TERM_OPERATOR",
+            f"`{operator}` is a whole-token term test, and Sigma has no "
+            f"modifier for one: its `|contains` is a SUBSTRING test and would "
+            f"match more than the rule states. Express it as the field values "
+            f"you actually want, or keep this rule in a dialect that has term "
+            f"matching.",
+            "render",
+        )
     suffix = {
-        "contains": "|contains",
-        "startswith": "|startswith",
-        "endswith": "|endswith",
         "<": "|lt", "<=": "|lte", ">": "|gt", ">=": "|gte",
     }.get(operator, "")
+    if operator in _SUFFIX_NOCASE:
+        # A case fold the SOURCE asked for is Sigma's default here, so nothing
+        # is written. An exact-case test needs `|cased` spelled out, or
+        # exporting it silently widens the rule instead of narrowing it.
+        suffix = _SUFFIX_NOCASE[operator] if nocase else _SUFFIX_EXACT[operator]
     if isinstance(right, Regex):
-        return field.full + "|re", right.pattern
+        # `|re` is case-sensitive in Sigma and `|re|i` is not, so the fold has
+        # to travel with the pattern. Dropping it narrowed every
+        # case-insensitive regex on export.
+        key = field.full + ("|re|i" if right.nocase else "|re")
+        return key, right.pattern
     if isinstance(right, Literal):
         return field.full + suffix, right.value
     raise Refusal(
@@ -1561,7 +1706,9 @@ def _render_selection(expr: Expr, lines: list[str], indent: str) -> None:
                 f"in the condition, so this needs its own selection.",
                 "render",
             )
-        key, value = _render_value(expr.left, expr.right, expr.op)
+        key, value = _render_value(
+            expr.left, expr.right, expr.op, nocase=expr.nocase
+        )
         lines.append(f"{indent}{key}: {_quote(value)}")
         return
 
@@ -1578,7 +1725,7 @@ def _render_selection(expr: Expr, lines: list[str], indent: str) -> None:
                 fields.add(None)
                 break
             rendered_key, value = _render_value(
-                operand.left, operand.right, operand.op
+                operand.left, operand.right, operand.op, nocase=operand.nocase
             )
             fields.add(rendered_key)
             key = rendered_key
@@ -1653,6 +1800,38 @@ def _render_selection(expr: Expr, lines: list[str], indent: str) -> None:
     )
 
 
+def _negation_as_not(expr: Expr) -> Expr:
+    """A per-field negation, rewritten as `Not(<positive form>)`.
+
+    Sigma has no per-field negation: it negates a whole named selection in
+    `condition:`. `Comparison` carries the negation TWO ways -- the `!=`
+    operator and the `negate` flag -- and `_render_value` used to have no entry
+    for `!=`, so
+
+        CommandLine != "x"
+
+    rendered as `CommandLine: x` under `condition: selection`, which is the
+    INVERSE of the rule: an exclusion became a detection. That is the worst
+    defect this renderer can have, because the output is valid, plausible, and
+    alerts on exactly the events the author suppressed.
+
+    Rewriting here rather than in `_render_selection` is deliberate: the
+    negation has to move OUT to the condition, so it is the condition splitter
+    that must see a `Not`, not the per-selection writer.
+    """
+    if isinstance(expr, Comparison):
+        positive: Comparison | None = None
+        if expr.op == "!=":
+            positive = Comparison("==", expr.left, expr.right, nocase=expr.nocase)
+        elif expr.negate:
+            positive = Comparison(expr.op, expr.left, expr.right, nocase=expr.nocase)
+        if positive is None:
+            return expr
+        # Two negations cancel: `!=` with `negate` set is a plain `==`.
+        return Not(positive) if not expr.negate or expr.op != "!=" else positive
+    return expr
+
+
 def _split_condition(condition: Expr) -> tuple[dict[str, Expr], str]:
     """A composed predicate back into named selections plus a condition.
 
@@ -1662,7 +1841,7 @@ def _split_condition(condition: Expr) -> tuple[dict[str, Expr], str]:
     and anything that cannot be cut along those lines is refused rather than
     reshaped into a rule that means something slightly different.
     """
-    operands = _flatten_and(condition)
+    operands = [_negation_as_not(o) for o in _flatten_and(condition)]
 
     selections: dict[str, Expr] = {}
     positive: list[Expr] = []

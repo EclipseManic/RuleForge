@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<!--
+  RuleForge: a local detection-rule workbench.
+
+  One page, four panes, no build step. The GUI is served straight off disk by
+  the stdlib HTTP server because the whole package has zero dependencies, and
+  that is what lets it run inside a locked-down SOC where npm and pip are not
+  available.
+
+  The builder edits the IR directly -- the same tagged JSON the codec reads and
+  writes. There is deliberately no second, simplified rule model in the
+  browser: a parallel representation is where "the GUI showed one thing and the
+  rendered rule said another" comes from.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RuleForge</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand" id="brand" title="Back to the home page">Rule<span>Forge</span></div>
+
+  <!-- Two levels, in the header, which is the shape Event Analyzer and
+       Phishing Mail Detector already use: Home explains the tool, Studio is
+       where the work happens. The left rail that listed all seven panes flat
+       is gone -- it was a second navigation surface for destinations that
+       belong to one of these two, and it made this tool the odd one out. -->
+  <nav class="tabs main-tabs" id="tabs" aria-label="Primary navigation">
+    <button class="tab active" data-main="home" data-pane="home">Home</button>
+    <button class="tab" data-main="studio" data-pane="build">Studio</button>
+  </nav>
+
+  <div class="topright">
+    <span class="local-status"><span class="status-dot"></span>Local only</span>
+    <label class="inline">Target
+      <select id="dialect"></select>
+    </label>
+    <button id="save" class="primary">Save version</button>
+  </div>
+</header>
+
+<!-- The sections of the Studio, shown only while the Studio is open. Every
+     pane that used to sit in the rail is still here, under the tab that owns
+     it, and the current one is named on the right. -->
+<nav class="tabs sub-tabs" id="subtabs" aria-label="Studio sections" hidden>
+  <button class="tab" data-pane="build">Workbench</button>
+  <button class="tab" data-pane="import">Import &amp; Explain</button>
+  <button class="tab" data-pane="fromlog">From Log</button>
+  <button class="tab" data-pane="datasets">Datasets</button>
+  <button class="tab" data-pane="testruns">Test Runs</button>
+  <button class="tab" data-pane="history">History</button>
+  <span class="sub-tabs-context">
+    <span class="eyebrow">Studio</span>
+    <span class="context-title" id="current-context">Home</span>
+  </span>
+</nav>
+
+<div id="toast" class="toast" hidden></div>
+
+<div class="app-shell">
+  <main class="app-content">
+
+<!-- ==================================================================
+     The landing pane.
+
+     The tool used to open straight onto the Build form: eleven metadata
+     fields, unexplained jargon, an output box reading "—", and no
+     indication of what any of it was for. Someone who had not written a
+     detection rule before had nowhere to start, and someone who had still
+     could not tell which of the four tabs did what.
+
+     So this pane says what the tool is, names the four things it does in
+     the order a person actually needs them, and -- most importantly --
+     offers a WORKED EXAMPLE. Reading a filled-in rule teaches the shape of
+     one faster than any amount of label text.
+
+     It is now the Home tab of the header rather than a flat entry in a
+     rail, and it is laid out the way the sibling tools lay out their own
+     overview: a hero with the claim and the two ways in, the workflow, and
+     the promises underneath. Every word that was here is still here.
+     ================================================================== -->
+<section class="pane active" id="pane-home">
+  <div class="home">
+
+    <!-- hero ---------------------------------------------------------- -->
+    <section class="home-hero">
+      <span class="hero-orb hero-orb--a" aria-hidden="true"></span>
+      <span class="hero-orb hero-orb--b" aria-hidden="true"></span>
+      <div class="hero-copy">
+        <span class="eyebrow">Local detection workbench</span>
+        <h1>A workbench for <em>detection rules</em>.</h1>
+        <p class="lead">
+          Write a rule once and read it in eight SIEM languages. Test it against
+          real log lines before it goes anywhere near production. Everything runs
+          on this machine &mdash; nothing is uploaded, and there is nothing to
+          install.
+        </p>
+        <div class="home-actions">
+          <button id="home-example" class="primary big">
+            Open a worked example
+          </button>
+          <button id="home-blank" class="big ghost">Start from nothing</button>
+        </div>
+        <p class="hint">
+          New to this? Take the example. It is a real credential-access rule,
+          already filled in, and you can watch it change language as you switch
+          the dialect at the top right.
+        </p>
+      </div>
+
+      <!-- The product in one picture: one Sigma rule, four of the eight
+           languages it can be read back in. Tabs are CSS-only so the landing
+           page keeps the stdlib-only promise: no script drives them. -->
+      <div class="hero-visual">
+        <div class="rule-preview" aria-label="One rule, read in four SIEM languages">
+          <div class="rule-preview-bar">
+            <span class="dot dot--r" aria-hidden="true"></span>
+            <span class="dot dot--y" aria-hidden="true"></span>
+            <span class="dot dot--g" aria-hidden="true"></span>
+            <span class="rule-preview-name">lsass-dump-comsvcs</span>
+            <span class="rule-preview-flag"><span class="pulse" aria-hidden="true"></span>local</span>
+          </div>
+
+          <div class="dialect-tabs">
+            <input type="radio" name="rf-dialect" id="rf-d-sigma" checked>
+            <label for="rf-d-sigma">Sigma</label>
+            <input type="radio" name="rf-dialect" id="rf-d-splunk">
+            <label for="rf-d-splunk">Splunk SPL</label>
+            <input type="radio" name="rf-dialect" id="rf-d-sentinel">
+            <label for="rf-d-sentinel">Sentinel KQL</label>
+            <input type="radio" name="rf-dialect" id="rf-d-qradar">
+            <label for="rf-d-qradar">QRadar AQL</label>
+
+            <div class="dialect-panes">
+              <pre class="dialect-pane"><span class="t-key">title</span>: <span class="t-str">LSASS dump via comsvcs</span>
+<span class="t-key">level</span>: high
+<span class="t-key">logsource</span>:
+    product: windows
+    category: process_creation
+<span class="t-key">detection</span>:
+    selection:
+        CommandLine|contains|all:
+            - <span class="t-str">'comsvcs.dll'</span>
+            - <span class="t-str">'MiniDump'</span>
+    condition: selection</pre>
+
+              <pre class="dialect-pane"><span class="t-comment">``` category=process_creation, product=windows --
+    map this to an index and sourcetype before deploying ```</span>
+<span class="t-key">index</span>=process_creation
+| <span class="t-key">where</span> (CommandLine LIKE <span class="t-str">"%comsvcs.dll%"</span>
+    AND CommandLine LIKE <span class="t-str">"%MiniDump%"</span>)</pre>
+
+              <pre class="dialect-pane"><span class="t-comment">// title: LSASS dump via comsvcs
+// severity: high
+// author: SOC</span>
+
+process_creation
+| <span class="t-key">where</span> (CommandLine <span class="t-key">contains_cs</span> <span class="t-str">"comsvcs.dll"</span>
+    <span class="t-key">and</span> CommandLine <span class="t-key">contains_cs</span> <span class="t-str">"MiniDump"</span>)
+| <span class="t-key">project</span> *</pre>
+
+              <pre class="dialect-pane"><span class="t-comment">-- title: LSASS dump via comsvcs
+-- severity: high
+-- author: SOC</span>
+<span class="t-key">SELECT</span> *
+<span class="t-key">FROM</span> process_creation
+<span class="t-key">WHERE</span> (CommandLine LIKE <span class="t-str">'%comsvcs.dll%'</span>
+    <span class="t-key">AND</span> CommandLine LIKE <span class="t-str">'%MiniDump%'</span>)</pre>
+            </div>
+          </div>
+
+          <div class="rule-preview-foot">
+            <span class="ok">parsed</span>
+            <span class="ok">explained</span>
+            <span class="ok">rendered</span>
+            <span class="rule-preview-note">
+              Eight dialects &middot; refusals named, never guessed
+            </span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- the counts ---------------------------------------------------- -->
+    <section class="home-stats" aria-label="What the workbench covers">
+      <div class="stat">
+        <span class="stat-num">8</span>
+        <span class="stat-label">SIEM dialects</span>
+      </div>
+      <div class="stat">
+        <span class="stat-num">0</span>
+        <span class="stat-label">Dependencies</span>
+      </div>
+      <div class="stat">
+        <span class="stat-num">4</span>
+        <span class="stat-label">Workflows</span>
+      </div>
+      <div class="stat">
+        <span class="stat-num">100%</span>
+        <span class="stat-label">Local &mdash; nothing uploaded</span>
+      </div>
+    </section>
+
+    <!-- the workflow -------------------------------------------------- -->
+    <section class="home-section">
+      <div class="home-section-head">
+        <span class="eyebrow">The workflow</span>
+        <h2>Four things, in the order you need them</h2>
+        <p class="section-lead">
+          Every one of them lives in the Studio, one tab away.
+        </p>
+      </div>
+
+      <div class="home-cards">
+        <button class="card" data-goto="build">
+          <span class="card-step">1</span>
+          <h3>Build</h3>
+          <p>
+            Describe what to match &mdash; a source, some conditions, optionally
+            a count over a time window. The rule is written out in your chosen
+            language as you type.
+          </p>
+        </button>
+        <button class="card" data-goto="import">
+          <span class="card-step">2</span>
+          <h3>Import &amp; Tune</h3>
+          <p>
+            Paste a rule somebody else wrote, in any of the eight languages. It
+            comes back explained in plain words, including the parts that do not
+            mean what they look like.
+          </p>
+        </button>
+        <button class="card" data-goto="fromlog">
+          <span class="card-step">3</span>
+          <h3>From Log</h3>
+          <p>
+            Paste a few log lines of the same event. It reports which fields are
+            steady enough to detect on and which only look steady, then proposes
+            a rule from the steady ones.
+          </p>
+        </button>
+        <button class="card" data-goto="history">
+          <span class="card-step">4</span>
+          <h3>History</h3>
+          <p>
+            Every saved version, with where it came from &mdash; authored,
+            imported, or proposed from a log &mdash; and what it was derived
+            from.
+          </p>
+        </button>
+      </div>
+    </section>
+
+    <!-- the claims ---------------------------------------------------- -->
+    <section class="home-section">
+      <div class="home-section-head">
+        <span class="eyebrow">Why it is built this way</span>
+        <h2>What it refuses to do</h2>
+        <p class="section-lead">
+          Refuses rather than guesses. Every verdict carries its evidence
+          boundary.
+        </p>
+      </div>
+
+      <div class="home-foot">
+        <div>
+          <h4>It refuses rather than guesses</h4>
+          <p>
+            When a rule cannot be expressed in the language you asked for, you
+            get a sentence explaining what would have gone wrong &mdash; not a
+            best-effort translation that quietly matches more than you meant.
+          </p>
+        </div>
+        <div>
+          <h4>Three answers, not two</h4>
+          <p>
+            A test returns <em>matched</em>, <em>no match</em>, or
+            <em>could not tell</em>. The third one matters: a rule testing a
+            field your sample does not contain has not failed to match &mdash;
+            the question was never answered.
+          </p>
+        </div>
+        <div>
+          <h4>Languages it speaks</h4>
+          <p id="home-dialects" class="mono-small">&mdash;</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- the way in ---------------------------------------------------- -->
+    <section class="home-cta">
+      <div class="home-cta-copy">
+        <h3>Start in the Studio</h3>
+        <p>
+          Six sections under one tab: build the rule, import and explain
+          somebody else's, propose one from log lines, keep the datasets and the
+          test runs that back it, and read every version back.
+        </p>
+      </div>
+      <div class="home-cta-actions">
+        <button class="primary big" data-goto="build">Open the Studio</button>
+        <button class="big ghost" data-goto="datasets">Browse datasets</button>
+      </div>
+      <div class="home-signature">RuleForge <span>local build</span></div>
+    </section>
+  </div>
+</section>
+
+<!-- ================================================================== -->
+<section class="pane" id="pane-build">
+  <div class="three-col">
+
+    <!-- metadata ------------------------------------------------------- -->
+    <div class="col scroll">
+      <h2>What it is called</h2>
+      <!-- Heading changed from "Rule": this column is the rule's paperwork,
+           not the rule. Calling it "Rule" put the least important fields in
+           the most prominent position and implied the detection lived here. -->
+      <label class="field">Rule id<input id="rule-id" type="text" placeholder="lsass-ntlm-001"></label>
+      <p class="hint">A short stable handle for this rule. Any text you will
+        recognise later &mdash; it is not shown in alerts.</p>
+      <label class="field">Title<input id="an-title" type="text" placeholder="Credential access then NTLM lateral movement"></label>
+      <label class="field">Description<textarea id="an-description" rows="3"></textarea></label>
+      <div class="row2">
+        <label class="field">Severity
+          <select id="an-severity">
+            <option value="">—</option>
+            <option>informational</option><option>low</option>
+            <option>medium</option><option>high</option><option>critical</option>
+          </select>
+        </label>
+        <label class="field">Author<input id="an-author" type="text"></label>
+      </div>
+      <label class="field">MITRE ATT&amp;CK
+        <input id="an-mitre" type="text" placeholder="credential-access: T1003, T1003.001">
+      </label>
+      <p class="hint">One tactic per line, techniques comma-separated after a colon.</p>
+      <label class="field">References<textarea id="an-references" rows="2" placeholder="one URL per line"></textarea></label>
+      <label class="field">Known false positives<textarea id="an-fps" rows="2" placeholder="one per line"></textarea></label>
+
+      <h2>Source table</h2>
+      <!-- These three had no explanation anywhere in the page. "Index-time
+           selector" and "Time field" are terms somebody who has not run a
+           SIEM has never met, and the only way to find out what they meant
+           was to type something and see what happened. -->
+      <label class="field">Table<input id="read-table" type="text" placeholder="SecurityEvent"></label>
+      <p class="hint">Where the events come from &mdash; the index, table or
+        data stream your SIEM reads. In Sentinel that is a table name like
+        <code>SecurityEvent</code>; in Splunk it is an index.</p>
+      <label class="field">Index-time selector<input id="read-selector" type="text" placeholder="index=main sourcetype=..."></label>
+      <p class="hint">An extra narrowing your SIEM applies <em>before</em> any
+        event is read, written in that SIEM's own words. Leave it blank unless
+        you are pasting a rule that had one. It is kept exactly as written and
+        is never applied when you test against a sample here, because no
+        sample can reproduce it &mdash; so a test says so rather than
+        pretending.</p>
+      <label class="field">Time field<input id="read-timefield" type="text" placeholder="TimeGenerated"></label>
+      <p class="hint">Which field holds each event's timestamp. Only needed if
+        the rule counts events over a time window; otherwise leave it
+        blank.</p>
+    </div>
+
+    <!-- pipeline ------------------------------------------------------- -->
+    <div class="col scroll">
+      <h2>What it matches
+        <span class="spacer"></span>
+         <select id="add-stage-kind" class="mini" aria-label="Stage type to add">
+          <option value="Filter">Filter &mdash; keep matching events</option>
+          <option value="Aggregate">Aggregate &mdash; count or summarise</option>
+          <option value="Correlation">Correlation &mdash; N times in a window</option>
+          <option value="Sequence">Sequence &mdash; this, then that</option>
+          <option value="Distinct">Distinct &mdash; drop duplicates</option>
+          <option value="Project">Project &mdash; choose columns</option>
+          <option value="Derive">Derive &mdash; compute a field</option>
+          <option value="Sort">Sort &mdash; order the results</option>
+          <option value="Limit">Limit &mdash; keep only N</option>
+          <option value="Expand">Expand &mdash; one row per list item</option>
+        </select>
+        <button id="add-stage" class="mini">Add</button>
+      </h2>
+      <!-- The heading was "Pipeline", which names the implementation rather
+           than the thing. Each step is explained in the dropdown now, because
+           a bare list of nine nouns tells a newcomer nothing about which one
+           they want. -->
+      <p class="hint">Steps run top to bottom: each one receives the events the
+        step above it kept. Most rules are a single <strong>Filter</strong>.</p>
+      <div id="stages"></div>
+      <p class="hint">Every rule ends in an output stage. That is not decoration:
+        a pipeline with no stated output returns whatever the last stage happened
+        to leave.</p>
+    </div>
+
+    <!-- output --------------------------------------------------------- -->
+    <div class="col scroll">
+      <h2>Rendered
+        <!-- The language is named beside the text. Without it the pane and
+             the dialect dropdown could disagree silently, which is how KQL
+             came to be displayed under a dropdown reading Splunk. -->
+        <span id="rendered-for" class="badge"></span>
+        <span class="spacer"></span>
+        <button id="render" class="mini">Render</button>
+        <button id="validate" class="mini">Validate</button>
+      </h2>
+      <pre id="rendered" class="code">—</pre>
+      <div id="diagnostics"></div>
+
+      <h2>Test against a sample
+        <span class="spacer"></span>
+        <button id="run" class="mini primary">Run</button>
+      </h2>
+      <p class="hint">One JSON event per line, or a JSON array. Fields must
+        already be parsed — raw log text goes in the From&nbsp;Log tab.</p>
+      <label class="field">Sample format<select id="events-format">
+        <option value="jsonl">one JSON object per line</option>
+        <option value="json">a JSON array</option>
+        <option value="kv">key=value</option>
+        <option value="syslog">syslog</option>
+      </select></label>
+       <textarea id="events" rows="6" class="code" aria-label="Sample events" placeholder='{"EventID": 4624, "Computer": "HOST1"}'></textarea>
+      <div id="evaluation"></div>
+
+      <h2>Save as evidence
+        <span class="spacer"></span>
+        <span class="badge declared">immutable run</span>
+      </h2>
+      <label class="field">Dataset<select id="build-dataset"></select></label>
+      <label class="field">Expected verdict<select id="build-expected"><option value="">No expectation</option><option value="matched">Matched</option><option value="no_match">No match</option><option value="not_evaluated">Not evaluated</option></select></label>
+      <button id="run-save-evidence" class="primary wide">Run and save evidence</button>
+      <p id="build-evidence-status" class="hint">Select a dataset to bind this rule run to named telemetry.</p>
+    </div>
+
+  </div>
+</section>
+
+<!-- ================================================================== -->
+<section class="pane" id="pane-import">
+  <div class="two-col">
+    <div class="col scroll">
+      <h2>Paste an existing rule</h2>
+      <p class="hint">It is parsed into the builder, so you can read what it
+        actually says and tune it rather than editing text and hoping. Anything
+        that cannot be represented is reported rather than dropped.</p>
+      <label class="field">Dialect of the pasted rule
+        <select id="import-dialect"></select>
+      </label>
+       <textarea id="import-text" rows="22" class="code" aria-label="Rule to import" placeholder="SecurityEvent&#10;| where EventID == 4624&#10;| where LogonType == 3"></textarea>
+      <button id="import-go" class="primary wide">Analyze and load into builder</button>
+    </div>
+    <div class="col scroll">
+      <h2>What this rule says</h2>
+      <div id="import-outline" class="outline">—</div>
+      <h2>Diagnostics</h2>
+      <div id="import-diagnostics"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================================================================== -->
+<section class="pane" id="pane-fromlog">
+  <div class="two-col">
+    <div class="col scroll">
+      <h2>Paste log samples</h2>
+      <p class="hint">Paste <strong>two or more</strong> events of the same kind.
+        One event cannot tell a stable field from a volatile one, and a rule
+        that pins every field of a single log line matches exactly that line.</p>
+      <label class="field">Format
+        <select id="log-format">
+          <option value="jsonl">JSON, one object per line</option>
+          <option value="json">JSON array</option>
+          <option value="kv">key=value pairs</option>
+          <option value="syslog">Syslog with key=value body</option>
+        </select>
+      </label>
+       <textarea id="log-text" rows="16" class="code" aria-label="Log samples" placeholder='{"EventID": 4624, "Computer": "HOST1", "ProcessId": 4821, "TimeCreated": "2026-01-01T10:00:00Z"}&#10;{"EventID": 4624, "Computer": "HOST2", "ProcessId": 9134, "TimeCreated": "2026-01-01T10:00:04Z"}'></textarea>
+
+      <h2>Options</h2>
+      <label class="field">Table / index<input id="log-table" type="text" placeholder="SecurityEvent"></label>
+      <div class="row2">
+        <label class="check"><input type="checkbox" id="opt-skip-volatile" checked> Skip fields that differ between samples</label>
+        <label class="check"><input type="checkbox" id="opt-skip-timestamps" checked> Skip timestamps and ids</label>
+      </div>
+      <div class="row2">
+        <label class="check"><input type="checkbox" id="opt-threshold"> Add a count threshold</label>
+        <label class="field">Group by<input id="opt-groupby" type="text" placeholder="Computer, Account"></label>
+      </div>
+      <button id="log-go" class="primary wide">Analyze samples and propose a rule</button>
+    </div>
+    <div class="col scroll">
+      <h2>Field analysis</h2>
+      <div id="log-fields" class="outline">—</div>
+      <h2>What to check</h2>
+      <!-- The generator's own doubts, next to its output. A proposed rule
+           shown without them reads like an authored one, and a proposed rule
+           that reads like an authored one gets deployed without review. -->
+      <div id="log-messages" class="outline">—</div>
+      <p class="hint">A proposed rule is a hypothesis, not a detection. It is
+        saved to history marked <em>synthesized</em> so nobody mistakes it for
+        one somebody decided on.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ================================================================== -->
+<section class="pane" id="pane-datasets">
+  <div class="page-shell">
+    <div class="page-heading">
+      <div>
+        <div class="eyebrow">EVIDENCE LIBRARY</div>
+        <h1>Datasets</h1>
+        <p class="page-subtitle">Keep representative telemetry local, named, and replayable.</p>
+      </div>
+      <div class="page-actions"><button id="dataset-refresh" class="mini">Refresh</button></div>
+    </div>
+    <div class="dataset-layout">
+      <section class="surface dataset-create">
+        <div class="section-heading"><div><span class="eyebrow">NEW FIXTURE</span><h2>Add dataset</h2></div></div>
+        <label class="field">Name<input id="dataset-name" type="text" placeholder="Windows login baseline"></label>
+        <div class="row2">
+          <label class="field">Format<select id="dataset-format"><option value="jsonl">JSONL</option><option value="json">JSON array</option><option value="kv">Key/value</option><option value="syslog">Syslog</option></select></label>
+          <label class="field">Table / index<input id="dataset-table" type="text" value="events" placeholder="SecurityEvent"></label>
+        </div>
+        <label class="field">Labels<input id="dataset-labels" type="text" placeholder="benign, windows, baseline"></label>
+        <label class="field">Description<textarea id="dataset-description" rows="2" placeholder="What this sample represents and where it came from."></textarea></label>
+        <label class="field">Raw events<textarea id="dataset-text" rows="11" class="code" placeholder='{"EventID": 4624, "Computer": "WS-01"}'></textarea></label>
+        <button id="dataset-save" class="primary wide">Save local dataset</button>
+      </section>
+      <section class="surface dataset-list-panel">
+        <div class="section-heading"><div><span class="eyebrow">LOCAL TELEMETRY</span><h2>Available datasets</h2></div><span id="dataset-count" class="count-badge">0</span></div>
+       <div class="filter-row"><input id="dataset-q" type="text" aria-label="Search datasets" placeholder="Search datasets"><button id="dataset-search" class="mini">Search</button></div>
+        <div id="dataset-list" class="dataset-list"></div>
+        <div id="dataset-preview" class="dataset-preview empty">Select a dataset to inspect its normalized events.</div>
+      </section>
+    </div>
+  </div>
+</section>
+
+<section class="pane" id="pane-testruns">
+  <div class="page-shell">
+    <div class="page-heading">
+      <div>
+        <div class="eyebrow">REPLAY EVIDENCE</div>
+        <h1>Test runs</h1>
+        <p class="page-subtitle">Run the current rule against a named dataset and preserve the result.</p>
+      </div>
+      <div class="page-actions"><button id="test-run-refresh" class="mini">Refresh</button></div>
+    </div>
+    <div class="testrun-layout">
+      <section class="surface testrun-setup">
+        <div class="section-heading"><div><span class="eyebrow">REPRODUCIBLE RUN</span><h2>Configure test</h2></div></div>
+        <label class="field">Dataset<select id="test-run-dataset"></select></label>
+        <label class="field">Expected verdict<select id="test-run-expected"><option value="">No expectation — exploratory</option><option value="matched">Matched</option><option value="no_match">No match</option><option value="not_evaluated">Not evaluated</option></select></label>
+        <label class="field">Purpose<select id="test-run-purpose"><option value="manual">Manual check</option><option value="positive">Positive fixture</option><option value="negative">Benign / negative fixture</option><option value="regression">Regression</option></select></label>
+        <label class="field">Run note<textarea id="test-run-note" rows="4" placeholder="What question is this run answering?"></textarea></label>
+        <button id="test-run-save" class="primary wide">Run and save evidence</button>
+        <p class="hint">The run stores the rule hash, dataset hash, evaluator result, trace, and caveats. It does not claim vendor-runtime equivalence.</p>
+      </section>
+      <section class="surface testrun-result-panel">
+        <div class="section-heading"><div><span class="eyebrow">SELECTED RESULT</span><h2>Evidence</h2></div></div>
+        <div id="test-run-result" class="empty">Run a test to see the verdict and stage trace.</div>
+      </section>
+      <section class="surface testrun-history-panel">
+        <div class="section-heading"><div><span class="eyebrow">IMMUTABLE LOG</span><h2>Recent runs</h2></div><span id="test-run-count" class="count-badge">0</span></div>
+        <div id="test-run-list" class="testrun-list"></div>
+      </section>
+    </div>
+  </div>
+</section>
+
+<section class="pane" id="pane-history">
+  <div class="two-col">
+    <div class="col scroll">
+      <h2>Versions
+        <span class="spacer"></span>
+        <button id="history-refresh" class="mini">Refresh</button>
+      </h2>
+      <div class="row3">
+         <input id="history-q" type="text" aria-label="Search history" placeholder="search title, id, note">
+         <select id="history-origin" aria-label="Filter history by origin">
+          <option value="">any origin</option>
+          <option value="authored">authored</option>
+          <option value="imported">imported</option>
+          <option value="synthesized">synthesized</option>
+        </select>
+         <select id="history-dialect" aria-label="Filter history by dialect"><option value="">any dialect</option></select>
+      </div>
+      <div id="history-list"></div>
+    </div>
+    <div class="col scroll">
+      <h2>Lineage</h2>
+      <p class="hint">History is append-only. Tuning a rule writes a new
+        version pointing at the one it came from, so "put it back how it was"
+        is always answerable.</p>
+      <div id="history-lineage" class="outline">Select a version.</div>
+    </div>
+  </div>
+</section>
+
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

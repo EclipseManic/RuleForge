@@ -237,12 +237,33 @@ class FieldRef:
 
 @dataclass(frozen=True, slots=True)
 class Comparison:
-    """A binary comparison. `op` is drawn from the closed set in values.py."""
+    """A binary comparison. `op` is drawn from the closed set in values.py.
+
+    `nocase` is FIRST-CLASS DATA, and that is the most important thing about
+    this node.
+
+    Case-insensitivity used to exist only on `Regex`, so every dialect had to
+    encode a case-insensitive substring test as a regex -- and a regex is a
+    PATTERN, not a literal. That one modelling gap caused three separate
+    classes of defect at once:
+
+        * a literal containing a regex metacharacter changed meaning
+          (`C:\\Users` became a pattern),
+        * a non-ASCII literal was refused, because the portable-regex screen
+          only accepts ASCII, so `José` could not be imported at all, and
+        * the case fold was silently dropped by every renderer that had no
+          regex spelling for the operator.
+
+    Carrying the fold on the comparison keeps `contains` a SUBSTRING test and
+    lets each renderer pick its own native spelling: `contains` in KQL,
+    `ILIKE` in AQL, `stringContains~` in EQL, `lower()` in SPL.
+    """
 
     op: str
     left: Expr
     right: Expr
     negate: bool = False
+    nocase: bool = False
 
     def __post_init__(self) -> None:
         if self.op not in COMPARISON_OPS:
@@ -254,7 +275,11 @@ class Comparison:
             )
 
     def describe(self) -> str:
-        body = f"{_describe(self.left)} {self.op} {_describe(self.right)}"
+        # The fold is shown because it changes which events match. A rule
+        # displayed without it reads as exact-case, and an analyst comparing
+        # the panel to the rendered text would be looking at two detections.
+        fold = " nocase" if self.nocase else ""
+        body = f"{_describe(self.left)} {self.op}{fold} {_describe(self.right)}"
         if not self.negate:
             return body
         # `negate` is DATA on the node rather than a wrapped `Not`, so it has to
@@ -262,6 +287,7 @@ class Comparison:
         # wrote: `cmd !~ "lsass"` displayed as `cmd matches /lsass/` is a rule
         # matching exactly the events the author excluded.
         return f"NOT ({body})"
+
 
 
 @dataclass(frozen=True, slots=True)

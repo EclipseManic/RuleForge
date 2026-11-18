@@ -410,8 +410,14 @@ class TheParserReadsWhatTheRendererWrites(unittest.TestCase):
         # The source comment is present on the first pass only, because the
         # re-imported rule IS native SPL and its selector is reused directly.
         # What must agree is the predicate.
-        self.assertIn('Image LIKE "%/lsass.exe"', once)
-        self.assertIn('Image LIKE "%/lsass.exe"', twice)
+        # Sigma's `|endswith` is case-INSENSITIVE by specification, so the
+        # predicate now carries the fold as SPL's own idiom: `lower(field)
+        # LIKE "...lowercased..."`. It used to render as exact-case
+        # `Image LIKE "%/lsass.exe"`, which silently narrowed the detection --
+        # `/LSASS.EXE` would not have matched.
+        self.assertIn('lower(Image) LIKE "%/lsass.exe"', once)
+        # Still stable on the second pass, which is what this test is for.
+        self.assertIn('LIKE "%/lsass.exe"', twice)
 
     def test_a_native_rule_renders_identically_twice(self):
         from engine import dialects

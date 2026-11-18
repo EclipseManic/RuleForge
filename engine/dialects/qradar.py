@@ -1250,14 +1250,26 @@ def _render_expression(expr: Expr) -> str:
         return _field(expr)
     if isinstance(expr, Regex):
         if expr.dialect != REGEX_DIALECT:
-            raise Refusal(
-                "AQL_RENDER_REGEX_DIALECT",
-                f"this pattern is {expr.dialect}, and AQL's MATCHES is Java "
-                f"regex. Writing it out unchanged would hand QRadar a pattern "
-                f"in a syntax it reads differently.",
-                "render",
-            )
-        return _literal(expr.pattern)
+            # POSIX ERE and Java regex agree on the portable subset, so a
+            # pattern that passes the portable screen means the same thing in
+            # both. Refusing on the DIALECT TAG alone rejected `-enc`, `^power`
+            # and `\.exe$`, which are identical in every flavour.
+            from ..evaluate import _screen_portable
+
+            try:
+                _screen_portable(expr.pattern)
+            except Refusal:
+                raise Refusal(
+                    "AQL_RENDER_REGEX_DIALECT",
+                    f"this pattern is {expr.dialect}, and AQL's MATCHES is Java "
+                    f"regex. Writing it out unchanged would hand QRadar a "
+                    f"pattern in a syntax it reads differently.",
+                    "render",
+                ) from None
+        # Java regex has the inline flag, and AQL MATCHES is case-sensitive:
+        # dropping the fold would narrow every rule that carried one.
+        prefix = "(?i)" if expr.nocase else ""
+        return _literal(prefix + expr.pattern)
     if isinstance(expr, Not):
         return f"NOT ({_render_expression(expr.operand)})"
     if isinstance(expr, Span):

@@ -1789,6 +1789,17 @@ def _render_comparison(expr: Comparison) -> str:
             f"change what the rule matches.",
             "render",
         )
+    # KQL's `contains`/`startswith`/`endswith` are case-INSENSITIVE and the
+    # `_cs` forms are the exact-case ones. The table above can name only one
+    # of each pair, so the FOLD decides which. Without this, a Sigma
+    # `|contains` (ignore-case by specification) came out as `contains_cs` and
+    # every uppercase match was silently lost on export.
+    if expr.nocase:
+        spelled = {
+            "contains_cs": "contains",
+            "startswith_cs": "startswith",
+            "endswith_cs": "endswith",
+        }.get(spelled, spelled)
     right = _render_expression(expr.right)
     if expr.negate:
         flipped = {"==": "!=", "!=": "==", "<": ">=", ">=": "<",

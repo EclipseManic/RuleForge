@@ -1510,6 +1510,18 @@ def _render_operand(expr: Expr, event: str) -> str:
     )
 
 
+#: Characters RE2 reads as syntax, so a literal containing one has to be
+#: escaped before it can be written as a pattern.
+_REGEX_META: Final = frozenset("\\^$.*+?()[]{}|")
+
+
+def _escape_regex(value: Any) -> str:
+    """A literal as an RE2 pattern that matches that literal and nothing else."""
+    return "".join(
+        "\\" + char if char in _REGEX_META else char for char in str(value)
+    )
+
+
 def _render_comparison(expr: Comparison, event: str) -> str:
     left = _render_operand(expr.left, event)
 
@@ -1540,6 +1552,22 @@ def _render_comparison(expr: Comparison, event: str) -> str:
         return f"not {text}" if expr.negate else text
 
     if expr.op in ("contains", "startswith", "endswith"):
+        if expr.nocase:
+            # `strings.contains` is case-SENSITIVE, and YARA-L has no folded
+            # variant by name. A regex with the `nocase` modifier is the
+            # documented way to say it, and it round-trips through the parser.
+            if not isinstance(expr.right, Literal) \
+                    or not isinstance(expr.right.value, str):
+                raise Refusal(
+                    "YARAL_RENDER_NOCASE_NOT_LITERAL",
+                    f"`{expr.op}` ignoring case needs a constant to fold, and "
+                    f"`{render_expr(expr.right)}` is not one.",
+                    "render",
+                )
+            body = _escape_regex(expr.right.value)
+            anchor = {"contains": "", "startswith": "^", "endswith": "$"}[expr.op]
+            text = f"{left} = /{anchor}{body}/ nocase"
+            return f"not {text}" if expr.negate else text
         spelled = {
             "contains": "strings.contains",
             "startswith": "strings.starts_with",
@@ -1599,6 +1627,13 @@ def _render_measure(measure: Measure, event: str) -> str:
         # needs a threshold to compare against, and an aggregate with no
         # threshold has nothing to put there. So it is refused, with the
         # spelling named.
+        #
+        # NOTE: mapping it to `count($e.metadata.event_type)` was tried and
+        # reverted. It renders, but the round trip then merges the two Filters
+        # of a threshold rule into one, and
+        # `test_fidelity.RenderedOutputCanBeReadBack` rejects the change of
+        # stage shape. That mismatch is a decision about how much shape the
+        # round trip must preserve, not something to paper over here.
         raise Refusal(
             "YARAL_RENDER_COUNT_WITHOUT_A_FIELD",
             f"`{measure.name}` counts rows rather than values, and every "

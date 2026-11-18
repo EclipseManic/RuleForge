@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import re
 import sys
 import traceback
 from decimal import Decimal
@@ -209,6 +210,68 @@ def _outline(rule: Rule) -> dict[str, Any]:
         if predicate is not None:
             body["predicate"] = render_expr(predicate)
 
+        # A stage whose meaning is in its SETTINGS rather than in a condition
+        # used to print as a bare word: a Correlation showed no frequency, no
+        # timeframe and no group key, so the clause that makes the rule a rule
+        # was invisible while the pane claimed nothing had been lost.
+        table = getattr(node, "table", None)
+        if table is not None:
+            body["table"] = table
+            selector = getattr(node, "selector", "")
+            if selector:
+                body["selector"] = selector
+            time_field = getattr(node, "time_field", "")
+            if time_field:
+                body["time_field"] = time_field
+
+        parent = getattr(node, "parent", None)
+        if parent is not None:
+            body["parent"] = parent
+            body["frequency"] = getattr(node, "frequency", None)
+            timeframe = getattr(node, "timeframe", None)
+            body["timeframe"] = _span(timeframe) if timeframe is not None else ""
+            body["group_by"] = [ref.full for ref in getattr(node, "group_by", ())]
+            body["count_subject"] = getattr(node, "count_subject", "")
+
+        measures = getattr(node, "measures", None)
+        if measures is not None:
+            body["measures"] = [
+                {
+                    "name": measure.name,
+                    "function": measure.function,
+                    "field": measure.field.full if measure.field else "",
+                    "distinct": bool(measure.distinct),
+                }
+                for measure in measures
+            ]
+            body["keys"] = [ref.full for ref in getattr(node, "keys", ())]
+            window = getattr(node, "window", None)
+            if window is not None:
+                # `window` is a Window (kind + size), not a Duration: the size
+                # is the span an analyst would write.
+                body["window"] = _span(window.size)
+                if getattr(window, "kind", ""):
+                    body["window_kind"] = window.kind
+
+        keeps = getattr(node, "keeps", None)
+        if keeps is not None:
+            body["keeps"] = [ref.full for ref in keeps]
+            body["dedupe_by"] = [ref.full for ref in getattr(node, "dedupe_by", ())]
+
+        keys = getattr(node, "keys", None)
+        if keys is not None and measures is None:
+            # Sort and Distinct both key on fields; Sort pairs each key with a
+            # direction, which is the part a reader needs to see.
+            described = []
+            for key in keys:
+                if (isinstance(key, tuple) and len(key) == 2
+                        and hasattr(key[0], "full")):
+                    described.append(
+                        {"field": key[0].full, "descending": bool(key[1])})
+                elif hasattr(key, "full"):
+                    described.append(key.full)
+            body["keys"] = described
+
         # A Sequence carries its conditions on its STEPS, not on a `condition`
         # attribute, so the generic lookups above find nothing and the most
         # complex stage in the model rendered as a bare word. The ordering is
@@ -257,6 +320,93 @@ def _outline(rule: Rule) -> dict[str, Any]:
         ],
         "pipeline": [stage(n) for n in rule.pipeline],
     }
+# ---------------------------------------------------------------------------
+# The vocabulary
+# ---------------------------------------------------------------------------
+#
+# The operator list and the code list are COMPUTED from the engine, never
+# restated in the page. Four hand-written copies of the operator list had
+# already drifted -- `has` was in some and `=~` in others -- and the Reference
+# page advertised "every code this tool can show you" while listing 26 of more
+# than 400. A list maintained by hand is a list that is eventually wrong.
+
+#: A right-hand side that parses for each operator, so the engine can be ASKED
+#: what it reads and writes rather than trusted to a table.
+_PROBE_VALUES: Final[dict[str, str]] = {
+    "==": '"x"', "!=": '"x"', "<": "1", "<=": "1", ">": "1", ">=": "1",
+    "=~": '"x"', "!~": '"x"', "like": '"x%"', "ilike": '"x%"',
+    "contains": '"x"', "startswith": '"x"', "endswith": '"x"', "has": '"x"',
+    "in": '("a", "b")', "has_any": '("a", "b")', "has_all": '("a", "b")',
+    "contains_any": '("a", "b")', "contains_all": '("a", "b")',
+    "matches": 'regex "x"',
+}
+
+_VOCABULARY: list[dict[str, Any]] | None = None
+_CODES: list[str] | None = None
+
+_CODE_PATTERN: Final = re.compile(
+    r'(?:Refusal|Caveat)\(\s*"([A-Z][A-Z0-9_]{2,})"|code="([A-Z][A-Z0-9_]{2,})"'
+)
+
+
+def _operator_coverage() -> list[dict[str, Any]]:
+    """Each authorable operator, and the targets that can actually write it.
+
+    "Can this target express this operator" is answered by rendering it, not by
+    reading a table, so the answer cannot drift away from the renderers.
+    """
+    global _VOCABULARY
+    if _VOCABULARY is not None:
+        return _VOCABULARY
+
+    from engine.values import AUTHORABLE_OPS, LIST_OPS
+
+    rows: list[dict[str, Any]] = []
+    for op in sorted(AUTHORABLE_OPS):
+        row: dict[str, Any] = {
+            "op": op,
+            "list": op in LIST_OPS,
+            "readable": False,
+            "targets": [],
+        }
+        text = f"SecurityEvent | where FieldName {op} {_PROBE_VALUES[op]}"
+        try:
+            rule, _ = dialects.lower("sentinel", text, "vocabulary")
+        except Refusal:
+            # Offered by the form but not read back by the parser: the exact
+            # gap that produced a refusal blaming the field.
+            row["note"] = "this build cannot read this operator back"
+            rows.append(row)
+            continue
+        row["readable"] = True
+        for entry in dialects.ready_dialects():
+            try:
+                dialects.render(entry.key, rule)
+            except Refusal:
+                continue
+            row["targets"].append(entry.key)
+        rows.append(row)
+
+    _VOCABULARY = rows
+    return rows
+
+
+def _code_index() -> list[str]:
+    """Every refusal code this build can raise, read out of the source once."""
+    global _CODES
+    if _CODES is not None:
+        return _CODES
+
+    found: set[str] = set()
+    root = _WEB_ROOT.parent / "engine"
+    for path in root.rglob("*.py"):
+        source = path.read_text(encoding="utf-8", errors="ignore")
+        for literal, keyword in _CODE_PATTERN.findall(source):
+            found.add(literal or keyword)
+    # Raised by this module rather than by the engine.
+    found.update({"INTERNAL", "ROUTE_UNKNOWN", "NOT_FOUND", "PATH_OUTSIDE_STATIC"})
+    _CODES = sorted(found)
+    return _CODES
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +467,14 @@ class Api:
         is navigable, and a missing entry looks like a bug.
         """
         return {"dialects": dialects.catalogue()}
+
+    def vocabulary(self) -> dict[str, Any]:
+        """The operators the form may offer, and every code this build raises.
+
+        Both come from the engine so the page cannot hold a fourth opinion
+        about either.
+        """
+        return {"operators": _operator_coverage(), "codes": _code_index()}
 
     # -- pillar 2: paste a rule, read it, tune it -------------------------
 
@@ -825,13 +983,11 @@ class RuleForgeHandler(BaseHTTPRequestHandler):
         if refusal.code in _TOO_LARGE_CODES:
             status = HTTPStatus.REQUEST_ENTITY_TOO_LARGE
             self._drain()
-        self._send(status, {
-            "error": {
-                "code": refusal.code,
-                "message": refusal.message,
-                "where": refusal.where,
-            }
-        })
+        # The whole refusal, not three fields of it. `node`, `field`,
+        # `operator` and `alternatives` are what let the page point at the
+        # condition that failed and offer a way out; dropping them here meant
+        # the engine could describe a refusal and the page could only print it.
+        self._send(status, {"error": refusal.as_dict()})
 
     def _drain(self) -> None:
         """Read and discard the request body, up to `_DRAIN_LIMIT`.
@@ -994,8 +1150,16 @@ class RuleForgeHandler(BaseHTTPRequestHandler):
                 if route in ("/", "/index.html"):
                     self._serve_file(_TEMPLATE_ROOT / "index.html", "text/html")
                     return
+                # The previous single-page UI, kept reachable while the rebuild
+                # is checked against it. Removed once parity is accepted.
+                if route in ("/classic", "/classic.html"):
+                    self._serve_file(_TEMPLATE_ROOT / "classic.html", "text/html")
+                    return
                 if route.startswith("/static/"):
                     self._serve_static(route[len("/static/"):])
+                    return
+                if route == "/api/vocabulary":
+                    self._send(HTTPStatus.OK, self.api.vocabulary())
                     return
                 if route == "/api/dialects":
                     self._send(HTTPStatus.OK, self.api.dialects())

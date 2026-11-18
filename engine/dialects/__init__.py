@@ -559,6 +559,166 @@ def _annotation_diagnostics(key: str, rule: Rule) -> list[Diagnostic]:
     )]
 
 
+def _comparisons(rule: Rule) -> list[dict[str, Any]]:
+    """Every comparison in a rule, flattened, in pipeline order.
+
+    `comparable` is False when the comparison was not written against a plain
+    field -- `lower(User) LIKE "%bob%"` comes back with a Call on the left. The
+    audit then has nothing it can line up, and guessing would be worse than
+    saying nothing.
+    """
+    found: list[dict[str, Any]] = []
+    streams = [rule.pipeline] + [b.pipeline for b in rule.bindings]
+
+    def walk(expr: Any, negated: bool = False) -> None:
+        if expr is None:
+            return
+        name = type(expr).__name__
+        if name == "Not":
+            walk(expr.operand, not negated)
+            return
+        if name == "Comparison":
+            right = expr.right
+            value = ""
+            fold = bool(getattr(expr, "nocase", False))
+            if type(right).__name__ == "Regex":
+                value = right.pattern
+                fold = fold or bool(right.nocase)
+            elif type(right).__name__ == "Literal":
+                value = _literal_text(right.value)
+            elif type(right).__name__ == "ListExpr":
+                value = "|".join(
+                    _literal_text(item.value) for item in right.items
+                    if type(item).__name__ == "Literal"
+                )
+            flipped = bool(expr.negate) != negated
+            op = expr.op
+            if flipped and op == "==":
+                op = "!="
+            elif flipped and op == "!=":
+                op = "=="
+            found.append({
+                "op": op,
+                "fold": fold,
+                "value": value,
+                "comparable": type(expr.left).__name__ == "FieldRef",
+            })
+            return
+        for attribute in ("operands", "operand", "left", "right"):
+            child = getattr(expr, attribute, None)
+            if isinstance(child, (list, tuple)):
+                for item in child:
+                    walk(item, negated)
+            elif child is not None and hasattr(child, "op"):
+                walk(child, negated)
+
+    for stream in streams:
+        for node in stream:
+            walk(getattr(node, "condition", None))
+            walk(getattr(node, "predicate", None))
+            for step in getattr(node, "steps", ()) or ():
+                walk(getattr(step, "condition", None))
+    return found
+
+
+def _literal_text(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
+def _wildcard_neutral(text: str) -> str:
+    """`%` and `*` are the same wildcard in different languages."""
+    return text.replace("%", "*").replace("_", "?")
+
+
+def _fidelity_diagnostics(key: str, rule: Rule, text: str) -> list[Diagnostic]:
+    """What the rendered text means compared with what the rule meant.
+
+    "Rendered without raising" was being treated as fidelity. Nothing compared
+    the operator, the case fold or the value before and after, so a dropped
+    case fold and an inverted `!=` both came back with an EMPTY diagnostic list
+    and the pane reported success.
+
+    The check is a round trip: read the dialect's own output back and compare
+    each comparison with the one it was written from.
+
+    It is deliberately conservative. A diagnostic that fires on a CORRECT
+    render is the same fault as a pane that says "nothing was lost" over a
+    lossy one, so a comparison is only reported when both readings line up:
+    the same field, the same operator. `QRadar LIKE` and `Splunk lower(x)` are
+    both case-insensitive without carrying a fold flag, and neither is called a
+    loss. Silence on a real loss is the old behaviour; a false alarm would be a
+    new bug.
+    """
+    entry = REGISTRY.get(key)
+    if entry is None or not entry.can_parse:
+        return []
+    try:
+        again, _ = lower(key, text, rule.rule_id)
+    except Refusal:
+        # The dialect cannot read its own output. That is a parser gap, and
+        # guessing at what it means would be worse than saying nothing.
+        return []
+
+    before = _comparisons(rule)
+    after = _comparisons(again)
+    if not before or len(before) != len(after):
+        return []
+
+    notes: list[Diagnostic] = []
+    for original, reread in zip(before, after):
+        if not original["comparable"] or not reread["comparable"]:
+            continue
+        if (original["op"] != reread["op"]
+                and {original["op"], reread["op"]} == {"==", "!="}):
+            notes.append(Diagnostic(
+                code="RENDER_OPERATOR_CHANGED",
+                message=(
+                    f"`{original['op']}` came back as `{reread['op']}` when "
+                    f"{entry.label} read its own output: the comparison is "
+                    f"INVERTED, so the rendered rule matches the rows the "
+                    f"original was written to exclude."
+                ),
+                severity="problem",
+                verified=True,
+            ))
+            continue
+        if original["op"] != reread["op"]:
+            # The dialect spells the operator differently on the way back in
+            # (`contains` as `LIKE`, `matches` as a field test). Comparing a
+            # fold across two different operators is how a false alarm is
+            # manufactured, so the rest of the check needs the same operator.
+            continue
+        if original["fold"] and not reread["fold"]:
+            notes.append(Diagnostic(
+                code="RENDER_CASE_FOLD_LOST",
+                message=(
+                    f"`{original['value']}` was matched regardless of case in "
+                    f"this rule, and {entry.label} matches it EXACTLY. The "
+                    f"rendered rule is narrower than the one it came from."
+                ),
+                severity="problem",
+                verified=True,
+            ))
+            continue
+        if (original["value"] and reread["value"]
+                and original["value"] != reread["value"]
+                and _wildcard_neutral(original["value"])
+                != _wildcard_neutral(reread["value"])
+                and "\\" not in original["value"] + reread["value"]):
+            notes.append(Diagnostic(
+                code="RENDER_VALUE_REINTERPRETED",
+                message=(
+                    f"`{original['value']}` was written as "
+                    f"`{reread['value']}` and {entry.label} reads that back as "
+                    f"a different value, so the rendered rule tests something "
+                    f"the original did not."
+                ),
+                severity="problem",
+                verified=True,
+            ))
+    return notes
+
+
 def render(key: str, rule: Rule) -> tuple[str, list[Diagnostic]]:
     """A Rule back out as native text in `key`'s language.
 
@@ -581,4 +741,5 @@ def render(key: str, rule: Rule) -> tuple[str, list[Diagnostic]]:
     return text, (
         _transfer_diagnostics(entry.key, rule)
         + _annotation_diagnostics(entry.key, rule)
+        + _fidelity_diagnostics(entry.key, rule, text)
     )

@@ -152,12 +152,25 @@ FUNCTIONS: Final[dict[str, str]] = {
     "startswith": "starts_with",
     "endswith": "ends_with",
     "stringcontains": "contains",
+    # The trailing `~` is EQL's case-INSENSITIVE form of the same function.
+    # Without these three, a folded substring test was refused as an unknown
+    # function, so a Sigma `|contains` could not be exported to EQL at all.
+    "startswith~": "starts_with_nocase",
+    "endswith~": "ends_with_nocase",
+    "stringcontains~": "contains_nocase",
     "length": "length",
     "concat": "to_string",
     "number": "to_int",
     "string": "to_string",
     "match": "matches_regex",
     "between": "contains",
+}
+
+#: The folded function names, and the comparison each one really is.
+_FOLDED_FUNCTIONS: Final[dict[str, str]] = {
+    "contains_nocase": "contains",
+    "starts_with_nocase": "startswith",
+    "ends_with_nocase": "endswith",
 }
 
 #: Pipe commands and whether they are modelled.
@@ -461,7 +474,12 @@ def _tokenise_eql(text: str) -> list[Any]:
         # while the case-SENSITIVE spelling one character shorter parses fine.
         if (
             token.kind == "ident"
-            and token.text.lower() in ("like", "regex")
+            and token.text.lower() in (
+                "like", "regex",
+                # The folded string FUNCTIONS carry the same suffix:
+                # `stringContains~(f, "x")` is the ignore-case form.
+                "stringcontains", "startswith", "endswith",
+            )
             and following is not None
             and following.kind in ("punct", "op")
             and following.text == "~"
@@ -513,6 +531,12 @@ def _normalise(expr: Expr) -> Expr:
     """
     if isinstance(expr, Call):
         args = tuple(_normalise(a) for a in expr.args)
+        folded = _FOLDED_FUNCTIONS.get(expr.function)
+        if folded is not None and len(args) == 2 and isinstance(args[1], Literal):
+            # `stringContains~(f, "x")` is the case-INSENSITIVE form of the
+            # same test, so it becomes the comparison with the fold set rather
+            # than a function the engine cannot run.
+            return Comparison(folded, args[0], args[1], nocase=True)
         if expr.function == "like" and len(args) >= 2:
             subject = args[0]
             patterns = args[1:]
@@ -908,6 +932,11 @@ def _render_comparison(expr: Comparison) -> str:
             "startswith": "startsWith",
             "endswith": "endsWith",
         }[expr.op]
+        if expr.nocase:
+            # EQL marks the case-INSENSITIVE variant with a trailing `~`. An
+            # exact-case name here narrows a Sigma `|contains`, which is
+            # ignore-case by specification.
+            spelled += "~"
         text = f"{spelled}({left}, {_render_expression(expr.right)})"
         return f"not {text}" if expr.negate else text
 

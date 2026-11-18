@@ -997,19 +997,19 @@ class OverHttp(unittest.TestCase):
         # saying what any of it was for. A person who had not written a
         # detection rule had no entry point, and a person who had still could
         # not tell which of the four tabs did what.
-        html = self._index_html()
+        html = self._classic_html()
         self.assertIn('id="pane-home"', html)
         self.assertIn('data-pane="home"', html)
         self.assertIn('class="pane active" id="pane-home"', html)
 
     def test_the_build_pane_is_no_longer_the_default(self):
-        html = self._index_html()
+        html = self._classic_html()
         self.assertIn('<section class="pane" id="pane-build">', html)
 
     def test_the_start_pane_offers_a_worked_example(self):
         # A filled-in rule teaches the shape of one faster than any amount of
         # label text, and there was nothing to learn from.
-        html = self._index_html()
+        html = self._classic_html()
         self.assertIn('id="home-example"', html)
         self.assertIn('id="home-blank"', html)
 
@@ -1089,13 +1089,19 @@ class OverHttp(unittest.TestCase):
     def test_the_start_pane_lists_dialects_from_the_api(self):
         # Named from `/api/dialects` rather than written into the page, so the
         # landing copy cannot claim a dialect count that has gone stale.
-        self.assertIn('id="home-dialects"', self._index_html())
+        self.assertIn('id="home-dialects"', self._classic_html())
         self.assertIn("#home-dialects", self._app_js())
 
-    def _index_html(self) -> str:
+    def _classic_html(self) -> str:
+        """The previous single-page interface, still served at `/classic`.
+
+        The rebuilt interface is a shell plus ES modules; its equivalents are
+        asserted in `tests/test_ui_contract.py`. Both are live, so both get
+        guards: the classic page is the fallback until parity is accepted.
+        """
         return pathlib.Path(
             api_module.__file__
-        ).resolve().parent.joinpath("templates", "index.html").read_text(
+        ).resolve().parent.joinpath("templates", "classic.html").read_text(
             encoding="utf-8"
         )
 
@@ -1161,6 +1167,7 @@ class OverHttp(unittest.TestCase):
         self.assertIn(".stale-note", css)
 
     def _app_js(self) -> str:
+        """The classic interface's script, served at `/classic`."""
         return pathlib.Path(
             api_module.__file__
         ).resolve().parent.joinpath("static", "app.js").read_text(
