@@ -26,8 +26,13 @@ from . import dialects, synthesize
 from .codec import rule_to_dict
 from .pipeline import evaluate as run_rule
 from .validate import validate
+from .outline import outline
 from .values import Refusal
-from web.api import serve
+
+# NOTE: `web.api.serve` is imported INSIDE `_cmd_serve`, not here.
+# `engine/` must not import `web/` -- that is the layering rule this
+# project states, and a module-level import broke it for every CLI
+# invocation, including the ones that never start a server.
 
 
 def _read(path: str) -> str:
@@ -96,15 +101,17 @@ def _cmd_check(args: argparse.Namespace) -> int:
 def _cmd_explain(args: argparse.Namespace) -> int:
     text = _read(args.path)
     rule, lowered = dialects.lower(args.source, text)
-    _notes(lowered, "read")
+    # A `problem` diagnostic means the rule did not survive the read
+    # intact. Reporting it on stderr and still exiting 0 told a CI job
+    # the rule was fine while the text on stderr said otherwise.
+    status = _notes(lowered, "read")
     if args.json:
         sys.stdout.write(json.dumps(rule_to_dict(rule), indent=2) + "\n")
-        return 0
-    from web.api import _outline
+        return status
 
-    outline = _outline(rule)
-    sys.stdout.write(f"{outline['annotations']['title'] or rule.rule_id}\n")
-    for stage in outline["pipeline"]:
+    described = outline(rule)
+    sys.stdout.write(f"{described['annotations']['title'] or rule.rule_id}\n")
+    for stage in described["pipeline"]:
         line = f"  {stage['kind']:12} {stage['id']}"
         for key in ("condition", "predicate"):
             if stage.get(key):
@@ -112,11 +119,16 @@ def _cmd_explain(args: argparse.Namespace) -> int:
         for step in stage.get("steps", ()):
             line += f"\n    {step['position']}. {step['condition']}"
         sys.stdout.write(line + "\n")
-    return 0
+    return status
 
 
 def _cmd_test(args: argparse.Namespace) -> int:
-    rule, _ = dialects.lower(args.source, _read(args.path))
+    # The lowering diagnostics are REPORTED, not dropped. A rule that read
+    # in with a `problem` -- a selector that could not be carried, a clause
+    # that was approximated -- is not the rule that was written, and a
+    # verdict about it is a verdict about something else.
+    rule, lowered = dialects.lower(args.source, _read(args.path))
+    status = _notes(lowered, "read")
     events = synthesize.parse_events(_read(args.events), args.format)
     result = run_rule(rule, events)
     sys.stdout.write(f"{result.verdict}  {len(result.rows)} row(s) of "
@@ -127,7 +139,9 @@ def _cmd_test(args: argparse.Namespace) -> int:
         return _report(result.refusal)
     # A non-match is a legitimate answer, not a failure. Only an UNDECIDED
     # result is an error for a shell: it means the question was not answered.
-    return 0 if result.verdict in ("matched", "no_match") else 1
+    if result.verdict not in ("matched", "no_match"):
+        return 1
+    return status
 
 
 def _cmd_propose(args: argparse.Namespace) -> int:
@@ -146,7 +160,11 @@ def _cmd_propose(args: argparse.Namespace) -> int:
             + (f"  ({reasons})" if reasons else "") + "\n"
         )
     status = _notes(notes, "propose")
-    out, _ = dialects.render(args.target, rule)
+    # The RENDER diagnostics were discarded, so a proposed rule written
+    # out with a selector that could not cross dialects came back with a
+    # clean exit and text broader than the analysis behind it.
+    out, rendered = dialects.render(args.target, rule)
+    status = max(status, _notes(rendered, "write"))
     sys.stdout.write(out if out.endswith("\n") else out + "\n")
     return status
 
@@ -170,6 +188,9 @@ def _cmd_dialects(_args: argparse.Namespace) -> int:
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
+    # Imported here so `engine/` never imports `web/` at module scope.
+    from web.api import serve
+
     serve(args.host, args.port)
     return 0
 

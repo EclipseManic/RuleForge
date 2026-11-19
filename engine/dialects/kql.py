@@ -360,13 +360,15 @@ def lower_kql(text: str, rule_id: str = "rule") -> tuple[Rule, list[Diagnostic]]
     columns: dict[str, set[str]] = {}
     for let in parsed.lets:
         nodes = _lower_stream(
-            let.source, let.stages, f"let_{let.name}", diagnostics
+            let.source, let.stages, f"let_{let.name}", diagnostics,
+            bindings=bindings,
         )
         bindings.append(Binding(name=let.name, pipeline=tuple(nodes)))
         columns[let.name] = _declared_columns(nodes)
 
     main = _lower_stream(
-        parsed.source, parsed.stages, "main", diagnostics, columns=columns
+        parsed.source, parsed.stages, "main", diagnostics, columns=columns,
+        bindings=bindings,
     )
 
     # Every graph names its output stage, so what the rule RETURNS is stated
@@ -444,6 +446,7 @@ def _lower_stream(
     prefix: str,
     diagnostics: list[Diagnostic],
     columns: dict[str, set[str]] | None = None,
+    bindings: list[Binding] | None = None,
 ) -> list[Any]:
     """One `Table | op | op` chain into a list of nodes."""
     nodes: list[Any] = []
@@ -481,7 +484,7 @@ def _lower_stream(
         stage = stages[index]
         node_id = f"{prefix}_{stage.operator.lower().replace('-', '_')}_{index}"
         lowered = _lower_stage(
-            stage, node_id, table, diagnostics, active_scopes
+            stage, node_id, table, diagnostics, active_scopes, bindings
         )
         index += 1
         if lowered is None:
@@ -568,6 +571,7 @@ def _lower_stage(
     table: str,
     diagnostics: list[Diagnostic],
     field_scopes: dict[str, str] | None = None,
+    bindings: list[Binding] | None = None,
 ) -> Any:
     operator = stage.operator.lower()
     body = stage.body.strip()
@@ -588,7 +592,7 @@ def _lower_stage(
         return _lower_summarize(body, node_id, diagnostics, field_scopes)
 
     if operator == "join":
-        return _lower_join(body, node_id, diagnostics)
+        return _lower_join(body, node_id, diagnostics, bindings)
 
     if operator in ("sort", "order"):
         return _lower_sort(body, node_id)
@@ -813,6 +817,47 @@ def _lower_measure(
             "lower",
         )
 
+    # `countif(<predicate>)` counts the rows the PREDICATE is true for. Its one
+    # argument is a condition, not a column: the code below would build
+    # `FieldRef("EventID == 4625")` and look up a field literally named that,
+    # which is absent in every row, so the count was always 0. A threshold
+    # written as `countif(EventID == 4625) >= 10` therefore never fired and the
+    # rule looked clean.
+    if lowered == "countif":
+        if len(args) != 1:
+            raise Refusal(
+                "KQL_COUNTIF_NEEDS_CONDITION",
+                f"`{call}` takes exactly one argument, the condition to count. "
+                f"It was given {len(args)}.",
+                "lower",
+            )
+        condition = _condition(
+            args[0].strip(), node_id, field_scopes=field_scopes
+        )
+        return Measure(
+            function="count_if",
+            name=name or "count_if",
+            condition=condition,
+        )
+
+    # `arg_max(<sort column>, <returned column>)` returns a VALUE from the row
+    # with the largest sort column. The model has one slot for a measure's
+    # column, so the second argument used to be dropped and the measure became
+    # "the largest sort column" -- a different number, reported as a success.
+    if lowered in ("arg_max", "arg_min"):
+        raise Refusal(
+            "KQL_ARG_AGGREGATE_UNSUPPORTED",
+            f"`{call}` returns `{args[1].strip() if len(args) > 1 else '?'}` "
+            f"from the row with the "
+            f"{'largest' if lowered == 'arg_max' else 'smallest'} "
+            f"`{args[0].strip()}`. This model has one column per measure, so it "
+            f"cannot say both which row to pick and which value to take, and "
+            f"measuring `{args[0].strip()}` instead would answer a different "
+            f"question. Use `max(...)`/`min(...)` if that is the number you "
+            f"meant.",
+            "lower",
+        )
+
     field_text = args[0].strip()
     field = _scoped(field_text, field_scopes)
     param: Decimal | None = None
@@ -853,7 +898,12 @@ def _lower_measure(
     )
 
 
-def _lower_join(body: str, node_id: str, diagnostics: list[Diagnostic]) -> Join:
+def _lower_join(
+    body: str,
+    node_id: str,
+    diagnostics: list[Diagnostic],
+    bindings: list[Binding] | None = None,
+) -> Join:
     how = "inner"
     right = ""
     on_text = ""
@@ -908,21 +958,41 @@ def _lower_join(body: str, node_id: str, diagnostics: list[Diagnostic]) -> Join:
             )
         inner = inner[:-1].strip()
         source, stages = _split_pipeline(inner)
-        if stages:
+        if stages and bindings is not None:
+            # CARRY the right-hand stages as a binding. They used to be parsed,
+            # described in a note that said they were carried, and then thrown
+            # away -- so `join kind=inner (AuditLogs | where ResultType == 0)
+            # on UserPrincipalName` silently widened the join to the whole
+            # unfiltered right table, which is a different rule and matches far
+            # more than the one written.
+            name = f"{node_id}_right"
+            sub_nodes = _lower_stream(
+                source, stages, name, diagnostics, bindings=bindings
+            )
+            bindings.append(Binding(name=name, pipeline=tuple(sub_nodes)))
+            right = name
             diagnostics.append(
                 Diagnostic(
-                    "KQL_JOIN_SUBPIPELINE",
-                    f"The joined operand has {len(stages)} stage(s) of its own. "
-                    f"They are parsed and carried, but a rule written as a "
-                    f"sub-pipeline and a rule written as a `let` binding are "
-                    f"different artifacts -- the sub-pipeline version has no "
-                    f"name to point at in a later stage.",
+                    "KQL_JOIN_SUBPIPELINE_CARRIED",
+                    f"The joined operand's {len(stages)} stage(s) are carried as "
+                    f"the binding `{name}`, so the filter inside the join is part "
+                    f"of the rule rather than discarded.",
                     severity="note",
                     verified=True,
                     evidence=operand[:60],
                 )
             )
-        right = source
+        elif stages:
+            raise Refusal(
+                "KQL_JOIN_SUBPIPELINE_UNSUPPORTED",
+                f"the joined operand has {len(stages)} stage(s) of its own and "
+                f"this lowering has nowhere to put them, so carrying the table "
+                f"alone would drop the filter inside the join and match more "
+                f"events than the rule says.",
+                "lower",
+            )
+        else:
+            right = source
     else:
         right = operand
 
@@ -1072,6 +1142,24 @@ _CASE_INSENSITIVE: Final[dict[str, tuple[str, str]]] = {
 }
 
 
+#: A term boundary, spelled in the portable subset this engine can execute.
+#:
+#: KQL's `has` family matches whole alphanumeric TERMS: `CommandLine has "net"`
+#: does not match `dotnet.exe`, because `net` there is part of the longer term.
+#: The boundary is "start-or-non-word before, non-word-or-end after".
+#:
+#: Written as a plain group with an explicit character class rather than
+#: `(?:...)` and `(?=...)`, because `_screen_portable` refuses every `(?` -- so a
+#: lookahead version lowered fine and then could not be validated or run.
+_TERM_BEFORE: Final = "(^|[^A-Za-z0-9_])"
+_TERM_AFTER: Final = "([^A-Za-z0-9_]|$)"
+
+
+def _term_pattern(value: str) -> str:
+    """A whole-term match for `value`, in the portable regex subset."""
+    return f"{_TERM_BEFORE}{re.escape(value)}{_TERM_AFTER}"
+
+
 class _KqlParser(Parser):
     """The shared parser, plus KQL's case-insensitive substring operators.
 
@@ -1121,12 +1209,18 @@ class _KqlParser(Parser):
                         f"to be a constant string. `{render_expr(item)}` is not.",
                         "lower",
                     )
-                # Unanchored: `has` is a containment test, which is the same
-                # approximation `has` -> `contains` already makes.
+                # TERM-anchored, like `has` itself: `has_any ("net")` does not
+                # match `dotnet.exe` in Sentinel. An unanchored pattern here
+                # widened every `has_any` into a `contains_any`.
+                #
+                # Spelled with a plain capturing group and an explicit class
+                # rather than `(?:...)` and a lookahead, because this engine's
+                # portable subset refuses both -- and a pattern it refuses to
+                # screen is a pattern it refuses to run.
                 tests.append(Comparison(
                     "matches", left,
                     Regex(
-                        re.escape(str(item.value)),
+                        _term_pattern(str(item.value)),
                         SPEC.default_regex_dialect,
                         nocase=True,
                     ),
@@ -1212,6 +1306,32 @@ class _KqlParser(Parser):
                 ))
             combined = tests[0] if len(tests) == 1 else BoolOp("or", tuple(tests))
             return Not(combined) if word.startswith("!") else combined
+
+        # `has` and `has_cs` match a whole alphanumeric TERM, not a substring.
+        # In Sentinel, `CommandLine has "net"` does NOT match
+        # `C:\Program Files\dotnet\dotnet.exe`, because `net` there is part of
+        # the longer term `dotnet`. Lowering it to a bare substring regex turned
+        # every `has` into a `contains`, so the rule fired on text its author had
+        # deliberately excluded -- silent widening on one of the most common
+        # operators in Sentinel content.
+        #
+        # The term boundary is spelled "not preceded, and not followed, by a
+        # word character", which is what KQL's tokenisation means.
+        if word in ("has", "has_cs"):
+            if not isinstance(right, Literal) or not isinstance(right.value, str):
+                raise Refusal(
+                    "KQL_CASE_INSENSITIVE_NOT_LITERAL",
+                    f"`{word}` compares against something that is not a constant "
+                    f"string, and a term boundary has to be applied to a known "
+                    f"value.",
+                    "lower",
+                )
+            term = re.escape(str(right.value))
+            pattern = _term_pattern(str(right.value))
+            return Comparison(
+                "matches", left,
+                Regex(pattern, SPEC.default_regex_dialect, nocase=word == "has"),
+            )
 
         anchors = _CASE_INSENSITIVE.get(word)
         if anchors is None:
@@ -1346,16 +1466,14 @@ def _lower_sort(body: str, node_id: str) -> Sort:
         text = ""
     elif text.lower().startswith("by "):
         text = text[3:].strip()
-    descending = False
-    if text.lower().endswith(" desc"):
-        descending = True
-        text = text[:-5].strip()
-    elif text.lower().endswith(" asc"):
-        text = text[:-4].strip()
     for part in split_top_level(text, ","):
         part = part.strip()
         if not part:
             continue
+        # Reset per key. `descending` used to be declared once outside this
+        # loop, so `sort by A desc, B` marked B descending as well -- KQL's
+        # default is ASC, and the second key silently reversed.
+        descending = False
         if part.lower().endswith(" desc"):
             descending = True
             part = part[:-5].strip()
@@ -1582,6 +1700,11 @@ def _substring_fold(expr: Any) -> tuple[FieldRef, str] | None:
     if pattern.dialect != SPEC.default_regex_dialect:
         return None
     body = pattern.pattern
+    # A term-anchored body is the `has` family's spelling now: strip the
+    # boundary first, so a round trip folds back to `has_any` / `has_all`
+    # instead of growing a `matches regex` clause on every pass.
+    if body.startswith(_TERM_BEFORE) and body.endswith(_TERM_AFTER):
+        body = body[len(_TERM_BEFORE):-len(_TERM_AFTER)]
     if body.startswith("^") or body.endswith("$"):
         return None
     text = _unescape_literal(body)
@@ -1927,8 +2050,6 @@ def _render_node(node: Any) -> str:
         if node.keeps:
             return "project " + ", ".join(r.full for r in node.keeps)
         return "project *"
-    if isinstance(node, Correlation):
-        return _render_correlation(node)
     raise Refusal(
         "KQL_NODE_NOT_RENDERABLE",
         f"a {type(node).__name__} stage has no KQL spelling in this renderer. "
@@ -2075,8 +2196,20 @@ def _render_join(node: Join) -> str:
 
 
 def _render_correlation(node: Correlation) -> str:
-    group = ", ".join(r.full for r in node.group_by)
-    return (
-        f"// correlation: {node.frequency} occurrences of {node.parent} within "
-        f"{int(node.timeframe.seconds)}s, grouped on {group}"
+    """KQL has no parent-rule threshold, so this is REFUSED, not commented out.
+
+    It used to return `// correlation: 5 occurrences of ... within 300s`, which
+    the pipeline writer turned into `| // correlation: ...` -- a syntax error in
+    Sentinel that also deleted the threshold. The rule then matched every single
+    event the filter caught, which is the opposite of what a threshold rule
+    says. A comment is not a rule.
+    """
+    raise Refusal(
+        "KQL_RENDER_CORRELATION",
+        f"`{node.id}` fires when `{node.parent}` matches {node.frequency} times "
+        f"within {int(node.timeframe.seconds)}s, and KQL has no way to say that. "
+        f"Sentinel expresses it as a scheduled analytics rule with an "
+        f"aggregation, not as a query, so writing this out as a comment would "
+        f"delete the threshold and alert on every single event.",
+        "render",
     )

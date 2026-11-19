@@ -554,7 +554,12 @@ def _lower_rule(
         )
         nodes.append(Filter(id=f"r{rule_id}_match", condition=condition))
 
-    if matched_parent:
+    # `frequency` + `timeframe` is a threshold. With `if_matched_sid` it counts
+    # the PARENT rule; without it, it counts THIS rule's own matches. Only the
+    # first form was modelled, so a rule that said "five of these in five
+    # minutes" lowered to a rule that fired on ONE -- the threshold disappeared
+    # at import time and nothing said so.
+    if matched_parent or frequency:
         if not frequency:
             raise Refusal(
                 "WAZUH_CORRELATION_NO_FREQUENCY",
@@ -575,7 +580,12 @@ def _lower_rule(
                     f"threshold.",
                     "lower",
                 ) from None
-        if not group_keys:
+        if not group_keys and matched_parent:
+            # A parent correlation counts OTHER rules' matches, so without a
+            # key the count is "anywhere in the log" -- five failures across
+            # five machines would fire a rule that means five on one. A SELF
+            # threshold has no such ambiguity: it counts this rule's own
+            # matches, which is exactly what Wazuh does.
             raise Refusal(
                 "WAZUH_CORRELATION_NO_GROUP",
                 f"rule {rule_id} counts the parent {frequency} times in "
@@ -593,19 +603,39 @@ def _lower_rule(
                 f"`frequency={frequency}` is not a number.",
                 "lower",
             ) from None
-        nodes.append(Correlation(
-            id=f"r{rule_id}_correlate",
-            parent=nodes[-1].id,
-            frequency=count,
-            timeframe=timeframe,
-            group_by=tuple(group_keys),
-        ))
+        if group_keys:
+            # The threshold is modelled on the rule's own match stage when
+            # there is no parent: Wazuh counts THIS rule N times in the window.
+            nodes.append(Correlation(
+                id=f"r{rule_id}_correlate",
+                parent=nodes[-1].id,
+                frequency=count,
+                timeframe=timeframe,
+                group_by=tuple(group_keys),
+            ))
+        else:
+            # A threshold with nothing to group on is a count over the whole
+            # log, and the IR refuses to represent that rather than invent a
+            # grouping. Saying so is the difference between "we read your rule"
+            # and "we read the part of your rule we could".
+            diagnostics.append(Diagnostic(
+                "WAZUH_THRESHOLD_NOT_MODELLED",
+                f"rule {rule_id} fires when it matches {frequency} times within "
+                f"{timeframe_text}s, but names no `<same_*>` element, so the "
+                f"count is 'anywhere in the log' rather than per host or per "
+                f"user. That cannot be represented without inventing a grouping "
+                f"the rule does not have, so this rule has been read WITHOUT its "
+                f"threshold. Add a `<same_*>` element, or express the count as "
+                f"an aggregate.",
+                severity="problem",
+            ))
     elif group_keys:
         diagnostics.append(Diagnostic(
             "WAZUH_SAME_WITHOUT_CORRELATION",
-            f"rule {rule_id} has <same_*> elements but no if_matched_sid, so "
-            f"there is no threshold for them to group. They have been read as "
-            f"having no effect, which is what Wazuh does with them here.",
+            f"rule {rule_id} has <same_*> elements but no if_matched_sid and no "
+            f"frequency, so there is no threshold for them to group. They have "
+            f"been read as having no effect, which is what Wazuh does with them "
+            f"here.",
             severity="caution",
         ))
 
@@ -775,7 +805,11 @@ def _render_predicate(expr: Expr, lines: list[str]) -> None:
 
 
 _BY_FIELD: Final[dict[str, str]] = {
-    value: key for key, value in reversed(list(FIELD_ELEMENTS.items()))
+    # NOT reversed: two Wazuh names share one canonical field -- `user` and
+    # `dstuser` both mean the destination user -- so the LAST spelling is the
+    # specific one. Reversed, `dstuser` came back out as `<user>`, renaming the
+    # element on every round trip.
+    value: key for key, value in FIELD_ELEMENTS.items()
 }
 
 

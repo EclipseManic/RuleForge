@@ -42,6 +42,7 @@ from engine import dialects, synthesize
 from engine.codec import rule_from_dict, rule_to_dict
 from engine.evaluate import Budget, Caveat, EvaluationResult, Trace
 from engine.ir import Rule, render_expr
+from engine.outline import outline, span_text
 from engine.pipeline import evaluate
 from engine.store import ORIGINS, RuleStore
 from engine.validate import validate
@@ -176,150 +177,12 @@ def _result_dict(result: EvaluationResult) -> dict[str, Any]:
     }
 
 
-def _span(duration: Any) -> str:
-    """A Duration as the span an analyst would write.
+#: Re-exported from the engine so `web/` is not the only place an outline can
+#: be produced. It used to live here, which forced `engine/cli.py` to import
+#: from `web/` -- the one layering rule this project states.
+_span = span_text
+_outline = outline
 
-    `str(Duration)` is a debugging repr, and `Duration(300s)` leaking into the
-    outline pane reads as a bug rather than as five minutes.
-    """
-    seconds = int(duration.seconds)
-    for suffix, size in (("d", 86400), ("h", 3600), ("m", 60)):
-        if seconds >= size and seconds % size == 0:
-            return f"{seconds // size}{suffix}"
-    return f"{seconds}s"
-
-
-def _outline(rule: Rule) -> dict[str, Any]:
-    """A readable summary of a rule, for the builder's outline pane.
-
-    `render_expr` is display text and explicitly NOT re-parseable dialect
-    syntax -- see its docstring in `ir.py`. It is used here for exactly the
-    purpose it was written for: showing an analyst what a condition says.
-    """
-    def stage(node: Any) -> dict[str, Any]:
-        body: dict[str, Any] = {
-            "id": node.id,
-            "kind": type(node).__name__,
-            "capability": node.capability.value,
-            "note": node.note,
-        }
-        condition = getattr(node, "condition", None)
-        if condition is not None:
-            body["condition"] = render_expr(condition)
-        predicate = getattr(node, "predicate", None)
-        if predicate is not None:
-            body["predicate"] = render_expr(predicate)
-
-        # A stage whose meaning is in its SETTINGS rather than in a condition
-        # used to print as a bare word: a Correlation showed no frequency, no
-        # timeframe and no group key, so the clause that makes the rule a rule
-        # was invisible while the pane claimed nothing had been lost.
-        table = getattr(node, "table", None)
-        if table is not None:
-            body["table"] = table
-            selector = getattr(node, "selector", "")
-            if selector:
-                body["selector"] = selector
-            time_field = getattr(node, "time_field", "")
-            if time_field:
-                body["time_field"] = time_field
-
-        parent = getattr(node, "parent", None)
-        if parent is not None:
-            body["parent"] = parent
-            body["frequency"] = getattr(node, "frequency", None)
-            timeframe = getattr(node, "timeframe", None)
-            body["timeframe"] = _span(timeframe) if timeframe is not None else ""
-            body["group_by"] = [ref.full for ref in getattr(node, "group_by", ())]
-            body["count_subject"] = getattr(node, "count_subject", "")
-
-        measures = getattr(node, "measures", None)
-        if measures is not None:
-            body["measures"] = [
-                {
-                    "name": measure.name,
-                    "function": measure.function,
-                    "field": measure.field.full if measure.field else "",
-                    "distinct": bool(measure.distinct),
-                }
-                for measure in measures
-            ]
-            body["keys"] = [ref.full for ref in getattr(node, "keys", ())]
-            window = getattr(node, "window", None)
-            if window is not None:
-                # `window` is a Window (kind + size), not a Duration: the size
-                # is the span an analyst would write.
-                body["window"] = _span(window.size)
-                if getattr(window, "kind", ""):
-                    body["window_kind"] = window.kind
-
-        keeps = getattr(node, "keeps", None)
-        if keeps is not None:
-            body["keeps"] = [ref.full for ref in keeps]
-            body["dedupe_by"] = [ref.full for ref in getattr(node, "dedupe_by", ())]
-
-        keys = getattr(node, "keys", None)
-        if keys is not None and measures is None:
-            # Sort and Distinct both key on fields; Sort pairs each key with a
-            # direction, which is the part a reader needs to see.
-            described = []
-            for key in keys:
-                if (isinstance(key, tuple) and len(key) == 2
-                        and hasattr(key[0], "full")):
-                    described.append(
-                        {"field": key[0].full, "descending": bool(key[1])})
-                elif hasattr(key, "full"):
-                    described.append(key.full)
-            body["keys"] = described
-
-        # A Sequence carries its conditions on its STEPS, not on a `condition`
-        # attribute, so the generic lookups above find nothing and the most
-        # complex stage in the model rendered as a bare word. The ordering is
-        # the entire point of the node, and an outline that does not show it
-        # leaves the analyst reading the raw IR to find out what the rule
-        # waits for.
-        steps = getattr(node, "steps", None)
-        if steps is not None:
-            body["steps"] = [
-                {
-                    "position": index,
-                    "condition": render_expr(step.condition),
-                    "runs": step.runs,
-                }
-                for index, step in enumerate(steps, start=1)
-            ]
-            body["ordered"] = True
-            body["by"] = [ref.full for ref in getattr(node, "by", ())]
-            maxspan = getattr(node, "maxspan", None)
-            body["maxspan"] = _span(maxspan) if maxspan is not None else ""
-            until = getattr(node, "until", None)
-            if until is not None:
-                body["until"] = render_expr(until)
-        return body
-
-    return {
-        "rule_id": rule.rule_id,
-        "dialect": rule.metadata.get("dialect", ""),
-        "language": rule.metadata.get("language", ""),
-        "annotations": {
-            "title": rule.annotations.title,
-            "description": rule.annotations.description,
-            "severity": rule.annotations.severity,
-            "author": rule.annotations.author,
-            "mitre_attack": [
-                {"tactic": tactic, "techniques": list(techniques)}
-                for tactic, techniques in rule.annotations.mitre_attack
-            ],
-            "references": list(rule.annotations.references),
-            "false_positives": list(rule.annotations.false_positives),
-        },
-        "bindings": [
-            {"name": b.name, "stages": [stage(n) for n in b.pipeline],
-             "guard": render_expr(b.guard) if b.guard is not None else None}
-            for b in rule.bindings
-        ],
-        "pipeline": [stage(n) for n in rule.pipeline],
-    }
 # ---------------------------------------------------------------------------
 # The vocabulary
 # ---------------------------------------------------------------------------
@@ -953,6 +816,20 @@ class RuleForgeHandler(BaseHTTPRequestHandler):
         # One line per request, on stderr, without the default's noise.
         sys.stderr.write(f"{self.address_string()} {fmt % args}\n")
 
+    #: The policy the page is served under. The comment below promised a CSP
+    #: and never sent one, which is the difference between "we thought about
+    #: pasted rules becoming script" and "a pasted rule cannot run as script".
+    #:
+    #: `style-src` allows 'unsafe-inline' because the screens set inline
+    #: `style=` attributes for bar widths; scripts stay same-origin only, so a
+    #: rule or a log sample cannot introduce one.
+    CONTENT_SECURITY_POLICY: Final = (
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; font-src 'self' https://fonts.gstatic.com; "
+        "connect-src 'self'; object-src 'none'; base-uri 'none'; "
+        "form-action 'none'; frame-ancestors 'none'"
+    )
+
     def _send(self, status: int, payload: Any) -> None:
         body = json.dumps(payload, allow_nan=False).encode("utf-8")
         self.send_response(status)
@@ -961,6 +838,7 @@ class RuleForgeHandler(BaseHTTPRequestHandler):
         # This tool renders rule text and log samples that came from
         # elsewhere. A restrictive CSP and nosniff are the cheap half of not
         # turning a pasted rule into script execution.
+        self.send_header("Content-Security-Policy", self.CONTENT_SECURITY_POLICY)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
@@ -1025,6 +903,45 @@ class RuleForgeHandler(BaseHTTPRequestHandler):
             super().handle()
         except (TimeoutError, OSError):
             self.close_connection = True
+
+    def _same_origin(self) -> bool:
+        """True when a state-changing request is allowed to touch the store.
+
+        The same-origin policy does not stop a cross-origin POST from being
+        SENT -- it only stops the attacker reading the reply. So any page the
+        analyst happens to have open could POST to a localhost port and
+        rewrite the saved rules while the workbench was running.
+
+        Two checks, because either alone has a hole:
+
+        * `Origin`, when present, must be this server's own host. A browser
+          attaches it to every write, so a present-and-different origin is a
+          page that is not this one. An ABSENT origin is allowed: curl, the
+          CLI and the test suite send none, and no browser omits it on a write.
+        * A browser-supplied body must also be `application/json`. A
+          cross-origin `no-cors` request is limited to the simple content
+          types, so it cannot send JSON without a preflight this server never
+          answers. Non-browser clients are exempt, which is why the API still
+          accepts a body with no `Content-Type` at all.
+        """
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True
+        origin = origin.strip()
+        if not origin or origin.lower() == "null":
+            # `Origin: null` is what a sandboxed iframe or a `data:` URL
+            # sends. It is never this page.
+            return False
+        host = (self.headers.get("Host") or "").strip().lower()
+        if not host:
+            return False
+        parsed = urlparse(origin)
+        if not parsed.scheme or not parsed.netloc:
+            return False
+        if parsed.netloc.lower() != host:
+            return False
+        content_type = (self.headers.get("Content-Type") or "").lower()
+        return content_type.split(";")[0].strip() == "application/json"
 
     def _body(self) -> dict[str, Any]:
         try:
@@ -1108,7 +1025,9 @@ class RuleForgeHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", f"{guessed or fallback_type}; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Security-Policy", self.CONTENT_SECURITY_POLICY)
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
@@ -1146,6 +1065,19 @@ class RuleForgeHandler(BaseHTTPRequestHandler):
         params = parse_qs(parsed.query)
 
         try:
+            # Writes are the only thing worth forging: a cross-origin GET can
+            # read nothing back, and the pages are same-origin anyway. Both
+            # POST and DELETE mutate the SQLite store, so both are guarded.
+            if method in ("POST", "DELETE") and not self._same_origin():
+                self._refuse(Refusal(
+                    "REQUEST_CROSS_ORIGIN",
+                    "this request came from another site. The workbench "
+                    "accepts writes only from its own page, because a "
+                    "malicious tab must not be able to overwrite your "
+                    "saved rules while it is running.",
+                    "api",
+                ), HTTPStatus.FORBIDDEN)
+                return
             if method == "GET":
                 if route in ("/", "/index.html"):
                     self._serve_file(_TEMPLATE_ROOT / "index.html", "text/html")

@@ -16,7 +16,7 @@ about rather than rediscovered in eight places.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass, field as dc_field, replace as dc_replace
 from decimal import Decimal
 from typing import Any, Callable, Final, Iterable, Sequence
 
@@ -1109,9 +1109,15 @@ class Parser:
         self._consume_modifiers()
 
         if op in ("=~", "matches"):
-            return Comparison(
-                "matches", left, self._as_pattern(right), negate=negated
-            )
+            pattern = self._as_pattern(right)
+            if word in self.spec.nocase_operators and isinstance(pattern, Regex):
+                # A spelling that MEANS "ignore case" -- EQL's `regex~`, `like~`
+                # -- folds the pattern. The mapping from spelling to engine
+                # operator drops the tilde, so without this the fold was read and
+                # discarded and `regex~ "ENC"` lowered to a case-SENSITIVE
+                # `regex`, which is the opposite of what was written.
+                pattern = dc_replace(pattern, nocase=True)
+            return Comparison("matches", left, pattern, negate=negated)
         if op == "!~":
             return Comparison("matches", left, self._as_pattern(right), negate=True)
         if op in ("in", "in_set"):

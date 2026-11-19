@@ -2315,7 +2315,17 @@ def _render_correlation(
 
     assert aggregate is not None  # one of the two, by the caller's check
     measure = aggregate.measures[0]
-    if measure.function != "dcount" or measure.field is None:
+
+    # `count()` is Sigma's `event_count`: the number of matching events. Only
+    # `dcount` is a `value_count`, which needs the column it counts distinct
+    # values of. Refusing `count()` here meant the single most common threshold
+    # shape -- `summarize FailedCount = count() by Account | where
+    # FailedCount >= 10` -- could not be written to Sigma at all.
+    if measure.function == "count" and measure.field is None:
+        kind = "event_count"
+    elif measure.function == "dcount" and measure.field is not None:
+        kind = "value_count"
+    else:
         raise Refusal(
             "SIGMA_RENDER_AGGREGATE",
             f"`{measure.function}` is not a Sigma correlation. Sigma counts "
@@ -2324,16 +2334,18 @@ def _render_correlation(
             f"produce a rule no backend understands.",
             "render",
         )
-    threshold = next(
-        (n for n in rule.pipeline
-         if isinstance(n, Filter) and n.id == "threshold"),
-        None,
-    )
+
+    # Found by SHAPE, not by `id == "threshold"`. A KQL or SPL threshold is
+    # whatever filter compares the measure's own alias, so hardcoding the id
+    # refused every alias but `count` with a message about Sigma correlations
+    # that said nothing about the real problem.
+    threshold = _threshold_filter(rule, aggregate)
     if threshold is None or not isinstance(threshold.condition, Comparison):
         raise Refusal(
             "SIGMA_RENDER_AGGREGATE",
-            "a value_count correlation needs its threshold filter, or there is "
-            "no condition to fire on.",
+            f"`{measure.name}` is aggregated but never compared to a constant, "
+            f"so there is no threshold to fire on. A Sigma correlation is a "
+            f"count and the condition that count has to meet.",
             "render",
         )
     operator = {v: k for k, v in _CONDITION_OPS.items()}.get(
@@ -2345,20 +2357,21 @@ def _render_correlation(
             f"`{threshold.condition.op}` is not a Sigma correlation comparison.",
             "render",
         )
+    if aggregate.window is None or aggregate.window.size is None:
+        raise Refusal(
+            "SIGMA_RENDER_AGGREGATE",
+            f"`{measure.name}` is a threshold with no time window, so the count "
+            f"has no `timespan` and Sigma would read it as all of history.",
+            "render",
+        )
     rules = _text_list(stored.get("rules")) or ("detection",)
-    lines.append("    type: value_count")
+    lines.append(f"    type: {kind}")
     lines.append("    rules:")
     lines.extend(f"        - {_quote(name)}" for name in rules)
     lines.append("    group-by:")
     lines.extend(f"        - {_quote(key.full)}" for key in aggregate.keys)
-    lines.append(f"    field: {_quote(measure.field.full)}")
-    if aggregate.window is None or aggregate.window.size is None:
-        raise Refusal(
-            "SIGMA_RENDER_AGGREGATE",
-            "a value_count correlation needs a window, or the count has no "
-            "timespan and is not a threshold.",
-            "render",
-        )
+    if kind == "value_count":
+        lines.append(f"    field: {_quote(measure.field.full)}")
     lines.append(f"    timespan: {_render_timespan(aggregate.window.size)}")
     lines.append("    condition:")
     right = threshold.condition.right

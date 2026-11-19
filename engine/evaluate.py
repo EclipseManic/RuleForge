@@ -662,9 +662,26 @@ def _first_set(pattern: str, start: int, stop: int | None = None) -> frozenset[s
         if body.startswith("."):
             return None
         if "-" in body:
+            # EXPAND the range. Adding only the two endpoints ("a" and "z")
+            # left the middle of [a-z] invisible to the overlap test, so
+            # `([a-z]a|ma)+$` looked like two disjoint alternations.
             out: set[str] = set()
-            for part in body.split("-"):
-                out.add(part)
+            index = 0
+            while index < len(body):
+                piece = body[index]
+                if piece == "\\" and index + 1 < len(body):
+                    out.add(body[index + 1])
+                    index += 2
+                    continue
+                if (index + 2 < len(body) and body[index + 1] == "-"
+                        and body[index + 2] != "]"):
+                    low, high = body[index], body[index + 2]
+                    for code in range(ord(low), ord(high) + 1):
+                        out.add(chr(code))
+                    index += 3
+                    continue
+                out.add(piece)
+                index += 1
             return frozenset(out)
         return frozenset(body)
     if char == ".":
@@ -739,6 +756,25 @@ def _split_alternatives(body: str) -> list[str]:
     return parts
 
 
+def _repeats_more_than_once(spec: str) -> bool:
+    """True when a `{...}` quantifier repeats its atom more than once.
+
+    `{0,1}`, `{1}` and `{1,1}` cannot multiply a backtracking path; `{2,}`,
+    `{2,10}` and `{0,}` can, and `(a+){2,}` is the same exponential family as
+    `(a+)+`.
+    """
+    body = spec.strip()
+    if not body:
+        return False
+    upper = body.split(",")[-1].strip() if "," in body else body
+    if upper == "":
+        return True  # an open-ended {n,}
+    try:
+        return int(upper) > 1
+    except ValueError:
+        return True  # unparseable: assume it repeats
+
+
 def _quantified_groups(pattern: str) -> list[tuple[int, int]]:
     """(start, end) of every quantified group body."""
     out: list[tuple[int, int]] = []
@@ -761,6 +797,15 @@ def _quantified_groups(pattern: str) -> list[tuple[int, int]]:
                     after = close + 1
                     if after < len(pattern) and pattern[after] in "*+":
                         out.append((index + 1, close))
+                    elif after < len(pattern) and pattern[after] == "{":
+                        # `(a+){2,}` and `(a+){2,10}` repeat the group too. A
+                        # detector that only knew `*` and `+` let the bounded
+                        # spelling through.
+                        brace = pattern.find("}", after)
+                        if brace != -1:
+                            spec = pattern[after + 1:brace]
+                            if _repeats_more_than_once(spec):
+                                out.append((index + 1, close))
                     break
     return out
 
@@ -1149,12 +1194,7 @@ def eval_expr(
     if isinstance(expr, ListExpr):
         return Seq(tuple(eval_expr(item, scope, context) for item in expr.items))
 
-    if isinstance(expr, Span):
-        return _eval_span(expr, scope, context)
-
-    if isinstance(expr, Arith):
-        return _eval_arith(expr, scope, context)
-
+    # A pattern is a VALUE, like a Duration. It evaluates to itself so the
     # A pattern is a VALUE, like a Duration. It evaluates to itself so the
     # comparison above can dispatch on it; it is never matched against anything
     # on its own, because a pattern with no subject is not a condition.
@@ -1390,6 +1430,13 @@ def _eval_sequence_comparison(
     operator, not by which side happens to hold the Seq.
     """
     # HAYSTACK-FIRST: the subject is a scalar, the options are the collection.
+    # A missing or null operand is checked BEFORE the membership machinery:
+    # A missing or null operand is checked BEFORE the membership machinery:
+    # `User in ["admin", "root"]` on a row with no `User` used to fall through
+    # to a bare UNDECIDED carrying no caveat, so the analyst saw "could not
+    # decide 1 of 1 rows" and was never told which field was missing.
+    if left is ABSENT or right is ABSENT or left is None or right is None:
+        return _undecidable_text_predicate(expr, left, right, context)
     haystack_ops = ("contains", "contains_any", "contains_all",
                     "starts_with", "ends_with", "has_any", "has_all")
     if expr.op in haystack_ops:
@@ -1756,20 +1803,47 @@ def _fn_text(name: str):
     return handler
 
 
-def _fn_contains_any(args: list[Any], ctx: "Context", node: Call) -> Any:
+def _contains_needles(args: list[Any], ctx: "Context", node: Call,
+                      want_all: bool) -> Any:
+    """`contains_any` / `contains_all`, in three-valued logic.
+
+    A needle that is not a string cannot be searched for, and `isinstance(n,
+    str) and n in subject` reported that as a definite "not found". A list
+    mixing a number with a real needle therefore answered `false` for
+    `contains_any` -- a decided answer about a test that was never run.
+    """
     subject, needles = args[0], args[1]
     if not isinstance(subject, str):
         return UNDECIDED
     items = list(needles) if isinstance(needles, (Seq, list)) else [needles]
-    return any(isinstance(n, str) and n in subject for n in items)
+    undecidable = 0
+    for needle in items:
+        if not isinstance(needle, str):
+            undecidable += 1
+            continue
+        if want_all:
+            if needle not in subject:
+                return False
+        elif needle in subject:
+            return True
+    if undecidable:
+        ctx.uncertain(
+            "COMPARISON_UNDECIDABLE",
+            f"`{node.function}` was given {undecidable} needle(s) that are not "
+            f"strings, so they cannot be searched for in `{render_where(node)}`.",
+            where=render_where(node),
+        )
+        return UNDECIDED
+    return want_all
+
+
+def _fn_contains_any(args: list[Any], ctx: "Context", node: Call) -> Any:
+    return _contains_needles(args, ctx, node, want_all=False)
 
 
 def _fn_contains_all(args: list[Any], ctx: "Context", node: Call) -> Any:
-    subject, needles = args[0], args[1]
-    if not isinstance(subject, str):
-        return UNDECIDED
-    items = list(needles) if isinstance(needles, (Seq, list)) else [needles]
-    return all(isinstance(n, str) and n in subject for n in items)
+    return _contains_needles(args, ctx, node, want_all=True)
+
 
 
 def _fn_presence(name: str):
@@ -1865,20 +1939,13 @@ def _fn_matches_regex(args: list[Any], ctx: "Context", node: Call) -> Any:
         return UNDECIDED
 
     nocase = "nocase" in node.flags or pattern.nocase
-    dialect = pattern.dialect
-    if nocase and dialect not in ("pcre", "pcre2", "posix_basic"):
-        # Case folding applies to the SUBJECT, not the pattern. Rewriting the
-        # pattern would need vendor-specific knowledge of case rules; folding
-        # the subject is exact for ASCII and honest everywhere else, because the
-        # trace says the fold happened.
-        try:
-            compiled = compile_pattern(dialect, pattern.pattern, nocase=False)
-        except Refusal as exc:
-            ctx.refusal(exc)
-            return UNDECIDED
-        return compiled.search(subject.casefold()) is not None
+    # The fold belongs to the COMPILE, not to the subject. Folding only the
+    # subject meant a pattern with an uppercase letter or a range in it
+    # (`DC01`, `[A-Z]`) could never match anything: the subject was lowercase
+    # and the pattern still demanded uppercase. `compile_pattern` applies
+    # re.IGNORECASE with re.ASCII, which is the behaviour the dialects specify.
     try:
-        compiled = compile_pattern(dialect, pattern.pattern, nocase=nocase)
+        compiled = compile_pattern(pattern.dialect, pattern.pattern, nocase=nocase)
     except Refusal as exc:
         ctx.refusal(exc)
         return UNDECIDED
@@ -1976,6 +2043,18 @@ def _fn_iff(args: list[Any], ctx: "Context", node: Call) -> Any:
     if condition is UNDECIDED:
         return UNDECIDED
     if condition is ABSENT:
+        return UNDECIDED
+    if not isinstance(condition, bool):
+        # `iff(null, "A", "B")` used to answer "B". Null is not false, and a
+        # rule written as "if this field is set" was silently reading the
+        # unset branch as though the field had been tested and failed.
+        ctx.uncertain(
+            "COMPARISON_UNDECIDABLE",
+            f"`{node.function}` was given a condition that is "
+            f"{type_name(condition)}, not true or false, so neither branch "
+            f"could be chosen.",
+            where=render_where(node),
+        )
         return UNDECIDED
     return args[1] if condition is True else args[2]
 

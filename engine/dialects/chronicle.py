@@ -356,7 +356,7 @@ def parse_chronicle(text: str) -> ParsedYaraL:
                 f"`{line}` in `meta:` is not a `key = \"value\"` pair.",
                 "parse",
             )
-        meta[key.strip()] = value.strip().strip('"')
+        meta[key.strip()] = _meta_value(value)
 
     return ParsedYaraL(
         name=head.group(1),
@@ -1145,6 +1145,8 @@ def _lower_join(
                 for key in keys
             ),
         ))
+
+
     nodes.append(Emit(id="out"))
 
     annotations, consumed = _annotations(parsed.meta, parsed.name)
@@ -1159,6 +1161,13 @@ def _lower_join(
             if reference in keys
         ),
     }
+    if window is not None:
+        # `match: $host over 10m` bounds the correlation, and it was parsed
+        # and then dropped on the floor: the rendered rule lost its `over`
+        # clause and became an all-time join. It is carried here so the
+        # renderer writes it back out.
+        metadata["chronicle.window"] = f"{int(window.seconds)}s"
+
     for key, value in parsed.meta.items():
         if key not in consumed:
             metadata[f"chronicle.meta.{key}"] = value
@@ -1166,9 +1175,15 @@ def _lower_join(
     diagnostics.append(Diagnostic(
         code="YARAL_EVENT_ORDER_UNCONSTRAINED",
         message=(
-            "the two event streams are joined on their shared fields, but "
-            "YARA-L's ordering (`$lsass.metadata.event_timestamp <= "
-            "$login.metadata.event_timestamp`) is not yet modelled here. The "
+            "the two event streams are joined on their shared fields"
+            + (
+                f" and bounded by `over {int(window.seconds)}s`, which is "
+                f"carried and written back out but NOT applied to your sample"
+                if window is not None
+                else ""
+            )
+            + ", but YARA-L's ordering (`$lsass.metadata.event_timestamp <= "
+            "$login.metadata.event_timestamp`) is not modelled here. The "
             "rule keeps both streams and their keys; add the temporal clause "
             "in the target SIEM."
         ),
@@ -1928,24 +1943,29 @@ def _render_join(rule: Rule, meta: dict[str, str]) -> str:
     annotations = rule.annotations
     meta_lines: list[str] = []
     if annotations.author:
-        meta_lines.append(f'    author = "{annotations.author}"')
+        meta_lines.append(f'    author = "{_meta_text(annotations.author)}"')
     if annotations.description:
-        meta_lines.append(f'    description = "{annotations.description}"')
+        meta_lines.append(
+            f'    description = "{_meta_text(annotations.description)}"'
+        )
     if annotations.severity:
-        meta_lines.append(f'    severity = "{annotations.severity}"')
+        meta_lines.append(f'    severity = "{_meta_text(annotations.severity)}"')
     for tactic, techniques in annotations.mitre_attack:
         if tactic:
-            meta_lines.append(f'    mitre_attack_tactic = "{tactic}"')
+            meta_lines.append(
+                f'    mitre_attack_tactic = "{_meta_text(tactic)}"'
+            )
         if techniques:
             meta_lines.append(
-                f'    mitre_attack_technique = "{", ".join(techniques)}"'
+                f'    mitre_attack_technique = '
+                f'"{_meta_text(", ".join(techniques))}"'
             )
     for reference in annotations.references:
-        meta_lines.append(f'    reference = "{reference}"')
+        meta_lines.append(f'    reference = "{_meta_text(reference)}"')
     for key, value in meta.items():
         if key.startswith("chronicle.meta."):
             meta_lines.append(
-                f'    {key[len("chronicle.meta."):]} = "{value}"'
+                f'    {key[len("chronicle.meta."):]} = "{_meta_text(value)}"'
             )
     if meta_lines:
         out.append("  meta:")
@@ -1957,12 +1977,58 @@ def _render_join(rule: Rule, meta: dict[str, str]) -> str:
 
     if keys:
         out.append("  match:")
-        out.append(f"    {', '.join('$' + n for n in key_names)}")
+        match_line = ", ".join('$' + n for n in key_names)
+        # The `over <window>` clause belongs to this line. Without it a
+        # 10-minute correlation was written back out as an unbounded join.
+        saved_window = meta.get("chronicle.window")
+        if saved_window:
+            match_line += f" over {saved_window}"
+        out.append(f"    {match_line}")
 
     out.append("  condition:")
     out.append(f"    {' and '.join('$' + v for v in variables)}")
     out.append("}")
     return "\n".join(out)
+
+
+def _meta_value(raw: str) -> str:
+    """A `meta:` value read back, with its escapes undone.
+
+    The inverse of `_meta_text`. Without it a rule that was written out with a
+    quoted description and read back in kept the backslashes, so every round
+    trip added another layer and the two texts never compared equal.
+    """
+    body = raw.strip()
+    if len(body) >= 2 and body.startswith('"') and body.endswith('"'):
+        body = body[1:-1]
+    out: list[str] = []
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char == "\\" and index + 1 < len(body):
+            following = body[index + 1]
+            out.append({"n": "\n", "r": "\r", "t": "\t"}.get(following, following))
+            index += 2
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _meta_text(value: str) -> str:
+    """A `meta:` value with the characters that end the string escaped.
+
+    A description containing `"` closed the YARA-L string literal early and the
+    rest of the value became syntax -- a rule that does not parse, from a rule
+    that was fine. Backslash goes first so an existing `\\` is not doubled.
+    """
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
 
 
 def _placeholder_name(ref: FieldRef) -> str:

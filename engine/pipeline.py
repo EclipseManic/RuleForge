@@ -38,7 +38,11 @@ from .evaluate import (
 )
 from .ir import (
     Aggregate,
+    Arith,
     Binding,
+    BoolOp,
+    Call,
+    Comparison,
     Correlation,
     Derive,
     Distinct,
@@ -48,7 +52,9 @@ from .ir import (
     Filter,
     Join,
     Limit,
+    ListExpr,
     Node,
+    Not,
     Project,
     Read,
     Rule,
@@ -299,6 +305,36 @@ def _is_monotone_in_input(rule: Rule) -> bool:
     return True
 
 
+def _mentions_time(expr: Any, depth: int = 0) -> bool:
+    """Whether an expression reads a clock.
+
+    A join predicate is not only ever a bare `Span`. KQL's canonical
+    correlation is `where A.Time between (B.Time .. B.Time + 10m)` ANDed with
+    a filter, so the `Span` arrives wrapped in a `BoolOp`. Checking only
+    `isinstance(predicate, Span)` reported "this rule needs no timestamps" for
+    exactly the rules that do, which downgraded TIME_FIELD_NOT_FOUND from a
+    blocker to a note and let an untimed sample come back a confident
+    `no_match`.
+    """
+    if depth > 64:
+        return False
+    if isinstance(expr, Span):
+        return True
+    if isinstance(expr, BoolOp):
+        return any(_mentions_time(operand, depth + 1) for operand in expr.operands)
+    if isinstance(expr, Not):
+        return _mentions_time(expr.operand, depth + 1)
+    if isinstance(expr, (Comparison, Arith)):
+        return _mentions_time(expr.left, depth + 1) or _mentions_time(
+            expr.right, depth + 1
+        )
+    if isinstance(expr, ListExpr):
+        return any(_mentions_time(item, depth + 1) for item in expr.items)
+    if isinstance(expr, Call):
+        return any(_mentions_time(argument, depth + 1) for argument in expr.args)
+    return False
+
+
 def _needs_timestamps(rule: Rule) -> bool:
     """Whether missing declared timestamps can change this rule's answer."""
     streams = [rule.pipeline] + [binding.pipeline for binding in rule.bindings]
@@ -308,9 +344,11 @@ def _needs_timestamps(rule: Rule) -> bool:
                 return True
             if isinstance(node, Aggregate) and node.window is not None:
                 return True
-            if isinstance(node, Join) and isinstance(node.predicate, Span):
-                return True
+            if isinstance(node, Join) and node.predicate is not None:
+                if _mentions_time(node.predicate):
+                    return True
     return False
+
 
 
 def _verdict(
@@ -728,11 +766,41 @@ def _eval_join(node: Join, state: _State) -> list[Row]:
     #
     # It only worked when both sides happened to spell the key the same way,
     # which is the common case in the tests and not in real rules.
+    # A join key has to be HASHABLE and comparable across types. The raw value
+    # is neither: two events that both lack the key hashed to the same
+    # `(ABSENT,)` tuple and joined as a confident match, a JSON array raised
+    # `TypeError: unhashable type: 'list'`, and "4624" did not join 4624.
+    def _join_key(value: Any) -> Any:
+        if isinstance(value, dict):
+            return ("d", tuple(sorted(
+                (str(k), _join_key(v)) for k, v in value.items())))
+        if isinstance(value, (list, tuple)):
+            return ("l", tuple(_join_key(item) for item in value))
+        number = as_number(value)
+        if number is not None:
+            # Normalises "4624" and 4624 to one key, which is the whole point
+            # of a numeric coercion existing.
+            return ("n", number)
+        return ("v", type_name(value), value)
+
+    def _has_missing_key(row: Row, refs: Any) -> bool:
+        for ref in refs:
+            value = _unscoped(row, ref)
+            if value is ABSENT or value is None:
+                return True
+        return False
+
+    missing_keys = 0
     index: dict[tuple, list[Row]] = defaultdict(list)
     if node.on:
         for row in right_rows:
+            if _has_missing_key(row, [right for _left, right in node.on]):
+                # A row with no join key cannot join ANYTHING. Indexing it put
+                # every such row in one bucket keyed on the absence itself.
+                missing_keys += 1
+                continue
             index[
-                tuple(_unscoped(row, right) for _left, right in node.on)
+                tuple(_join_key(_unscoped(row, right)) for _left, right in node.on)
             ].append(row)
 
     out: list[Row] = []
@@ -751,11 +819,18 @@ def _eval_join(node: Join, state: _State) -> list[Row]:
             )
         candidates: list[Row]
         if node.on:
-            # The LEFT key probes the index the RIGHT key built. Both sides are
-            # read unscoped, because neither row has been merged yet.
-            candidates = index.get(
-                tuple(_unscoped(left_row, left) for left, _right in node.on), []
-            )
+            if _has_missing_key(left_row, [left for left, _right in node.on]):
+                # The left row cannot join anything either. Skipping it here is
+                # what stops `ABSENT == ABSENT` from being a match.
+                missing_keys += 1
+                candidates = []
+            else:
+                # The LEFT key probes the index the RIGHT key built. Both sides
+                # are read unscoped, because neither row has been merged yet.
+                candidates = index.get(
+                    tuple(_join_key(_unscoped(left_row, left))
+                          for left, _right in node.on), []
+                )
         else:
             candidates = right_rows
 
@@ -797,6 +872,14 @@ def _eval_join(node: Join, state: _State) -> list[Row]:
             f"join's row count is a lower bound rather than a number.",
             where=node.id,
         )
+    if missing_keys:
+        state.context.uncertain(
+            "JOIN_KEY_MISSING",
+            f"`{node.id}` skipped {missing_keys} row(s) whose join key is "
+            f"absent or null. An absent key is not a value that equals another "
+            f"absent key, so those rows cannot join anything.",
+            where=node.id,
+        )
     _record(state, node, len(left_rows), len(out), undecided=undecided)
     return out
 
@@ -828,17 +911,16 @@ def _eval_aggregate(node: Aggregate, rows: list[Row], state: _State) -> list[Row
     Group keys are tagged so a missing key and a null key never land in the same
     bucket -- merging them produces a group count that is right for neither.
     """
-    groups: dict[tuple, list[Row]] = defaultdict(list)
-    for row in rows:
-        state.context.budget.spend()
-        groups[tuple(_group_tag(row, ref) for ref in node.keys)].append(row)
-
     windows = _windows_for(node.window, rows, state)
 
     out: list[Row] = []
     for window_rows in windows:
         local: dict[tuple, list[Row]] = defaultdict(list)
         for row in window_rows:
+            # One step per row, charged HERE rather than in a first pass whose
+            # grouping was never read. That pass billed every row twice, so a
+            # budget that is meant to bound the work ran out at half the work.
+            state.context.budget.spend()
             local[tuple(_group_tag(row, ref) for ref in node.keys)].append(row)
         for key, members in local.items():
             values: dict[str, Any] = {}
@@ -851,6 +933,33 @@ def _eval_aggregate(node: Aggregate, rows: list[Row], state: _State) -> list[Row
     _record(state, node, len(rows), len(out),
             detail=f"groups={len(out)}")
     return out
+
+
+def _group_key_missing(row: Row, refs: Any) -> bool:
+    """Whether any key in a grouping tuple is absent OR null.
+
+    Both are "no value". The stages below used to test only `ABSENT`, so two
+    events that both carried an explicit `null` source IP hashed to the same
+    `(None,)` and were correlated as one actor -- a brute-force threshold fired
+    on unrelated logins because the field was empty rather than filled.
+    """
+    for ref in refs:
+        value = row.get(storage_key(ref))
+        if value is ABSENT or value is None:
+            return True
+    return False
+
+
+def _grouped_key(row: Row, refs: Any) -> tuple:
+    """A hashable, type-normalised grouping key.
+
+    `_group_tag` already solves both problems for the aggregate: `"4624"` and
+    `4624` are the same value, and a JSON array becomes a tuple instead of
+    raising `TypeError: unhashable type: 'list'`. Correlation, sequence and
+    emit built raw tuples, so a numeric id in two spellings split one actor
+    into two groups and an array field crashed the run outright.
+    """
+    return tuple(_group_tag(row, ref) for ref in refs)
 
 
 def _group_tag(row: Row, ref: Any) -> tuple:
@@ -884,6 +993,25 @@ def _windows_for(
     """
     if window is None or window.kind in ("per_event", "cumulative"):
         return [rows]
+
+    # A window is a statement about time. When rows carry no timestamp there is
+    # nothing to bucket, and returning one bucket for all of them reports a
+    # 5-minute count that was never windowed at all -- matched, with no caveat.
+    # This is also where the MIXED case is reported: the untimed rows used to
+    # disappear at the `timed = [...]` line below without a word.
+    untimed = [row for row in rows if as_number(row.time) is None]
+    if untimed:
+        span = ""
+        if window.size is not None:
+            span = f"{int(window.size.seconds)}s "
+        state.context.uncertain(
+            "AGGREGATE_ROW_UNTIMED",
+            f"{len(untimed)} of {len(rows)} row(s) carry no timestamp, so the "
+            f"{span}window could not be applied to them. A windowed count over "
+            f"untimed rows is a total, not a rate, and the rule says the two "
+            f"are the same.",
+            where=window.time_field or "window",
+        )
     if window.kind == "session":
         if window.gap is None:
             raise Refusal(
@@ -1010,8 +1138,9 @@ def _measure(measure: Any, members: list[Row], state: _State) -> Any:
         return Decimal(len({
             str(v) for v in values if v is not ABSENT and v is not None
         }))
-    if name in ("countif",):
-        return Decimal(len(present))
+        return Decimal(len({
+            str(v) for v in values if v is not ABSENT and v is not None
+        }))
 
     # The four aggregates below are reachable from a dialect spec -- KQL maps
     # `percentile`, `stdev`, `arg_max` and `arg_min` -- and used to fall
@@ -1290,8 +1419,8 @@ def _eval_emit(node: Emit, rows: list[Row], state: _State) -> list[Row]:
         deduped: list[Row] = []
         collapsed = 0
         for row in out:
-            key = tuple(row.get(storage_key(ref)) for ref in node.dedupe_by)
-            if any(part is ABSENT for part in key):
+            key = _grouped_key(row, node.dedupe_by)
+            if _group_key_missing(row, node.dedupe_by):
                 # Fifty events becoming one alert because a dedupe key was
                 # missing is a silent data loss, so the rows are kept and the
                 # fact is reported.
@@ -1350,11 +1479,11 @@ def _eval_correlation(node: Correlation, state: _State) -> list[Row]:
             # one lowers the count towards a false no_match.
             untimed += 1
             continue
-        key = tuple(row.get(storage_key(ref)) for ref in node.group_by)
-        if any(part is ABSENT for part in key):
-            # An absent group key is not a group. Lumping every absence
-            # together would count unrelated events as one actor, which is the
-            # very failure this grouping exists to prevent.
+        key = _grouped_key(row, node.group_by)
+        if _group_key_missing(row, node.group_by):
+            # An absent or null group key is not a group. Lumping every
+            # absence together would count unrelated events as one actor,
+            # which is the very failure this grouping exists to prevent.
             ungrouped += 1
             continue
         groups.setdefault(key, []).append((when, row))
@@ -1440,8 +1569,8 @@ def _eval_sequence(node: Sequence, rows: list[Row], state: _State) -> list[Row]:
             # the ordering the rule is testing for.
             untimed += 1
             continue
-        key = tuple(row.get(storage_key(ref)) for ref in node.by)
-        if any(part is ABSENT for part in key):
+        key = _grouped_key(row, node.by)
+        if _group_key_missing(row, node.by):
             ungrouped += 1
             continue
         groups.setdefault(key, []).append((when, row))
@@ -1482,8 +1611,17 @@ def _eval_sequence(node: Sequence, rows: list[Row], state: _State) -> list[Row]:
         # what identifies a chain: two anchors reaching the same final event
         # are the same occurrence seen from different starting points.
         closed: set[int] = set()
+        # Caveats from a FAILED candidate attempt are not facts about the rule.
+        # Anchor 1 of a two-event sequence tests step 1 against the second
+        # event, which has no `process.name`, so it recorded
+        # COMPARISON_UNDECIDABLE -- and that one dead-end flipped a completed
+        # sequence from matched to not_evaluated. The attempts run against a
+        # scratch context; its caveats are merged only if the whole group
+        # produced no match at all.
+        scratch = Context(budget=state.context.budget)
+        group_matched = False
         for anchor in range(len(members)):
-            matched = _match_sequence_from(node, members, anchor, span, state)
+            matched = _match_sequence_from(node, members, anchor, span, state, scratch)
             if matched is None:
                 continue
             row, closing = matched
@@ -1491,7 +1629,11 @@ def _eval_sequence(node: Sequence, rows: list[Row], state: _State) -> list[Row]:
                 continue
             closed.add(closing)
             out.append(row)
+            group_matched = True
             state.context.budget.spend()
+        if not group_matched:
+            for caveat in scratch.caveats:
+                state.context.uncertain(caveat.code, caveat.message, caveat.where)
 
     out.sort(key=lambda row: (as_number(row.time) or 0))
     detail = (
@@ -1510,6 +1652,7 @@ def _match_sequence_from(
     anchor: int,
     span: Any,
     state: _State,
+    context: Context | None = None,
 ) -> tuple[Row, int] | None:
     """One attempt at the sequence, beginning at `members[anchor]`.
 
@@ -1523,13 +1666,16 @@ def _match_sequence_from(
     runs_left = node.steps[0].runs
     started: Any = None
     collected: list[Row] = []
+    # Caveats raised while testing a candidate belong to the ATTEMPT, not to
+    # the rule. The caller merges them only when the whole group failed.
+    active = context if context is not None else state.context
 
     for position in range(anchor, len(members)):
         when, row = members[position]
 
         if node.until is not None:
             verdict = eval_expr(
-                node.until, Scope(current=row), state.context
+                node.until, Scope(current=row), active
             )
             if verdict is True:
                 # The chain was cancelled. Completing it anyway reports an
@@ -1540,7 +1686,7 @@ def _match_sequence_from(
             return None
 
         step = node.steps[step_index]
-        verdict = eval_expr(step.condition, Scope(current=row), state.context)
+        verdict = eval_expr(step.condition, Scope(current=row), active)
         if verdict is not True:
             # A row that does not satisfy the current step is simply not part
             # of it. It is NOT a failure: unrelated traffic sits between the

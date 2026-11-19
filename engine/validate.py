@@ -148,10 +148,24 @@ def validate(rule: Rule) -> None:
     for node in stages:
         _validate_node(node, sources)
 
+    # A binding's GUARD is a predicate that runs before the binding does, so it
+    # is on the deploy path exactly like a Filter's condition. It was skipped
+    # entirely, which meant a catastrophic pattern or an unknown operator there
+    # passed every check.
+    for binding in rule.bindings:
+        if binding.guard is not None:
+            _require_predicate(binding.guard, f"binding `{binding.name}`")
+            _walk_expression(binding.guard, 0)
+
     # The deploy-path screen. Every stage, not just the reachable ones: a stage
     # a rule does not currently use still renders into the artifact.
     for node in stages:
         _screen_node(node)
+    for binding in rule.bindings:
+        if binding.guard is not None:
+            for value in _everything_reachable(binding.guard):
+                if isinstance(value, Regex):
+                    _screen_regex(value, f"binding `{binding.name}`")
 
 
 # ---------------------------------------------------------------------------
@@ -421,8 +435,20 @@ def _everything_reachable(node: Node):
 
 
 def _walk_value(value: Any, depth: int):
-    if depth > 12:
-        return
+    # NO early return on depth. `_walk_expression` documents exactly why: a cap
+    # that SILENTLY stops walking lets an attacker hide a catastrophic pattern
+    # past it. Each BoolOp costs two levels (the node and its operands tuple),
+    # so seven AND clauses -- far below MAX_EXPRESSION_DEPTH -- put a `(a+)+$`
+    # out of reach of the screen entirely. The cap is high enough to bound the
+    # work and it REFUSES rather than returning quietly.
+    if depth > MAX_EXPRESSION_DEPTH:
+        raise Refusal(
+            "EXPRESSION_TOO_DEEP",
+            f"this condition nests more than {MAX_EXPRESSION_DEPTH} levels deep, "
+            f"so it cannot be screened for a pattern that would hang the engine "
+            f"that runs it. Flatten the rule.",
+            "validate",
+        )
     if isinstance(value, Regex):
         yield value
         return

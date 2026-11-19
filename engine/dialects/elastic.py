@@ -212,6 +212,10 @@ SPEC: Final = DialectSpec(
         "like~", "regex~",
     }),
     list_operators=frozenset({"in"}),
+    # Spellings that MEAN "ignore case". The operator map above turns `regex~`
+    # into plain `matches` and forgets the tilde, so the fold has to be declared
+    # separately or the case-insensitivity is read and thrown away.
+    nocase_operators=_NOCASE_SPELLINGS,
     functions=FUNCTIONS,
     implicit_equality=False,
     default_regex_dialect=REGEX_DIALECT,
@@ -694,10 +698,22 @@ def _lower_pipes(
                 keep_last=name == "tail",
             ))
         elif handling == "sort":
-            keys = [
-                (_field(part, "| sort"), False)
-                for part in split_top_level(argument, ",") if part.strip()
-            ]
+            # A direction per key, which is what EQL writes and what `Sort`
+            # carries. Reading only the field name made a re-parse of
+            # `| sort A descending` come back ascending.
+            keys = []
+            for part in split_top_level(argument, ","):
+                spec = part.strip()
+                if not spec:
+                    continue
+                descending = False
+                for word, flag in ((" descending", True), (" desc", True),
+                                   (" ascending", False), (" asc", False)):
+                    if spec.lower().endswith(word):
+                        descending = flag
+                        spec = spec[: -len(word)].strip()
+                        break
+                keys.append((_field(spec, "| sort"), descending))
             nodes.append(Sort(id=f"pipe_{index}_sort", keys=tuple(keys)))
         elif handling == "distinct":
             from ..ir import Distinct
@@ -895,7 +911,17 @@ def _render_comparison(expr: Comparison) -> str:
                 f"hand Elastic a pattern in a syntax it reads differently.",
                 "render",
             )
-        text = f'{left} regex "{expr.right.pattern}"'
+        # `regex~` is EQL's case-INSENSITIVE form and bare `regex` is not.
+        # Emitting `regex` for a nocase pattern dropped the fold on the way out,
+        # so a rule that matched `ENCODED` locally matched only `encoded` in
+        # production -- the translation looked clean and meant something else.
+        #
+        # The pattern is a double-quoted string in EQL, so `\` and `"` have to
+        # be escaped or a pattern containing either terminates the literal early
+        # and produces a query that does not parse.
+        body = expr.right.pattern.replace("\\", "\\\\").replace('"', '\\"')
+        operator = "regex~" if expr.right.nocase else "regex"
+        text = f'{left} {operator} "{body}"'
         return f"not {text}" if expr.negate else text
 
     if expr.op == "in":
@@ -1069,8 +1095,12 @@ def render_elastic(rule: Rule) -> str:
             )
             continue
         if isinstance(node, Sort):
+            # EQL's `sort` takes a direction per field, and the model carries
+            # one per key. Emitting only the names silently sorted every key
+            # ascending, so `sort by A desc, B asc` came back as `A, B`.
             pipes.append("| sort " + ", ".join(
-                ref.full for ref, _descending in node.keys
+                f"{ref.full} {'descending' if descending else 'ascending'}"
+                for ref, descending in node.keys
             ))
             continue
         if isinstance(node, Distinct):

@@ -837,7 +837,23 @@ function renderStageBody(host, stage) {
       value.value = pair.v[1]['@'] === 'Literal'
         ? literalToText(pair.v[1].value) : describeExpr(pair.v[1]);
       value.onchange = () => {
-        pair.v[1] = literal(literalFromText(value.value));
+        /* An EXPRESSION is not a string. This used to assign
+           `literal(literalFromText(...))` unconditionally, so opening a rule
+           with `| extend Ratio = BytesOut / BytesIn` and touching that row
+           replaced the Arith node with the literal text "BytesOut / BytesIn" --
+           the rule changed meaning because someone clicked in a field. */
+        const original = pair.v[1];
+        const text = value.value;
+        if (original['@'] !== 'Literal') {
+          if (text === describeExpr(original)) {
+            return; /* untouched: keep the expression */
+          }
+          toast('this cell holds an expression. Edit it in the rule text, or '
+              + 'replace it with a plain value.', 'bad');
+          value.value = describeExpr(original);
+          return;
+        }
+        pair.v[1] = literal(literalFromText(text));
       };
       row.appendChild(value);
       const drop = el('button', 'icon', '\u00d7');
@@ -1078,7 +1094,14 @@ function renderStageBody(host, stage) {
       }
       box.appendChild(label);
       const slot = el('div');
-      renderCondition(slot, step.condition, next => { step.condition = next; });
+      renderCondition(slot, step.condition, next => {
+        /* Clearing a step condition assigned null, and the encoder then sent a
+           SequenceStep with no condition -- which the engine refuses, so the
+           whole rule stopped loading after an accidental click. A step with no
+           test is not a step, so clearing restores the empty comparison the
+           row starts with. */
+        step.condition = next || newComparison();
+      });
       box.appendChild(slot);
       host.appendChild(box);
     });

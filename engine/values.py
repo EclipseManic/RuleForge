@@ -399,17 +399,22 @@ def as_number(value: Any) -> Decimal | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, Decimal):
-        return value
+        return value if value.is_finite() else None
     if isinstance(value, int):
         return Decimal(value)
     if isinstance(value, float):
+        # A JSON sample can carry NaN/Infinity, and Decimal("NaN") < Decimal(5)
+        # RAISES instead of comparing, so a non-finite value must be refused
+        # here rather than crashing whatever orders it later.
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
         return Decimal(str(value))
     if isinstance(value, str):
         text = value.strip()
         if not text:
             return None
         try:
-            return Decimal(text)
+            parsed_decimal = Decimal(text)
         except InvalidOperation:
             try:
                 parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
@@ -418,6 +423,10 @@ def as_number(value: Any) -> Decimal | None:
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
             return Decimal(str(parsed.timestamp()))
+        # "NaN", "sNaN", "Infinity" and "-inf" all PARSE. None of them is a
+        # number a SIEM can order, and letting one through crashed `_ordering`
+        # with an unhandled decimal.InvalidOperation.
+        return parsed_decimal if parsed_decimal.is_finite() else None
     if isinstance(value, Duration):
         return value.seconds
     return None
@@ -534,7 +543,9 @@ def _ordering(left: Any, right: Any) -> int | Undecided:
             return -1
         if a > b:
             return 1
-    except TypeError:
+    except (TypeError, InvalidOperation):
+        # Decimal("NaN") compares by RAISING InvalidOperation, not by
+        # returning False. An unorderable pair is UNDECIDED, never a crash.
         return UNDECIDED
     return 0
 
@@ -611,15 +622,33 @@ def _equals(left: Any, right: Any) -> bool | Undecided:
 
 
 def _seq_equals(left: Any, right: Any) -> bool | Undecided:
-    a = list(left) if isinstance(left, (list, Seq)) else [left]
-    b = list(right) if isinstance(right, (list, Seq)) else [right]
+    """Element-wise equality, in three-valued logic.
+
+    A single UNDECIDED element used to be swallowed: the loop only returned on
+    a definite False and then fell through to `True`, so `["abc"] == 123` came
+    back TRUE. A list compared against a scalar or a list of the wrong shape is
+    undecided, not equal, and a mixed list is undecided unless one element is
+    definitely unequal.
+    """
+    left_is_seq = isinstance(left, (list, Seq))
+    right_is_seq = isinstance(right, (list, Seq))
+    if left_is_seq != right_is_seq:
+        # A list and a scalar are not comparable as equality. Treating the
+        # scalar as a one-element list made `field == "x"` match `["x", "y"]`
+        # whenever the lengths happened to line up.
+        return UNDECIDED
+    a = list(left) if left_is_seq else [left]
+    b = list(right) if right_is_seq else [right]
     if len(a) != len(b):
         return False
+    saw_undecided = False
     for x, y in zip(a, b):
         result = _equals(x, y)
-        if result is not UNDECIDED and not result:
+        if result is UNDECIDED:
+            saw_undecided = True
+        elif not result:
             return False
-    return True
+    return UNDECIDED if saw_undecided else True
 
 
 # ---------------------------------------------------------------------------

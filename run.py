@@ -85,10 +85,25 @@ def _port_is_free(host: str, port: int) -> bool:
     A connect probe rather than a bind, because a failed bind can mean
     permission or a stale socket as well as "in use", and only one of those
     is worth moving to the next port for.
+
+    The address family comes from `getaddrinfo`, not from a hardcoded
+    `AF_INET`. `--host ::1` is a legitimate loopback choice, and an AF_INET
+    probe against an IPv6 literal raised `socket.gaierror` -- so the check
+    crashed before the server ever started.
     """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.settimeout(0.4)
-        return probe.connect_ex((host, port)) != 0
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        # An address this host cannot resolve is not "in use"; the bind below
+        # is what reports the real problem, with its own message.
+        return True
+    for family, kind, proto, _canon, address in infos:
+        with socket.socket(family, kind, proto) as probe:
+            probe.settimeout(0.4)
+            if probe.connect_ex(address) == 0:
+                return False
+    return True
+
 
 
 def _find_port(host: str, preferred: int) -> int:
