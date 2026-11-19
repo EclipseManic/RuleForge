@@ -30,7 +30,16 @@ from web.api import (
     build_server,
 )
 
-from . import planned_dialect
+try:
+    from . import planned_dialect
+except ImportError:  # pragma: no cover - `unittest discover -s tests`
+    # `discover -s tests` (no `-t .`) makes this directory the TOP level, so
+    # these modules import as `test_api` rather than `tests.test_api` and a
+    # relative import has no parent package. Falling back to the absolute name
+    # keeps both spellings working instead of crashing two modules out of the
+    # run -- a suite that dies at import reports success for everything it
+    # never collected.
+    from tests import planned_dialect
 
 USER_RULE = """
 let LSASSAccess =

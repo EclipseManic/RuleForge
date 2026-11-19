@@ -588,14 +588,29 @@ def _closes_at_end(body: str) -> bool:
     depth = 0
     in_string = False
     in_regex = False
-    for index, char in enumerate(body):
+    index = 0
+    while index < len(body):
+        char = body[index]
         if char == "\\" and (in_string or in_regex):
+            # Advance PAST the escaped character, not just past the backslash.
+            # This loop used to `continue` without moving on, so an escaped `/`
+            # inside a pattern still ENDED the pattern: `/\/dev\/tcp\//` was
+            # read as regex, then not-regex, then regex again, and the closing
+            # `)` was swallowed as pattern text. The group was never recognised,
+            # so the whole predicate was refused as unreadable -- which is how
+            # the `linux-reverse-shell` Sigma rule rendered Chronicle text that
+            # Chronicle itself could not read back.
+            index += 2
             continue
         if in_string:
-            in_string = char != '"'
+            if char == '"':
+                in_string = False
+            index += 1
             continue
         if in_regex:
-            in_regex = char != "/"
+            if char == "/":
+                in_regex = False
+            index += 1
             continue
         if char == '"':
             in_string = True
@@ -607,7 +622,9 @@ def _closes_at_end(body: str) -> bool:
             depth -= 1
             if depth == 0:
                 return index == len(body) - 1
+        index += 1
     return False
+
 
 
 def _split_top(body: str, joiner: str) -> list[str]:
@@ -836,11 +853,38 @@ class _Threshold:
     strict: bool
 
 
-def _lower_condition(text: str) -> _Threshold | None:
-    """`condition: $e and #e > 5` as a threshold, when it has one.
+@dataclass(frozen=True, slots=True)
+class _OutcomeTest:
+    """One `$name <op> <number>` from `condition:`.
+
+    `condition:` constrains the `outcome:` aggregates as well as the event
+    count, and only the count was ever read. `condition: #e >= 5 and $cnt >= 3`
+    lowered with no diagnostics and no filter after the aggregate, so a
+    password-spray rule written to require three distinct source IPs fired on
+    one -- the exported YARA-L would do the same in SecOps.
+    """
+
+    variable: str
+    operator: str
+    value: Decimal
+
+
+#: The comparisons an `outcome:` test may use. All six are plain orderings or
+#: equalities, so no inversion is needed and nothing has to be rewritten.
+_OUTCOME_OPERATORS: Final[frozenset[str]] = frozenset(
+    (">", ">=", "<", "<=", "==", "!=")
+)
+
+
+def _lower_condition(
+    text: str, outcome_names: frozenset[str] = frozenset()
+) -> tuple[_Threshold | None, tuple[_OutcomeTest, ...]]:
+    """`condition:` split into the event-count threshold and the outcome tests.
 
     `#e` is a COUNT. Read as a field reference it becomes a comparison against
-    an absent column and the threshold stops applying.
+    an absent column and the threshold stops applying. `$name` is an `outcome:`
+    aggregate, and it was not read AT ALL: the old version returned on the first
+    `#e` it found, so every `$name` test after it disappeared without a word.
     """
     body = text.strip()
     if not body:
@@ -850,6 +894,8 @@ def _lower_condition(text: str) -> _Threshold | None:
             "`$e` would invent a condition the author did not write.",
             "lower",
         )
+    threshold: _Threshold | None = None
+    outcome_tests: list[_OutcomeTest] = []
     for part in re.split(r"\band\b", body, flags=re.I):
         piece = part.strip().strip("()").strip()
         split = _split_operator(piece)
@@ -858,7 +904,23 @@ def _lower_condition(text: str) -> _Threshold | None:
         left, operator, right = split
         count = _COUNT_REF.match(left.strip())
         if count is None:
+            # An `outcome:` aggregate test. A `$e`-style event reference has no
+            # operator of its own and never reaches here; anything else keeps
+            # the old behaviour rather than inventing a meaning for it.
+            name = left.strip()
+            if name.startswith("$") and name[1:] in outcome_names:
+                outcome_tests.append(
+                    _outcome_test(piece, name[1:], operator, right)
+                )
             continue
+        if threshold is not None:
+            raise Refusal(
+                "YARAL_THRESHOLD_REPEATED",
+                f"`condition:` thresholds the event count more than once "
+                f"(`{piece}`). Only one count can be the threshold, and "
+                f"picking one of them silently would drop the other.",
+                "lower",
+            )
         if operator not in (">", ">="):
             raise Refusal(
                 "YARAL_THRESHOLD_DIRECTION",
@@ -877,10 +939,50 @@ def _lower_condition(text: str) -> _Threshold | None:
                 f"which is not a number.",
                 "lower",
             ) from None
-        return _Threshold(
+        threshold = _Threshold(
             variable=count.group(1), minimum=minimum, strict=operator == ">"
         )
-    return None
+    return threshold, tuple(outcome_tests)
+
+
+def _outcome_test(
+    piece: str, variable: str, operator: str, right: str
+) -> _OutcomeTest:
+    """One validated `$name <op> <number>`."""
+    if operator not in _OUTCOME_OPERATORS:
+        raise Refusal(
+            "YARAL_OUTCOME_TEST_OPERATOR",
+            f"`{piece}` tests the outcome `{variable}` with `{operator}`. "
+            f"YARA-L's `condition:` compares an outcome with > >= < <= == or "
+            f"!=, and anything else is not a test this model can write back.",
+            "lower",
+        )
+    try:
+        value = Decimal(right.strip())
+    except Exception:
+        raise Refusal(
+            "YARAL_OUTCOME_TEST_NOT_A_NUMBER",
+            f"`{piece}` compares the outcome `{variable}` with "
+            f"`{right.strip()}`, which is not a number.",
+            "lower",
+        ) from None
+    return _OutcomeTest(variable=variable, operator=operator, value=value)
+
+
+def _outcome_condition(tests: tuple[_OutcomeTest, ...]) -> Expr:
+    """The post-aggregate filter the outcome tests describe."""
+    comparisons: list[Expr] = [
+        Comparison(
+            test.operator,
+            FieldRef(name=test.variable),
+            Literal(test.value),
+        )
+        for test in tests
+    ]
+    if len(comparisons) == 1:
+        return comparisons[0]
+    return BoolOp("and", tuple(comparisons))
+
 
 
 def _lower_outcome(
@@ -1126,6 +1228,24 @@ def _lower_join(
             ),
         ))
 
+    # The window, as a REAL predicate on the join. Carrying it only in metadata
+    # meant the evaluated rule was an unbounded all-time join: two events ten
+    # days apart on the same host satisfied a rule that said `over 10m`. The
+    # span is symmetric because YARA-L's `over` bounds the whole match window,
+    # so either event may come first -- which is also why the ordering caveat
+    # below is about ORDER, not about the window.
+    window_predicate: Expr | None = None
+    if window is not None:
+        left_time = FieldRef(name="metadata", path=("event_timestamp",),
+                             scope="left")
+        right_time = FieldRef(name="metadata", path=("event_timestamp",),
+                              scope="right")
+        window_predicate = Span(
+            left_time,
+            Arith("-", right_time, Literal(window.seconds)),
+            Arith("+", right_time, Literal(window.seconds)),
+        )
+
     nodes: list[Node] = [
         Read(
             id="source",
@@ -1144,7 +1264,9 @@ def _lower_join(
                 (key, FieldRef(name=key.name, path=key.path, scope="right"))
                 for key in keys
             ),
+            predicate=window_predicate,
         ))
+
 
 
     nodes.append(Emit(id="out"))
@@ -1177,15 +1299,15 @@ def _lower_join(
         message=(
             "the two event streams are joined on their shared fields"
             + (
-                f" and bounded by `over {int(window.seconds)}s`, which is "
-                f"carried and written back out but NOT applied to your sample"
+                f" and bounded by `over {int(window.seconds)}s`, which IS "
+                f"applied to your sample"
                 if window is not None
                 else ""
             )
-            + ", but YARA-L's ordering (`$lsass.metadata.event_timestamp <= "
-            "$login.metadata.event_timestamp`) is not modelled here. The "
-            "rule keeps both streams and their keys; add the temporal clause "
-            "in the target SIEM."
+            + ", but YARA-L's ORDERING (`$lsass.metadata.event_timestamp <= "
+            "$login.metadata.event_timestamp`) is not modelled here: the window "
+            "is symmetric, so either event may come first. Add the directional "
+            "clause in the target SIEM if the rule needs one."
         ),
         severity="caution",
         verified=True,
@@ -1298,12 +1420,32 @@ def lower_chronicle(
         )
 
     if not predicates:
-        raise Refusal(
-            "YARAL_NO_PREDICATES",
-            "this rule's `events:` section tests nothing: every line binds a "
-            "variable. A rule with no test matches every event in the stream.",
-            "lower",
-        )
+        # An aggregate with a grouping key has no per-event test to state: the
+        # detection IS the count. The IR holds that shape (a Read, an
+        # Aggregate and a post-aggregate Filter), so refusing to read it back
+        # made the renderer's own output unparseable. It is allowed only with
+        # BOTH an `outcome:` and a `match:` -- without them the rule really
+        # would count every event in the stream with nothing to group on --
+        # and it is reported rather than passed quietly.
+        if parsed.outcome and parsed.match:
+            diagnostics.append(Diagnostic(
+                code="YARAL_NO_EVENT_PREDICATE",
+                message=(
+                    "`events:` names no test, so this rule counts EVERY event "
+                    "in the stream and groups the count by `match:`. That is "
+                    "what a bare `outcome:` aggregate means; add a predicate to "
+                    "`events:` if the count should be narrower."
+                ),
+                severity="caution",
+                verified=True,
+            ))
+        else:
+            raise Refusal(
+                "YARAL_NO_PREDICATES",
+                "this rule's `events:` section tests nothing: every line binds a "
+                "variable. A rule with no test matches every event in the stream.",
+                "lower",
+            )
 
     if parsed.options:
         diagnostics.append(Diagnostic(
@@ -1317,12 +1459,11 @@ def lower_chronicle(
             verified=True,
         ))
 
-    condition = predicates[0] if len(predicates) == 1 \
-        else BoolOp("and", tuple(predicates))
-
     keys, window = _lower_match(parsed.match, placeholders)
-    threshold = _lower_condition(parsed.condition)
     measures = _lower_outcome(parsed.outcome, event_vars)
+    threshold, outcome_tests = _lower_condition(
+        parsed.condition, frozenset(m.name for m in measures)
+    )
 
     nodes: list[Node] = [
         Read(
@@ -1339,8 +1480,16 @@ def lower_chronicle(
                 "metadata.event_timestamp" if window is not None else ""
             ),
         ),
-        Filter(id="events", condition=condition),
     ]
+    if predicates:
+        # An aggregate-only rule has no per-event test at all, and inventing an
+        # always-true Filter for it is refused by `BoolOp`. Its detection IS
+        # the count, which the Aggregate and the outcome test below express.
+        nodes.append(Filter(
+            id="events",
+            condition=predicates[0] if len(predicates) == 1
+            else BoolOp("and", tuple(predicates)),
+        ))
 
     if threshold is not None:
         if not keys:
@@ -1378,6 +1527,23 @@ def lower_chronicle(
         nodes.append(Aggregate(
             id="outcome", measures=tuple(measures), keys=tuple(keys)
         ))
+        if outcome_tests:
+            # `$cnt >= 3` is a test on the OUTCOME, so it runs after the
+            # aggregate. Dropping it let a rule written to need three distinct
+            # source IPs fire on one, with no diagnostic to say so.
+            nodes.append(Filter(
+                id="outcome_test",
+                condition=_outcome_condition(outcome_tests),
+            ))
+    elif outcome_tests:
+        raise Refusal(
+            "YARAL_OUTCOME_TEST_WITHOUT_OUTCOME",
+            f"`condition:` tests `{'$' + outcome_tests[0].variable}`, but "
+            f"there is no `outcome:` section that computes it. Testing a value "
+            f"the rule never calculates would compare against nothing and pass "
+            f"every event.",
+            "lower",
+        )
     elif keys and threshold is None:
         diagnostics.append(Diagnostic(
             code="YARAL_MATCH_WITHOUT_THRESHOLD",
@@ -1438,6 +1604,52 @@ def _render_value(value: Any) -> str:
     if isinstance(value, (int, float)):
         return str(value)
     return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _render_outcome_test(expr: Expr) -> str:
+    """A post-aggregate filter as a `condition:` test on an outcome name.
+
+    `condition:` is the only place YARA-L can test an `outcome:` value, so a
+    Filter that sits after the Aggregate has to be written back there. Putting
+    it in `events:` would apply it per event -- the opposite of what it says.
+    """
+    tests: list[Expr]
+    if isinstance(expr, BoolOp) and expr.op == "and":
+        tests = list(expr.operands)
+    else:
+        tests = [expr]
+    parts: list[str] = []
+    for test in tests:
+        if not isinstance(test, Comparison) or test.negate:
+            raise Refusal(
+                "YARAL_RENDER_OUTCOME_TEST",
+                f"`{render_expr(test)}` runs after the aggregate but is not a "
+                f"plain comparison against an outcome. YARA-L can only write "
+                f"`$name <op> <number>` there, and writing this as something "
+                f"else would change which events fire the rule.",
+                "render",
+            )
+        if not isinstance(test.left, FieldRef) or not isinstance(
+            test.right, Literal
+        ):
+            raise Refusal(
+                "YARAL_RENDER_OUTCOME_TEST",
+                f"`{render_expr(test)}` compares something other than an "
+                f"outcome name with a constant. `condition:` cannot express "
+                f"that, and dropping it would delete the test.",
+                "render",
+            )
+        if test.op not in _OUTCOME_OPERATORS:
+            raise Refusal(
+                "YARAL_RENDER_OUTCOME_TEST",
+                f"`{render_expr(test)}` uses `{test.op}`, which is not one of "
+                f"the comparisons `condition:` allows on an outcome.",
+                "render",
+            )
+        parts.append(
+            f"${test.left.full} {test.op} {_render_value(test.right.value)}"
+        )
+    return " and ".join(parts)
 
 
 def _render_field(ref: FieldRef, event: str) -> str:
@@ -1527,7 +1739,15 @@ def _render_operand(expr: Expr, event: str) -> str:
 
 #: Characters RE2 reads as syntax, so a literal containing one has to be
 #: escaped before it can be written as a pattern.
-_REGEX_META: Final = frozenset("\\^$.*+?()[]{}|")
+#:
+#: `/` is here because a YARA-L pattern is written BETWEEN SLASHES: an
+#: unescaped `/` closes the literal early, and a leading one -- `/all` from
+#: `CommandLine|contains: '/all'` -- produced `//all/`, which YARA-L reads as
+#: a COMMENT. The rule then lost its predicate entirely and matched every
+#: event. That broke seven Sigma rules in the cross-dialect corpus
+#: (bitsadmin-download, mshta-remote, net-user-add, net-group-admin,
+#: nltest-recon, linux-sudo-shadow, linux-reverse-shell).
+_REGEX_META: Final = frozenset("\\^$.*+?()[]{}|/")
 
 
 def _escape_regex(value: Any) -> str:
@@ -1535,6 +1755,7 @@ def _escape_regex(value: Any) -> str:
     return "".join(
         "\\" + char if char in _REGEX_META else char for char in str(value)
     )
+
 
 
 def _render_comparison(expr: Comparison, event: str) -> str:
@@ -1580,8 +1801,16 @@ def _render_comparison(expr: Comparison, event: str) -> str:
                     "render",
                 )
             body = _escape_regex(expr.right.value)
-            anchor = {"contains": "", "startswith": "^", "endswith": "$"}[expr.op]
-            text = f"{left} = /{anchor}{body}/ nocase"
+            # PREFIX and SUFFIX, not one anchor. `endswith` was written with
+            # the `$` at the FRONT (`/$whoami\.exe/`), which is an end-of-input
+            # assertion followed by text -- a pattern that cannot match
+            # anything at all. The rule compiled, rendered and never fired.
+            prefix, suffix = {
+                "contains": ("", ""),
+                "startswith": ("^", ""),
+                "endswith": ("", "$"),
+            }[expr.op]
+            text = f"{left} = /{prefix}{body}{suffix}/ nocase"
             return f"not {text}" if expr.negate else text
         spelled = {
             "contains": "strings.contains",
@@ -1590,6 +1819,24 @@ def _render_comparison(expr: Comparison, event: str) -> str:
         }[expr.op]
         text = f"{spelled}({left}, {_render_operand(expr.right, event)})"
         return f"not {text}" if expr.negate else text
+
+    if expr.nocase and expr.op in ("==", "!="):
+        # YARA-L's `nocase` modifier is the documented way to fold an
+        # equality, and the parser reads it back as `Comparison.nocase`. Left
+        # as a bare `=` the export was case-SENSITIVE, so `Image = "/bin/sh"`
+        # missed `/BIN/SH` in SecOps while matching it locally.
+        if not isinstance(expr.right, Literal) \
+                or not isinstance(expr.right.value, str):
+            raise Refusal(
+                "YARAL_RENDER_NOCASE_NOT_LITERAL",
+                f"`{expr.op}` ignoring case needs a constant to fold, and "
+                f"`{render_expr(expr.right)}` is not one.",
+                "render",
+            )
+        spelled = "=" if expr.op == "==" else "!="
+        text = (f"{left} {spelled} {_render_operand(expr.right, event)} "
+                f"nocase")
+        return f"not ({text})" if expr.negate else text
 
     spelled = _RENDER_OPS.get(expr.op)
     if spelled is None:
@@ -1705,12 +1952,19 @@ def render_chronicle(rule: Rule) -> str:
     condition_lines: list[str] = []
     correlation: Correlation | None = None
     aggregate: Aggregate | None = None
+    outcome_tests: list[str] = []
 
     for node in rule.pipeline:
         if isinstance(node, Read):
             continue
         if isinstance(node, Filter):
-            _render_expression(node.condition, event, condition_lines)
+            if aggregate is None:
+                _render_expression(node.condition, event, condition_lines)
+            else:
+                # It runs AFTER the aggregate, so it tests an outcome rather
+                # than an event. Writing it into `events:` would apply it per
+                # event, which is the opposite of what it says.
+                outcome_tests.append(_render_outcome_test(node.condition))
             continue
         if isinstance(node, Correlation):
             correlation = node
@@ -1736,7 +1990,18 @@ def render_chronicle(rule: Rule) -> str:
             "render",
         )
 
-    if not condition_lines:
+    # `events:` is filled either by the event predicates or, when a rule is
+    # purely an AGGREGATE, by the `match:` key bindings inserted further down.
+    # Refusing on an empty `condition_lines` alone rejected a valid
+    # `stats dc(user) by src` rule, whose only test runs after the aggregate.
+    #
+    # Deliberately NOT relaxed for a bare Correlation: `Read -> Correlation ->
+    # Emit` has no event test to write, so rendering it produced YARA-L with an
+    # `events:` section holding nothing but a binding -- text this parser then
+    # refused, which turned an honest "I cannot write this" into a broken
+    # round trip.
+    aggregate_keys = aggregate.keys if aggregate is not None else ()
+    if not condition_lines and not aggregate_keys:
         raise Refusal(
             "YARAL_RENDER_NO_EVENTS",
             "this rule has no filter stage, so its `events:` section would be "
@@ -1744,6 +2009,7 @@ def render_chronicle(rule: Rule) -> str:
             "in the stream.",
             "render",
         )
+
 
     name = _rule_name(
         meta.get("chronicle.rule_name") or rule.rule_id or "rule"
@@ -1817,9 +2083,12 @@ def render_chronicle(rule: Rule) -> str:
         # `frequency` is a minimum and YARA-L's `>` is strict, so the number
         # comes back one lower. Writing `frequency` straight out would make
         # the rendered rule fire one event LATER than the one it came from.
-        out.append(f"    ${event} and #{event} > {correlation.frequency - 1}")
+        head = f"${event} and #{event} > {correlation.frequency - 1}"
     else:
-        out.append(f"    ${event}")
+        head = f"${event}"
+    for test in outcome_tests:
+        head += f" and {test}"
+    out.append(f"    {head}")
     out.append("}")
     return "\n".join(out)
 

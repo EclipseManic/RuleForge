@@ -254,6 +254,21 @@ export function renderCondition(host, expr, replace, options) {
           renderCondition(host, expr, replace, options);
         },
       }),
+      /* The case-fold TOGGLE. `Comparison.nocase` is a real IR field and the
+         evaluator honours it, but there was no way to see or set it here -- so
+         a case-insensitive test could only be written by hand in the rule text,
+         and a rule that had one looked identical to one that did not. */
+      isRegex ? null : btn(expr.nocase && expr.nocase.v ? 'aa' : 'Aa', {
+        size: 'sm', kind: 'quiet',
+        title: 'ignore upper/lower case',
+        active: !!(expr.nocase && expr.nocase.v),
+        onClick: () => {
+          expr.nocase = T.bool(!(expr.nocase && expr.nocase.v));
+          touch();
+          renderCondition(host, expr, replace, options);
+        },
+      }),
+
       btn('and', {
         size: 'sm', kind: 'quiet', title: 'group this with another condition',
         onClick: () => { replace(boolOp('and', [expr, newComparison()])); },

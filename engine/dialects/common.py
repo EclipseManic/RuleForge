@@ -53,6 +53,8 @@ __all__ = [
     "parse_annotation_header",
     "qualified_name",
     "TOKEN_RE",
+    "cross_row_predicate",
+    "refuse_cross_row_predicate",
 ]
 
 
@@ -545,6 +547,109 @@ def qualified_name(tokens: Sequence[Token]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Cross-row join predicates
+# ---------------------------------------------------------------------------
+
+
+def _scopes_in(value: Any, depth: int = 0) -> set[str]:
+    """Every `FieldRef.scope` an expression tree mentions."""
+    if depth > 64:
+        return set()
+    if isinstance(value, FieldRef):
+        return {value.scope}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        found: set[str] = set()
+        for item in value:
+            found |= _scopes_in(item, depth + 1)
+        return found
+    if hasattr(value, "__dataclass_fields__"):
+        found = set()
+        for name in value.__dataclass_fields__:
+            found |= _scopes_in(getattr(value, name, None), depth + 1)
+        return found
+    return set()
+
+
+def _contains_span(value: Any, depth: int = 0) -> bool:
+    """Whether an expression tree holds a `Span` (a temporal range test)."""
+    if depth > 64:
+        return False
+    if isinstance(value, Span):
+        return True
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_contains_span(item, depth + 1) for item in value)
+    if hasattr(value, "__dataclass_fields__"):
+        return any(
+            _contains_span(getattr(value, name, None), depth + 1)
+            for name in value.__dataclass_fields__
+        )
+    return False
+
+
+def _field_refs(value: Any, depth: int = 0) -> list[FieldRef]:
+    """Every `FieldRef` an expression tree mentions."""
+    if depth > 64:
+        return []
+    if isinstance(value, FieldRef):
+        return [value]
+    if isinstance(value, (list, tuple, set, frozenset)):
+        found: list[FieldRef] = []
+        for item in value:
+            found.extend(_field_refs(item, depth + 1))
+        return found
+    if hasattr(value, "__dataclass_fields__"):
+        found = []
+        for name in value.__dataclass_fields__:
+            found.extend(_field_refs(getattr(value, name, None), depth + 1))
+        return found
+    return []
+
+
+def cross_row_predicate(node: Any) -> bool:
+    """Whether a join's predicate names the SAME field on both sides.
+
+    That is the shape a dialect cannot write back. KQL resolves a post-join
+    name by COLUMN, so when the left and right side are spelled the same --
+    which is exactly what a temporal window between two events of one schema
+    looks like -- both occurrences collapse onto one scope. The predicate then
+    reads only one side, `validate` refuses it as not-cross-row, and the
+    correlation is no longer bounded by anything.
+
+    Distinct names on the two sides (`$left.Account == $right.UserPrincipalName`,
+    or a window between `login.t` and `lsass.t`) survive every dialect's round
+    trip and are asserted by the existing tests, so they are deliberately NOT
+    covered here.
+    """
+    if getattr(node, "predicate", None) is None:
+        return False
+    by_name: dict[str, set[str]] = {}
+    for ref in _field_refs(node.predicate):
+        by_name.setdefault(ref.full, set()).add(ref.scope)
+    return any(
+        "left" in scopes and "right" in scopes for scopes in by_name.values()
+    )
+
+
+def refuse_cross_row_predicate(node: Any, dialect_label: str, code: str) -> None:
+    """Refuse, by name, a join predicate whose two sides cannot be told apart."""
+    if not cross_row_predicate(node):
+        return
+    raise Refusal(
+        code,
+        f"`{node.id}` joins two streams on a condition that names the SAME "
+        f"field on both sides -- a temporal window between two events of one "
+        f"schema, usually. {dialect_label} flattens a join into one row and "
+        f"resolves a name by column, so once the rows are merged the two sides "
+        f"become the same column and the condition ends up comparing the row "
+        f"with itself. The join keys are kept; add the temporal clause by hand "
+        f"in {dialect_label}.",
+        "render",
+    )
+
+
+
+
+# ---------------------------------------------------------------------------
 # Dialect specification
 # ---------------------------------------------------------------------------
 
@@ -936,6 +1041,18 @@ class Parser:
             # `| where T > ago(30m)` into a comparison against a column called
             # `ago` -- a rule that silently matches nothing, and does so without
             # a single warning.
+            if self.current.is_op("(") and lowered in ("true", "false"):
+                # SPL spells the fallback branch of `case()` / `if()` as
+                # `true()` -- a zero-argument function that MEANS the literal.
+                # Reading it as a bare boolean left the `(` unconsumed, so the
+                # whole `case(...)` was refused as a parse error: `eval sev =
+                # case(EventID == 4625, "high", true(), "none")` is one of the
+                # most common shapes in real Splunk tuning and none of it could
+                # be imported.
+                self.advance()
+                if not self.accept(")"):
+                    raise self.unexpected("`)` to close `%s(`" % lowered)
+                return Literal(lowered == "true")
             if self.current.is_op("(") and (
                 lowered not in self.spec.keywords or lowered in self.spec.functions
             ):

@@ -89,6 +89,7 @@ from .common import (
     split_top_level,
     strip_comments,
     tokenize,
+    refuse_cross_row_predicate,
 )
 
 __all__ = [
@@ -1797,6 +1798,20 @@ def _render_expression(expr: Expr) -> str:
                 f"renders as a different operator is a different rule.",
                 "render",
             )
+        if expr.nocase and expr.op in ("==", "!="):
+            # SPL's `==` is exact-case. `lower(a) == lower(b)` is the idiom
+            # Splunk's own documentation uses for an ignore-case equality --
+            # the same shape `_like_subject` already emits for `LIKE`. Left as
+            # a bare `==` the fold was dropped, so a rule that matched `ADMIN`
+            # locally missed it in Splunk.
+            spelling = "==" if expr.op == "==" else "!="
+            left = _render_expression(expr.left)
+            right = _render_expression(expr.right)
+            if isinstance(expr.right, Literal) \
+                    and isinstance(expr.right.value, str):
+                right = f"lower({right})"
+            body = f"lower({left}) {spelling} {right}"
+            return f"NOT ({body})" if expr.negate else body
         body = (
             f"{_render_expression(expr.left)} {spelling} "
             f"{_render_expression(expr.right)}"
@@ -1912,6 +1927,11 @@ def _render_stage(node: Node, rule: Rule) -> list[str]:
             head.append(f"| eval {node.into}={node.field.full}")
         return head
     if isinstance(node, Join):
+        # A predicate is DROPPED by the SPL join below: SPL's `join` takes
+        # equality keys and an inline subsearch, and has no place for a
+        # condition comparing the two sides. Emitting only the keys turned a
+        # bounded correlation into an unbounded one, so say so instead.
+        refuse_cross_row_predicate(node, "SPL", "SPL_RENDER_JOIN_PREDICATE")
         binding = next(
             (b for b in rule.bindings if b.name == node.right), None
         )

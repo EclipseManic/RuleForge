@@ -83,6 +83,7 @@ from .common import (
     split_top_level,
     strip_comments,
     tokenize,
+    refuse_cross_row_predicate,
 )
 
 __all__ = ["DIALECT", "LANGUAGE", "SPEC", "Diagnostic", "lower_kql", "render_kql",
@@ -358,13 +359,34 @@ def lower_kql(text: str, rule_id: str = "rule") -> tuple[Rule, list[Diagnostic]]
 
     bindings: list[Binding] = []
     columns: dict[str, set[str]] = {}
+    constants: dict[str, tuple[Any, ...]] = {}
     for let in parsed.lets:
+        # A `let` whose right-hand side is a LIST OF CONSTANTS is an allowlist,
+        # not a pipeline. Resolving it here is what makes `Account in (Admins)`
+        # a membership test against two strings instead of against a column
+        # that no event has.
+        values = _constant_list(let.source)
+        if values is not None:
+            constants[let.name] = values
+            diagnostics.append(Diagnostic(
+                code="KQL_LET_LIST_RESOLVED",
+                message=(
+                    f"`let {let.name}` is a list of {len(values)} constant(s), "
+                    f"so it has been substituted wherever it is used. The "
+                    f"exported query spells the values out; a Sentinel "
+                    f"`dynamic([...])` literal is not carried across as a name."
+                ),
+                severity="note",
+                verified=True,
+            ))
+            continue
         nodes = _lower_stream(
             let.source, let.stages, f"let_{let.name}", diagnostics,
             bindings=bindings,
         )
         bindings.append(Binding(name=let.name, pipeline=tuple(nodes)))
         columns[let.name] = _declared_columns(nodes)
+
 
     main = _lower_stream(
         parsed.source, parsed.stages, "main", diagnostics, columns=columns,
@@ -377,6 +399,17 @@ def lower_kql(text: str, rule_id: str = "rule") -> tuple[Rule, list[Diagnostic]]
     if not any(isinstance(n, Emit) for n in main):
         main = list(main) + [Emit(id=f"{prefix_of(main)}_out")]
 
+    if constants:
+        # Applied to the finished stages rather than threaded through the
+        # parser, so a `let` name reaches every condition that uses it --
+        # including the ones inside a `summarize` or a join predicate.
+        main = [
+            Filter(id=node.id,
+                   condition=_resolve_constants(node.condition, constants))
+            if isinstance(node, Filter) else node
+            for node in main
+        ]
+
     rule = Rule(
         rule_id=rule_id,
         pipeline=tuple(main),
@@ -386,6 +419,93 @@ def lower_kql(text: str, rule_id: str = "rule") -> tuple[Rule, list[Diagnostic]]
     )
     validate(rule)
     return rule, diagnostics
+
+
+def _constant_list(source: str) -> tuple[Any, ...] | None:
+    """The literal values of `dynamic([...])` or `datatable(...)[...]`.
+
+    These are how a Sentinel author writes an allowlist, and the NAME was
+    lowered as if it were a column: `Account in (Admins)` became a membership
+    test against a field called `Admins`, which no event has, so every row came
+    back undecided. Nothing was refused and nothing was reported -- the rule
+    simply stopped deciding anything.
+
+    Returns None for anything that is not a flat list of constants, so a `let`
+    that really is a pipeline is left alone.
+    """
+    text = source.strip()
+    inner: str | None = None
+    lowered = text.lower()
+    if lowered.startswith("dynamic(") and text.endswith(")"):
+        inner = text[len("dynamic("):-1].strip()
+    elif lowered.startswith("datatable("):
+        close = text.find(")")
+        if close != -1:
+            rest = text[close + 1:].strip()
+            if rest:
+                inner = rest
+    if inner is None or not (inner.startswith("[") and inner.endswith("]")):
+        return None
+    values: list[Any] = []
+    for token in _tokenise_kql(inner[1:-1]):
+        if token.kind == "eof":
+            continue
+        if token.kind == "punct" and token.text == ",":
+            continue
+        if token.kind == "string":
+            values.append(Literal(token.text))
+        elif token.kind == "number":
+            try:
+                values.append(Literal(Decimal(token.text)))
+            except Exception:  # noqa: BLE001 - a number this cannot read
+                return None
+        else:
+            return None
+    return tuple(values) if values else None
+
+
+def _resolve_constants(expr: Any, constants: dict[str, tuple[Any, ...]]) -> Any:
+    """Replace a `let` name used as a list with the list it names.
+
+    Only a name standing ALONE in a list is replaced. `in (Admins, "x")` is
+    left as it is, because expanding one member of a mixed list would silently
+    change which of the other members the author meant.
+    """
+    if not constants or expr is None:
+        return expr
+    if isinstance(expr, ListExpr):
+        items = tuple(_resolve_constants(item, constants) for item in expr.items)
+        if len(items) == 1 and isinstance(items[0], FieldRef):
+            named = constants.get(items[0].full)
+            if named is not None:
+                return ListExpr(named)
+        return ListExpr(items) if items != expr.items else expr
+    if isinstance(expr, Comparison):
+        left = _resolve_constants(expr.left, constants)
+        right = _resolve_constants(expr.right, constants)
+        if left is expr.left and right is expr.right:
+            return expr
+        return Comparison(expr.op, left, right, negate=expr.negate,
+                          nocase=expr.nocase)
+    if isinstance(expr, BoolOp):
+        operands = tuple(_resolve_constants(o, constants) for o in expr.operands)
+        return expr if operands == expr.operands else BoolOp(expr.op, operands)
+    if isinstance(expr, Not):
+        inner = _resolve_constants(expr.operand, constants)
+        return expr if inner is expr.operand else Not(inner)
+    if isinstance(expr, Call):
+        args = tuple(_resolve_constants(a, constants) for a in expr.args)
+        return expr if args == expr.args else Call(
+            expr.function, args, flags=expr.flags)
+    if isinstance(expr, Span):
+        return expr
+    if isinstance(expr, Arith):
+        left = _resolve_constants(expr.left, constants)
+        right = _resolve_constants(expr.right, constants)
+        if left is expr.left and right is expr.right:
+            return expr
+        return Arith(expr.op, left, right)
+    return expr
 
 
 def _declared_columns(nodes: list[Any]) -> set[str]:
@@ -1012,16 +1132,29 @@ def _lower_join(
         part = part.strip()
         if not part:
             continue
-        left, _, right_name = part.partition("=")
+        # `on $left.A == $right.B` is how KQL writes a join whose key names
+        # DIFFER, and `partition("=")` split it at the first `=` of `==`: the
+        # left key became `$left.A ` and the right became `= $right.B`, which
+        # re-rendered as `on $left.$left == $right.= $right`. Splitting on
+        # `==` and stripping the scope prefixes is what the syntax means.
+        spelling = "==" if "==" in part else "="
+        left, _, right_name = part.partition(spelling)
+        left = left.strip()
+        right_name = right_name.strip()
+        for scope_prefix in ("$left.", "$right."):
+            if left.startswith(scope_prefix):
+                left = left[len(scope_prefix):]
+            if right_name.startswith(scope_prefix):
+                right_name = right_name[len(scope_prefix):]
         if not right_name:
             # A bare key joins the column to ITSELF on the other side.
-            ref = FieldRef.parse(part)
+            ref = FieldRef.parse(left)
             on.append((ref, FieldRef(ref.name, ref.path, scope="right")))
             continue
         on.append(
             (
-                FieldRef.parse(left.strip()),
-                FieldRef.parse(right_name.strip(), scope="right"),
+                FieldRef.parse(left),
+                FieldRef.parse(right_name, scope="right"),
             )
         )
 
@@ -1123,7 +1256,24 @@ def _condition(
         _tokenise_kql(text), SPEC, default_scope=default_scope,
         field_scopes=field_scopes,
     )
-    return parser.parse_expression(0)
+    parsed = parser.parse_expression(0)
+    # EVERY token has to be consumed. A parser that stops early and returns
+    # what it had read silently WIDENS the rule: `parse_json(InitiatedBy).user.
+    # userPrincipalName == "admin@corp.com"` came back as the bare call
+    # `parse_json(InitiatedBy)` -- the member path AND the comparison dropped --
+    # so a filter that should have narrowed to one user matched (or, here,
+    # could not be decided for) every row. Refusing names the token it could
+    # not read.
+    leftover = [t for t in parser.tokens[parser.index:] if t.kind != "eof"]
+    if leftover:
+        raise Refusal(
+            "KQL_TRAILING_SYNTAX",
+            f"`{node_id}` could not be read in full: the condition stops making "
+            f"sense at `{leftover[0].text}`. Reading only the part before it "
+            f"would silently widen the rule, so it is refused instead.",
+            "lower",
+        )
+    return parsed
 
 
 #: KQL's case-insensitive substring operators, and how each anchors.
@@ -1922,6 +2072,12 @@ def _render_comparison(expr: Comparison) -> str:
             "contains_cs": "contains",
             "startswith_cs": "startswith",
             "endswith_cs": "endswith",
+            # `==`/`!=` fold to KQL's `=~`/`!~`, which ARE case-insensitive
+            # equality. Left as `==` the export was case-SENSITIVE, so a rule
+            # that matched `ADMIN` locally stopped matching it in Sentinel --
+            # the evaluator had learned to fold and the renderer had not.
+            "==": "=~",
+            "!=": "!~",
         }.get(spelled, spelled)
     right = _render_expression(expr.right)
     if expr.negate:
@@ -2013,6 +2169,10 @@ def _render_stream(nodes: tuple[Any, ...], indent: str) -> str:
         # `on` clause holds equality keys and nothing else. Folded into `on`
         # it was silently dropped on re-import -- see `_render_join`.
         if isinstance(node, Join) and node.predicate is not None:
+            # A TEMPORAL window cannot be written here: KQL resolves a
+            # post-join name by COLUMN, so two sides spelled the same collapse
+            # onto one scope and the predicate stops reading both sides.
+            refuse_cross_row_predicate(node, "KQL", "KQL_RENDER_JOIN_PREDICATE")
             parts.append("| where " + _render_expression(node.predicate))
     body = "\n".join(parts)
     if indent:

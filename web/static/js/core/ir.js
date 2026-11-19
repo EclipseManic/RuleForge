@@ -92,6 +92,11 @@ export function fieldRefText(ref) {
 export function comparison(op, left, right) {
   return {
     '@': 'Comparison', op: T.str(op), left, right, negate: T.bool(false),
+    /* `nocase` is a real field on the IR and the evaluator honours it. Leaving
+       it out of the wire object meant the workbench sent a Comparison the
+       decoder had to fill in, and a case-insensitive test written here came
+       back case-sensitive -- the flag was silently reset on every save. */
+    nocase: T.bool(false),
   };
 }
 

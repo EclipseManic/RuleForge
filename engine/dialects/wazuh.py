@@ -886,20 +886,33 @@ def _render_comparison(expr: Comparison, lines: list[str], *, negate: bool) -> N
     # as one narrows the rule without saying so. `<field type="pcre2">` is the
     # only matcher that can carry `(?i)`, and it is used exactly when a fold is
     # needed, so an exact-case rule keeps the plain element.
+    # PREFIX and SUFFIX, not one anchor.
+    #
+    # `endswith` was written with the `$` at the FRONT -- `(?i)$\whoami.exe` --
+    # which asserts end-of-input and then requires the text after it, so the
+    # element could never match anything. The rule deployed and never fired.
     anchors = {
-        "contains": "", "contains_cs": "",
-        "startswith": "^", "startswith_cs": "^",
-        "endswith": "$", "endswith_cs": "$",
+        "contains": ("", ""), "contains_cs": ("", ""),
+        "startswith": ("^", ""), "startswith_cs": ("^", ""),
+        "endswith": ("", "$"), "endswith_cs": ("", "$"),
     }
     if expr.op in anchors:
-        anchor = anchors[expr.op]
+        prefix, suffix = anchors[expr.op]
+        # A PCRE2 element holds a PATTERN, so the literal has to be
+        # regex-escaped as well as XML-escaped: `\whoami.exe` unescaped reads
+        # as `\w` (any word character), then "hoami", then any character, and
+        # the element matched far more than the rule said.
+        pattern_value = _escape(re.escape(str(expr.right.value)))
         if name == "full_log":
             if expr.nocase:
                 lines.append(
-                    f"  <pcre2{attribute}>{_FOLD_FLAG}{anchor}{value}</pcre2>"
+                    f"  <pcre2{attribute}>{_FOLD_FLAG}"
+                    f"{prefix}{pattern_value}{suffix}</pcre2>"
                 )
             else:
-                lines.append(f"  <match{attribute}>{anchor}{value}</match>")
+                lines.append(
+                    f"  <match{attribute}>{prefix}{value}{suffix}</match>"
+                )
             return
         element = _BY_FIELD.get(name)
         if element:
@@ -910,15 +923,18 @@ def _render_comparison(expr: Comparison, lines: list[str], *, negate: bool) -> N
                     f"case. Rendering this would make the rule exact-case.",
                     "render",
                 )
-            lines.append(f"  <{element}{attribute}>{anchor}{value}</{element}>")
+            lines.append(
+                f"  <{element}{attribute}>{prefix}{value}{suffix}</{element}>"
+            )
         elif expr.nocase:
             lines.append(
                 f'  <field name="{_escape(name)}" type="pcre2"{attribute}>'
-                f"{_FOLD_FLAG}{anchor}{value}</field>"
+                f"{_FOLD_FLAG}{prefix}{pattern_value}{suffix}</field>"
             )
         else:
             lines.append(
-                f'  <field name="{_escape(name)}"{attribute}>{anchor}{value}</field>'
+                f'  <field name="{_escape(name)}"{attribute}>'
+                f"{prefix}{value}{suffix}</field>"
             )
         return
 

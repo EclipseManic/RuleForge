@@ -1261,11 +1261,42 @@ def _eval_boolop(expr: BoolOp, scope: Scope, context: "Context") -> Any:
     return combined
 
 
+def _fold(value: Any) -> Any:
+    """Case-fold a value for a case-insensitive comparison.
+
+    Strings fold; a list folds element-wise so `User in ("admin", "ROOT")` and
+    `has_any ("cmd.exe")` fold the way the scalar forms do. Anything else is
+    returned untouched -- there is no meaningful fold for a number or a null,
+    and inventing one would be a guess.
+    """
+    if isinstance(value, str):
+        return value.casefold()
+    if isinstance(value, (Seq, list)):
+        return [_fold(item) for item in value]
+    return value
+
+
 def _eval_comparison(expr: Comparison, scope: Scope, context: "Context") -> Any:
     left = eval_expr(expr.left, scope, context)
     right = eval_expr(expr.right, scope, context)
     if left is UNDECIDED or right is UNDECIDED:
         return UNDECIDED
+
+    # `Comparison.nocase` is DATA on the node, and nothing here ever read it.
+    # Sigma lowers every string test not marked `|cased` with nocase=True, and
+    # KQL's `=~` / `in~` lower the same way, so EVERY case-insensitive test in
+    # the IR evaluated case-SENSITIVELY: a standard `Image|endswith:
+    # '\certutil.exe'` did not match `CERTUTIL.EXE`, and the rule reported a
+    # clean no_match on the exact attack it was written for. Folding here, at
+    # the one place every comparison passes through, is what makes the local
+    # answer agree with the vendor engine the rule was written for.
+    if expr.nocase:
+        if isinstance(right, Regex):
+            if not right.nocase:
+                right = Regex(right.pattern, right.dialect, True)
+        else:
+            left = _fold(left)
+            right = _fold(right)
 
     # A pattern operator with a Regex on either side. Handled BEFORE the ABSENT
     # guard, because a Regex is a node rather than a value and asking whether it

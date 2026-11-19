@@ -212,9 +212,13 @@ def _verify(_argv: list[str]) -> int:
         [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-t", "."],
         "test suite",
     )
+    # `--cross` is not optional here. Without it the sweep only round-trips
+    # each rule through its OWN dialect, so a renderer that emits text a
+    # DIFFERENT dialect cannot read back is never exercised -- which is how 7
+    # Sigma -> Chronicle regressions sat in a green `verify` for a release.
     status = max(status, _run(
-        [sys.executable, str(ROOT / "corpus" / "run_corpus.py")],
-        "corpus sweep",
+        [sys.executable, str(ROOT / "corpus" / "run_corpus.py"), "--cross"],
+        "corpus sweep (cross-dialect)",
     ))
     print()
     print("  All checks passed." if status == 0

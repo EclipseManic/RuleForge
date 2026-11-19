@@ -141,6 +141,10 @@ export function renderStageBody(host, stage) {
           '@': 'Measure', function: T.str('count'),
           name: T.str('n' + stage.measures.v.length), field: T.nul(),
           distinct: T.bool(false), param: T.nul(),
+          /* `condition` is what makes a measure `count_if`. Omitting it left
+             the decoder to invent a value, and a measure created here could
+             never be turned into a conditional count. */
+          condition: T.nul(),
         });
         touch();
         renderStageBody(host, stage);
@@ -227,10 +231,28 @@ export function renderStageBody(host, stage) {
         pair.v[0] = T.str(value);
       }, { placeholder: 'NewColumn' }));
       row.appendChild(h('span', { class: 'muted', text: '=' }));
+      row.appendChild(h('span', { class: 'muted', text: '=' }));
+      const computed = pair.v[1]['@'] !== 'Literal';
       row.appendChild(textInput(
-        pair.v[1]['@'] === 'Literal' ? literalToText(pair.v[1].value) : describeExpr(pair.v[1]),
-        (value) => { pair.v[1] = literal(literalFromText(value)); },
-        { placeholder: 'value' },
+        computed ? describeExpr(pair.v[1]) : literalToText(pair.v[1].value),
+        (value) => {
+          /* An EXPRESSION is not a string. This used to assign
+             `literal(literalFromText(value))` unconditionally, so opening a
+             rule that computes `BytesOut / BytesIn` and touching the box
+             replaced the whole Arith tree with the literal text "BytesOut /
+             BytesIn" -- the formula became a constant string and the stage
+             silently computed something else. A computed value is shown
+             read-only instead, because a free-text box cannot round-trip an
+             expression tree. */
+          if (computed) {
+            toast('this column is a formula; edit the rule text to change it.',
+              'bad');
+            return;
+          }
+          pair.v[1] = literal(literalFromText(value));
+          touch();
+        },
+        { placeholder: 'value', readOnly: computed },
       ));
       row.appendChild(h('div', { class: 'cond-actions' },
         btn('\u00d7', {

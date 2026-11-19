@@ -1331,9 +1331,14 @@ def _render_comparison(expr: Comparison) -> str:
         # match is the faithful translation, and the value has to be escaped
         # because a literal `%` in the data would otherwise become a wildcard
         # and widen the test.
+        #
+        # AQL spells the case-insensitive form `ILIKE`, and `expr.nocase` is
+        # what says to use it. Emitting plain LIKE lost the fold, so a rule
+        # that matched `ADMIN` locally stopped matching it in QRadar.
         pattern = _like_pattern(expr.right, operator)
-        text = f"{left} LIKE {pattern}"
-        return f"{left} NOT LIKE {pattern}" if expr.negate else text
+        word = "ILIKE" if expr.nocase else "LIKE"
+        text = f"{left} {word} {pattern}"
+        return f"{left} NOT {word} {pattern}" if expr.negate else text
 
     if operator == "matches":
         right = _render_expression(expr.right)
@@ -1349,6 +1354,16 @@ def _render_comparison(expr: Comparison) -> str:
             "render",
         )
     right = _render_expression(expr.right)
+    if expr.nocase and operator in ("==", "!="):
+        # AQL's `=` is exact-case. `UPPER()` on both sides is the portable way
+        # to say "ignore case" for equality: `ILIKE` without wildcards also
+        # works, but reads as a pattern test and some Ariel builds treat `_` in
+        # the value as a wildcard. The operator carries the negation, so a
+        # negated test stays folded rather than becoming `NOT (a = b)`.
+        folded = "=" if operator == "==" else "<>"
+        if expr.negate:
+            folded = "<>" if folded == "=" else "="
+        return f"UPPER({left}) {folded} UPPER({right})"
     if expr.negate:
         # Negation is folded into the operator where one exists, because
         # `NOT (a <> b)` is harder to read than `a = b` and some Ariel versions

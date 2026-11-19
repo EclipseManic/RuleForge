@@ -36,7 +36,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Final
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse, urlsplit
 
 from engine import dialects, synthesize
 from engine.codec import rule_from_dict, rule_to_dict
@@ -935,11 +935,28 @@ class RuleForgeHandler(BaseHTTPRequestHandler):
         host = (self.headers.get("Host") or "").strip().lower()
         if not host:
             return False
+        # The HOST must be this machine. Comparing Origin to Host alone was a
+        # DNS-rebinding hole: an attacker points `evil.com` at 127.0.0.1, the
+        # browser sends `Host: evil.com` with `Origin: http://evil.com`, the
+        # two agree, and the write went straight through to SQLite. The host
+        # is the thing that has to be loopback, not the pair that has to match.
+        hostname = urlsplit("//" + host).hostname or ""
+        if not _is_loopback(hostname):
+            return False
         parsed = urlparse(origin)
         if not parsed.scheme or not parsed.netloc:
             return False
         if parsed.netloc.lower() != host:
             return False
+        # A bodyless request carries no Content-Type, and requiring one made
+        # the browser's own `del(path)` fail with 403 -- the UI could not
+        # delete a history entry or a dataset at all.
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            return True
         content_type = (self.headers.get("Content-Type") or "").lower()
         return content_type.split(";")[0].strip() == "application/json"
 
@@ -1175,6 +1192,21 @@ class RuleForgeHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:  # noqa: N802
         self._dispatch("DELETE")
+
+
+def _is_loopback(hostname: str) -> bool:
+    """True when a Host name resolves to this machine and nowhere else.
+
+    This server is a localhost workbench, so the only Host it should ever
+    accept is a loopback one. Without the check, DNS rebinding defeats the
+    Origin test completely: the attacker's own domain points at 127.0.0.1, so
+    `Origin` and `Host` agree and the comparison passes.
+    """
+    name = hostname.strip().strip("[]").lower()
+    if name in ("localhost", "::1", "0:0:0:0:0:0:0:1"):
+        return True
+    # 127.0.0.0/8 is loopback in its entirety.
+    return name.startswith("127.")
 
 
 def _entry_id(route: str, prefix: str, suffix: str = "") -> int | None:

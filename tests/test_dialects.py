@@ -24,7 +24,12 @@ from engine.dialects.common import Diagnostic
 from engine.ir import Rule
 from engine.values import Refusal
 
-from . import planned_dialect
+try:
+    from . import planned_dialect
+except ImportError:  # pragma: no cover - `unittest discover -s tests`
+    # See the same block in `test_api.py`: `discover -s tests` imports these
+    # modules top-level, so the relative form has no parent package.
+    from tests import planned_dialect
 
 #: `engine/dialects/__init__.py` -> `engine/dialects` -> `engine`.
 ENGINE = pathlib.Path(dialects.__file__).resolve().parent.parent
