@@ -940,6 +940,25 @@ def _render_comparison(expr: Comparison, lines: list[str], *, negate: bool) -> N
 
     if expr.op == "==":
         element = _BY_FIELD.get(name)
+        if expr.nocase:
+            # `<field>`/`<user>`/... are OS-Regex and case-SENSITIVE, so an
+            # ignore-case equality written as one narrows the rule in silence.
+            # An anchored PCRE2 pattern with `(?i)` is the only matcher that
+            # folds, and it is used exactly when a fold is needed -- an
+            # exact-case rule keeps the plain element.
+            if element:
+                raise Refusal(
+                    "WAZUH_RENDER_NOCASE_ELEMENT",
+                    f"`<{element}>` is an OS-Regex element and cannot ignore "
+                    f"case. Rendering this would make the rule exact-case.",
+                    "render",
+                )
+            pattern_value = _escape(re.escape(str(expr.right.value)))
+            lines.append(
+                f'  <field name="{_escape(name)}" type="pcre2"{attribute}>'
+                f"{_FOLD_FLAG}^{pattern_value}$</field>"
+            )
+            return
         if element:
             lines.append(f"  <{element}{attribute}>{value}</{element}>")
         else:

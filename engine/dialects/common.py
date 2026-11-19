@@ -55,7 +55,31 @@ __all__ = [
     "TOKEN_RE",
     "cross_row_predicate",
     "refuse_cross_row_predicate",
+    "escape_for_string_literal",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Escaping a rendered pattern for the string-literal layer
+# ---------------------------------------------------------------------------
+
+
+def escape_for_string_literal(pattern: str) -> str:
+    """Double the backslashes in a LIKE/glob pattern for the STRING layer.
+
+    A LIKE pattern escapes its own metacharacters with a backslash, and the
+    dialect's string literal escapes a backslash AGAIN on the way back in. A
+    renderer that emitted only the glob layer lost it on re-import.
+
+    The value `NT AUTHORITY\\` went out as `"nt authority\\\\%"` -- the glob
+    layer's two backslashes, un-doubled for the literal -- the tokenizer
+    collapsed them to one, and `\\%` then meant an ESCAPED percent sign rather
+    than "a literal backslash, then any run of characters". A `startswith`
+    benign-filter stopped matching its own value, so its NEGATION matched every
+    `NT AUTHORITY\\SYSTEM` event: a false positive on the most common exclusion
+    in Windows detection content, in three dialects at once.
+    """
+    return pattern.replace("\\", "\\\\")
 
 
 # ---------------------------------------------------------------------------

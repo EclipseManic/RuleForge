@@ -86,6 +86,7 @@ from ..ir import (
     Regex,
     Rule,
     Span,
+    Window,
     render_expr,
 )
 from ..validate import validate
@@ -800,13 +801,27 @@ def _predicate(
     reference = _call(left, event_vars)
     if reference is None:
         reference = _field(left, event_vars, seen)
+    # YARA-L spells a case-folded comparison with a trailing ` nocase`
+    # modifier: `$e.User = "Admin" nocase`. The renderer wrote it and the
+    # parser could not read it, so every case-insensitive equality failed to
+    # round-trip. The modifier is part of the COMPARISON, not of the value.
+    nocase = False
+    stripped = right.rstrip()
+    if stripped.lower().endswith(" nocase") and not stripped.startswith("/"):
+        # Only for a VALUE comparison. A `/pattern/ nocase` literal carries its
+        # modifier inside `_value`, and stripping it here dropped the fold from
+        # every regex predicate.
+        nocase = True
+        right = stripped[: -len(" nocase")].rstrip()
     value = _value(right)
 
     if isinstance(value, Regex):
         return Comparison("matches", reference, value, negate=negate)
     if isinstance(value, ListExpr):
-        return Comparison("in", reference, value, negate=negate)
-    return Comparison(operator, reference, value, negate=negate)
+        return Comparison("in", reference, value, negate=negate,
+                          nocase=nocase)
+    return Comparison(operator, reference, value, negate=negate,
+                      nocase=nocase)
 
 
 # ---------------------------------------------------------------------------
@@ -943,6 +958,25 @@ def _lower_condition(
             variable=count.group(1), minimum=minimum, strict=operator == ">"
         )
     return threshold, tuple(outcome_tests)
+
+
+#: The name the windowed aggregation gives its event count. YARA-L spells it
+#: `#e`, which is not a column, so it is carried as a measure whose name no
+#: `outcome:` can collide with and written back as `#e` by the renderer.
+EVENT_COUNT: Final = "__event_count"
+
+
+def _event_count_condition(threshold: _Threshold) -> Expr:
+    """`#e >= N` (or `> N`) as a filter on the aggregated event count.
+
+    A real comparison rather than a shifted `Correlation.frequency`, because
+    after an `Aggregate` the count IS a column and `>` can be written exactly.
+    """
+    return Comparison(
+        ">" if threshold.strict else ">=",
+        FieldRef(name=EVENT_COUNT),
+        Literal(Decimal(threshold.minimum)),
+    )
 
 
 def _outcome_test(
@@ -1511,6 +1545,44 @@ def lower_chronicle(
                 f"noise rather than on a burst.",
                 "lower",
             )
+
+    # `#e >= N` and `outcome:` describe the SAME window, so they have to be
+    # ONE aggregation. They used to be two stages -- a `Correlation` to enforce
+    # the count, then an `Aggregate` to compute the outcome -- and a
+    # `Correlation` COLLAPSES its group to a single summary row. The aggregate
+    # then saw one row, so `count_distinct(principal.ip)` was always 1 and a
+    # rule requiring three distinct IPs could never fire, with no diagnostic.
+    #
+    # A single windowed `Aggregate` produces `count` and the outcome measures
+    # side by side, which is exactly what YARA-L's `condition:` tests.
+    if threshold is not None and measures:
+        # `> N` is strict and a filter is exact, so the number is kept as
+        # written rather than shifted: the comparison below is a real `>`.
+        count_measure = Measure(function="count", name=EVENT_COUNT)
+        nodes.append(Aggregate(
+            id="window",
+            measures=(count_measure, *measures),
+            keys=tuple(keys),
+            window=Window(kind="tumbling", size=window),
+        ))
+        condition = _event_count_condition(threshold)
+        if outcome_tests:
+            condition = BoolOp(
+                "and", (condition, _outcome_condition(outcome_tests))
+            )
+        nodes.append(Filter(id="threshold", condition=condition))
+        diagnostics.append(Diagnostic(
+            code="YARAL_THRESHOLD_AND_OUTCOME_ONE_WINDOW",
+            message=(
+                f"`#{threshold.variable}` and `outcome:` are computed by one "
+                f"windowed aggregation over the same {int(window.seconds)}s, "
+                f"which is what YARA-L means. They used to be two stages, and "
+                f"the count collapsed the group before the outcome could see it."
+            ),
+            severity="note",
+            verified=True,
+        ))
+    elif threshold is not None:
         # `> N` is STRICT and `Correlation.frequency` fires at `>=`. Copying
         # the number across makes the rule fire one event early.
         frequency = threshold.minimum + 1 if threshold.strict \
@@ -1523,7 +1595,9 @@ def lower_chronicle(
             group_by=tuple(keys),
         ))
 
-    if measures:
+    if threshold is not None and measures:
+        pass
+    elif measures:
         nodes.append(Aggregate(
             id="outcome", measures=tuple(measures), keys=tuple(keys)
         ))
@@ -1646,9 +1720,11 @@ def _render_outcome_test(expr: Expr) -> str:
                 f"the comparisons `condition:` allows on an outcome.",
                 "render",
             )
-        parts.append(
-            f"${test.left.full} {test.op} {_render_value(test.right.value)}"
+        # The event count is `#e` in YARA-L, not a `$name` outcome column.
+        name = (
+            "#e" if test.left.name == EVENT_COUNT else f"${test.left.full}"
         )
+        parts.append(f"{name} {test.op} {_render_value(test.right.value)}")
     return " and ".join(parts)
 
 
@@ -2067,16 +2143,28 @@ def render_chronicle(rule: Rule) -> str:
             for key, name in zip(keys, names)
         ]
         out[out.index("  events:") + 1:out.index("  events:") + 1] = bindings
-        window = (
-            f" over {_render_duration(correlation.timeframe)}"
-            if correlation else ""
-        )
+        # The `over <window>` clause comes from whichever stage carries the
+        # time bound: a bare threshold is a Correlation, while a threshold that
+        # also has an `outcome:` is one windowed Aggregate (see `lower_chronicle`).
+        if correlation is not None:
+            span: Any = correlation.timeframe
+        elif aggregate is not None and aggregate.window is not None:
+            span = aggregate.window.size
+        else:
+            span = None
+        window = f" over {_render_duration(span)}" if span is not None else ""
         out.append("  match:")
         out.append(f"    {', '.join('$' + n for n in names)}{window}")
 
-    if aggregate and aggregate.measures:
+    # The event count is YARA-L's `#e`, not an `outcome:` column, so it is not
+    # written into the `outcome:` section -- it goes into `condition:` below.
+    outcome_measures = [
+        m for m in (aggregate.measures if aggregate else ())
+        if m.name != EVENT_COUNT
+    ]
+    if outcome_measures:
         out.append("  outcome:")
-        out.extend(_render_measure(m, event) for m in aggregate.measures)
+        out.extend(_render_measure(m, event) for m in outcome_measures)
 
     out.append("  condition:")
     if correlation:

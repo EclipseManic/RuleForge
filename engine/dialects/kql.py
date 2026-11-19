@@ -203,6 +203,19 @@ SPEC: Final = DialectSpec(
     default_regex_dialect="posix_extended",
 )
 
+#: `!endswith`, `!has`, `!contains` and the rest of KQL's negated string
+#: operators. The shared parser decides whether a word is an infix operator by
+#: looking its BINDING POWER up in the spec, so each negated spelling needs an
+#: entry or the expression stops at the operator. They map to the same engine
+#: operator as their positive form; `_KqlParser.build_comparison` wraps the
+#: result in `Not`, so `!has` and `not (... has ...)` cannot drift apart.
+for _negated in ("has", "has_cs", "hasprefix", "hasprefix_cs", "hassuffix",
+                 "hassuffix_cs", "contains", "contains_cs", "startswith",
+                 "startswith_cs", "endswith", "endswith_cs", "in", "has_any",
+                 "has_all", "between"):
+    SPEC.operators["!" + _negated] = SPEC.operators[_negated]
+del _negated
+
 #: Aggregates KQL spells, mapped to what this engine computes.
 AGGREGATES: Final[dict[str, tuple[str, bool]]] = {
     # name: (engine function, is_distinct)
@@ -1228,6 +1241,42 @@ def _tokenise_kql(text: str) -> list[Token]:
             continue
         out.append(token)
         index += 1
+    return _merge_negated_operators(out)
+
+
+#: KQL's negated string operators, spelled `!endswith` rather than `not (...)`
+#: or `!~`. The lexer splits `!` from the name, so they never reached
+#: `build_comparison` as one operator and `ServiceName !endswith "$"` was
+#: refused with "stops making sense at `!`" -- a shape that appears in most
+#: Kerberoasting and browser-tuning queries in Sentinel content.
+_NEGATABLE: Final[frozenset[str]] = frozenset({
+    "has", "has_cs", "hasprefix", "hasprefix_cs", "hassuffix",
+    "hassuffix_cs", "contains", "contains_cs", "startswith", "startswith_cs",
+    "endswith", "endswith_cs", "has_any", "has_all", "between",
+})
+
+
+def _merge_negated_operators(tokens: list[Token]) -> list[Token]:
+    """Collapse `!` followed by a negatable operator into one `op` token."""
+    out: list[Token] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        following = tokens[index + 1] if index + 1 < len(tokens) else None
+        if (
+            token.kind == "op" and token.text == "!"
+            and following is not None and following.kind == "ident"
+            and following.text.lower() in _NEGATABLE
+        ):
+            # `ident`, not `op`: the shared parser resolves an operator's
+            # binding power by looking a WORD up in the spec, so an `op` token
+            # called `!endswith` had no precedence and the expression stopped
+            # there. As an ident it takes the same path `endswith` does.
+            out.append(Token("ident", "!" + following.text.lower(), token.at))
+            index += 2
+            continue
+        out.append(token)
+        index += 1
     return out
 
 
@@ -1324,8 +1373,44 @@ class _KqlParser(Parser):
     place that distinction survives, so the fold happens here.
     """
 
+    def parse_atom(self) -> Expr:
+        """The shared atom, plus KQL's member access on a call result.
+
+        `parse_json(InitiatedBy).user.userPrincipalName` is how an Entra ID
+        detection reaches into a nested identity object, and the shared parser
+        stopped at the `.`: `found '.' but needed ')'`. The member path is
+        carried as `json_extract(base, "a.b")`, which the IR can hold, which
+        the evaluator implements, and which the renderer writes back in dot
+        form -- so the round trip is exact rather than approximate.
+        """
+        atom = super().parse_atom()
+        if not isinstance(atom, Call):
+            return atom
+        path: list[str] = []
+        while self.current.text == "." and self.current.kind == "punct":
+            self.advance()
+            if self.current.kind not in ("ident", "keyword"):
+                break
+            path.append(self.advance().text)
+        if not path:
+            return atom
+        return Call("member_path", (atom, Literal(".".join(path))))
+
     def build_comparison(self, token: Token, left: Any, right: Any) -> Any:
         word = token.text.lower() if token.kind == "ident" else token.text
+
+        # A negated string operator: `!endswith`, `!has`, `!contains`. KQL
+        # spells negation as a `!` prefix on the operator, and the lexer splits
+        # the two, so these never reached the tables below and were refused.
+        # The positive form is built and then negated, so `!has` and
+        # `not (... has ...)` cannot drift apart.
+        if word.startswith("!") and word not in ("!=", "!~", "!in", "!in~"):
+            positive = self.build_comparison(
+                Token("ident", word[1:], token.at), left, right
+            )
+            return Not(positive)
+
+
 
         # `has_any` / `has_all` are case-INSENSITIVE in KQL, like the rest of
         # the `has` family. They were mapped onto the engine's
@@ -2116,6 +2201,15 @@ def _glob_to_regex(pattern: str) -> str:
 
 
 def _render_call(call: Call) -> str:
+    # `parse_json(X).user.name` is a MEMBER path, carried as a call so the IR
+    # can hold it. Written back in dot form, which is the spelling an analyst
+    # recognises and the one the parser reads.
+    if call.function == "member_path" and len(call.args) == 2 \
+            and isinstance(call.args[1], Literal) \
+            and isinstance(call.args[1].value, str):
+        return (
+            f"{_render_expression(call.args[0])}.{call.args[1].value}"
+        )
     spelled = _RENDER_FUNCTIONS.get(call.function)
     if spelled is None:
         raise Refusal(

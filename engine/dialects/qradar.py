@@ -108,6 +108,7 @@ from .common import (
     split_top_level,
     strip_comments,
     tokenize,
+    escape_for_string_literal,
 )
 
 __all__ = [
@@ -1395,7 +1396,12 @@ def _like_pattern(right: Expr, operator: str) -> str:
         "startswith": f"{body}%",
         "endswith": f"%{body}",
     }[operator]
-    return "'" + wrapped.replace("'", "''") + "'"
+    # The glob layer's backslashes have to survive the STRING layer too. See
+    # `escape_for_string_literal`: without this a trailing `\` in the value
+    # became an escaped `%`, so `User|startswith: 'NT AUTHORITY\'` stopped
+    # matching and its negation alerted on every SYSTEM event.
+    quoted = escape_for_string_literal(wrapped).replace("'", "''")
+    return "'" + quoted + "'"
 
 
 def _render_call(call: Call) -> str:

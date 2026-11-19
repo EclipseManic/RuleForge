@@ -18,6 +18,7 @@ import unittest
 from decimal import Decimal
 
 from engine import dialects
+from engine.evaluate import _glob_match
 from engine.dialects.crowdstrike import (
     BOOLEAN_OPERATORS,
     DEFAULT_TABLE,
@@ -65,7 +66,14 @@ def condition(text: str):
 
 
 def plain(condition_expr) -> str:
-    return render_expr(condition_expr)
+    """The expression's STRUCTURE, with the case-fold flag left out.
+
+    FQL's `:` is case-insensitive by default, so every equality lowered from it
+    now carries `nocase=True`. These tests are about boolean grouping and
+    operator mapping, not about case, so the flag is stripped here rather than
+    repeated in thirty expected strings.
+    """
+    return render_expr(condition_expr).replace(" nocase", "")
 
 
 class CommaIsOrNotAnd(unittest.TestCase):
@@ -405,7 +413,46 @@ class Rendering(unittest.TestCase):
             annotations=Annotations(title=""),
             metadata={"dialect": DIALECT},
         )
-        self.assertEqual(render_crowdstrike(rule), r"a:*'*a\*b*'")
+        # TWO backslashes, not one. The glob layer needs `\*` to keep the star
+        # literal, and the FQL string literal consumes one layer on the way
+        # back in -- so a single `\*` arrived at the matcher as a bare `*`,
+        # which is a WILDCARD. `a:*'*a\*b*'` matched `axb`; the pattern now
+        # matches `a*b` and not `axb`, which is what `contains "a*b"` says.
+        self.assertEqual(render_crowdstrike(rule), r"a:*'*a\\*b*'")
+        back, _ = dialects.lower("crowdstrike", render_crowdstrike(rule))
+        condition = next(
+            n.condition for n in back.pipeline if type(n).__name__ == "Filter"
+        )
+        self.assertTrue(_glob_match("a*b", condition.right.value, False))
+        self.assertFalse(_glob_match("axb", condition.right.value, False))
+
+    def test_a_value_ending_in_a_backslash_keeps_its_wildcard(self):
+        # The reported false positive: `User|startswith: 'NT AUTHORITY\'`
+        # became `NT AUTHORITY\*`, where `\*` is an ESCAPED star. The filter
+        # matched nothing, so its negation alerted on every SYSTEM event.
+        rule = Rule(
+            rule_id="r",
+            pipeline=(
+                Read(id="s", table=DEFAULT_TABLE),
+                Filter(id="f", condition=Comparison(
+                    "startswith", FieldRef(name="User"),
+                    Literal("NT AUTHORITY\\"), nocase=True,
+                )),
+                Emit(id="o"),
+            ),
+            annotations=Annotations(title=""),
+            metadata={"dialect": DIALECT},
+        )
+        back, _ = dialects.lower("crowdstrike", render_crowdstrike(rule))
+        condition = next(
+            n.condition for n in back.pipeline if type(n).__name__ == "Filter"
+        )
+        self.assertTrue(
+            _glob_match("NT AUTHORITY\\SYSTEM", condition.right.value, True)
+        )
+        self.assertFalse(
+            _glob_match("NT AUTHORITYX", condition.right.value, True)
+        )
 
     def test_a_negated_ordering_is_refused_because_fql_cannot_spell_it(self):
         rule = Rule(

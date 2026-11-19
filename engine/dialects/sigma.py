@@ -746,15 +746,19 @@ def _field_predicate(
             # answer Sigma's `field: null` deserves.
             terms.append(Call("is_null", (field,)))
             continue
-        # Sigma's `|contains`, `|startswith` and `|endswith` are
-        # case-INSENSITIVE by specification, and `|cased` is the modifier that
-        # turns the fold off. Without this, importing a Sigma rule produced an
-        # exact-case comparison, so exporting it again narrowed the detection
-        # -- silently, in six of the eight targets.
+        # EVERY Sigma string comparison folds case unless `|cased` is spelled
+        # out -- plain equality included. Only the substring family carried the
+        # fold, so `OriginalFileName: 'CertUtil.exe'` lowered exact-case and a
+        # standard Certutil LOLBin rule missed `CERTUTIL.EXE` in Sigma and in
+        # every dialect it was exported to.
+        folds = (
+            isinstance(single, str)
+            and "cased" not in modifiers
+            and operator in ("==", "!=", "in", "contains", "startswith",
+                             "endswith")
+        )
         terms.append(Comparison(
-            operator, field, _literal(single),
-            nocase=operator in ("contains", "startswith", "endswith")
-            and "cased" not in modifiers,
+            operator, field, _literal(single), nocase=folds,
         ))
 
     if len(terms) == 1:
@@ -2376,7 +2380,14 @@ def _render_correlation(
     lines.append("    condition:")
     right = threshold.condition.right
     value = right.value if isinstance(right, Literal) else right
+    # A STRICT `>` is written as `gte: N+1`. Sigma's correlation frequency is a
+    # minimum and its own parser accepts only `gte`, so emitting `gt: N` here
+    # produced text the Sigma reader refused -- for integer event counts the two
+    # are identical, so this is exact rather than approximate.
+    if operator == "gt" and isinstance(value, Decimal):
+        operator, value = "gte", value + 1
     lines.append(f"        {operator}: {_quote(value)}")
+    return lines
     return lines
 
 

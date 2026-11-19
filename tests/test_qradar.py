@@ -19,6 +19,7 @@ from __future__ import annotations
 import unittest
 
 from engine import dialects
+from engine.evaluate import _glob_match
 from engine.dialects.qradar import (
     AGGREGATES,
     CLAUSE_EXECUTION_ORDER,
@@ -578,7 +579,16 @@ class Rendering(unittest.TestCase):
             annotations=Annotations(title=""),
             metadata={"dialect": DIALECT},
         )
-        self.assertIn("LIKE '%100\\%%'", render_qradar(rule))
+        # TWO backslashes: one layer for the LIKE escape, one for the AQL
+        # string literal that the tokenizer unescapes on the way back in.
+        self.assertIn("LIKE '%100\\\\%%'", render_qradar(rule))
+        # And prove it is the form that survives a round trip.
+        back, _ = dialects.lower("qradar", render_qradar(rule))
+        condition = next(
+            n.condition for n in back.pipeline if type(n).__name__ == "Filter"
+        )
+        self.assertTrue(_glob_match("100%", condition.right.value, False))
+        self.assertFalse(_glob_match("100x", condition.right.value, False))
 
     def test_an_unrenderable_stage_is_refused_rather_than_dropped(self):
         rule = Rule(

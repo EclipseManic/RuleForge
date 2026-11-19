@@ -457,6 +457,14 @@ LOCAL_FUNCTIONS: Final[frozenset[str]] = frozenset({
     "upper", "length", "abs", "round", "floor", "ceil", "min", "max",
     "matches_regex", "in_set", "has_any", "has_all", "to_string", "to_int",
      "bin", "now", "ago", "strftime", "iff",
+    # KQL/Splunk expressions the evaluator computes locally.
+    #
+    # `case` is Splunk's branch chain and `parse_json` turns the JSON text a
+    # Sentinel column holds into a value. `member_path` is how a dotted member
+    # access (`parse_json(X).user.name`) is carried in the IR -- NOT called
+    # `json_extract`, which is already declared above as an APPLIANCE function
+    # meaning "the vendor's own field extractor", a different thing.
+    "case", "parse_json", "member_path",
     # Absence over a schema that has none.
     #
     # `is_null` asks whether a field is PRESENT and null, which is what Sigma's

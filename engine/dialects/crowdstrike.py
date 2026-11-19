@@ -69,6 +69,7 @@ from ..validate import validate
 from ..values import Refusal
 from .common import (
     Diagnostic,
+    escape_for_string_literal,
     is_bare_identifier,
     plain_number,
     strip_comments,
@@ -313,11 +314,28 @@ def _glob_to_like(pattern: str) -> str:
     is escaped, because it has no special meaning there and would otherwise
     become a wildcard here and widen the test.
 
+    The glob's OWN escape has to be honoured, and it was not: `\\*` (a literal
+    star) was read as a backslash followed by the wildcard `*`, and a literal
+    backslash came out unescaped so it swallowed whatever followed it. Both are
+    silent -- the pattern compiles and matches a different set of rows.
+
     Lowering the glob to a REGEX instead is the mistake this avoids: in a
     regex `.` matches any character, so `*'1.2.3.4'` would match `1x2y3z4`.
     """
     out: list[str] = []
-    for char in pattern:
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "\\" and index + 1 < len(pattern):
+            following = pattern[index + 1]
+            # An ESCAPED character is a LITERAL. `*` and `?` lose their
+            # wildcard meaning, and `%`, `_` and `\\` are metacharacters in
+            # LIKE, so each has to be escaped again for that layer.
+            out.append(
+                "\\" + following if following in "%_\\" else following
+            )
+            index += 2
+            continue
         if char == "*":
             out.append("%")
         elif char == "?":
@@ -326,6 +344,7 @@ def _glob_to_like(pattern: str) -> str:
             out.append("\\" + char)
         else:
             out.append(char)
+        index += 1
     return "".join(out)
 
 
@@ -385,7 +404,14 @@ def _parse_matcher(scanner: _Scanner, field: str) -> Expr:
         test: Expr = Call("is_null", (reference,))
         return Not(test) if negate else test
 
-    return Comparison(operator, reference, Literal(value), negate)
+    # FQL's `:` is case-INSENSITIVE by default, so an equality read from it
+    # has to carry the fold. Without this, `ImageFileName:'cmd.exe'` lowered
+    # exact-case and stopped matching `CMD.EXE` -- and re-importing our own
+    # output narrowed the rule.
+    return Comparison(
+        operator, reference, Literal(value), negate,
+        nocase=operator == "==" and isinstance(value, str),
+    )
 
 
 def _parse_predicate(scanner: _Scanner) -> Expr:
@@ -607,15 +633,16 @@ def _escape_glob_literal(text: str) -> str:
 
 
 def _quote_glob(glob: str) -> str:
-    """Wrap an already-escaped wildcard value in quotes.
+    """Wrap an already-escaped wildcard value in quotes, for the STRING layer.
 
-    Deliberately NOT `_value`. `_value` escapes backslashes, and a glob has
-    already placed its own: running it through both turned the `\\*` that
-    means "a literal star" into `\\\\*`, which means "a literal backslash
-    followed by a wildcard" -- a pattern matching something the rule never
-    described.
+    Deliberately NOT `_value`, which would double the glob's `\\*` into
+    `\\\\*` and change "a literal star" into "a literal backslash then a
+    wildcard". But the backslashes the GLOB layer placed still have to survive
+    the literal: the scanner collapses `\\\\` to `\\`, so a value ending in a
+    backslash lost its escape and turned the following `*` into a literal star
+    -- which is why `User:!*'NT AUTHORITY\\*'` alerted on every SYSTEM event.
     """
-    return "'" + glob + "'"
+    return "'" + escape_for_string_literal(glob) + "'"
 
 
 def _like_to_glob(pattern: str) -> str:

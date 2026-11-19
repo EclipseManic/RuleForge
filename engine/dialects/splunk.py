@@ -90,6 +90,7 @@ from .common import (
     strip_comments,
     tokenize,
     refuse_cross_row_predicate,
+    escape_for_string_literal,
 )
 
 __all__ = [
@@ -1643,7 +1644,13 @@ def _like_body(operator: str, value: str, nocase: bool = False) -> str:
         # the pattern unmatchable, which is how an exclusion silently stops
         # excluding.
         escaped = escaped.lower()
-    return wildcards.format(escaped).replace("*", "%")
+    # The glob layer's backslashes have to survive the STRING layer too. See
+    # `escape_for_string_literal`: without this a trailing `\` in the value
+    # became an escaped `%`, so `User|startswith: 'NT AUTHORITY\'` stopped
+    # matching and its negation alerted on every SYSTEM event.
+    return escape_for_string_literal(
+        wildcards.format(escaped).replace("*", "%")
+    )
 
 
 def _like_subject(expr: Any) -> str:

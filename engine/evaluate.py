@@ -27,6 +27,7 @@ the other is "this tool cannot tell you".
 from __future__ import annotations
 
 import ipaddress
+import json
 import re
 from dataclasses import dataclass, field as dc_field
 from decimal import Decimal, InvalidOperation, DivisionByZero
@@ -2090,7 +2091,113 @@ def _fn_iff(args: list[Any], ctx: "Context", node: Call) -> Any:
     return args[1] if condition is True else args[2]
 
 
+def _fn_case(args: list[Any], ctx: "Context", node: Call) -> Any:
+    """Splunk's `case(c1, v1, c2, v2, ..., default)`.
+
+    The first TRUE condition wins; a trailing odd argument is the fallback.
+    Nothing implemented it, so `eval risk = case(like(CommandLine, "%-enc%"),
+    90, true(), 0)` -- the standard shape of a risk score, and the reason
+    `true()` had to parse at all -- raised FUNCTION_UNKNOWN and the rule came
+    back `not_evaluated` without saying which part could not be computed.
+    """
+    if len(args) < 2:
+        raise Refusal(
+            "FUNCTION_ARITY",
+            f"`{node.function}()` needs at least one condition/value pair.",
+            "eval",
+        )
+    body = list(args)
+    fallback: Any = ABSENT
+    if len(body) % 2:
+        fallback = body.pop()
+    undecided = False
+    for index in range(0, len(body), 2):
+        condition = body[index]
+        if condition is True:
+            return body[index + 1]
+        if condition is UNDECIDED or condition is ABSENT or condition is None:
+            # An earlier branch MIGHT have applied, so answering with the
+            # fallback would be a guess in the rule's favour.
+            undecided = True
+    if undecided:
+        ctx.uncertain(
+            "COMPARISON_UNDECIDABLE",
+            f"`{node.function}` could not pick a branch: a condition before "
+            f"the fallback was undecided, so an earlier branch may have "
+            f"applied.",
+            where=render_where(node),
+        )
+        return UNDECIDED
+    return fallback
+
+
+def _fn_parse_json(args: list[Any], ctx: "Context", node: Call) -> Any:
+    """KQL's `parse_json(x)`: a JSON STRING becomes a structured value.
+
+    Sentinel stores nested identity objects (`InitiatedBy`, `DeviceDetail`) as
+    JSON text inside one column, so `parse_json(InitiatedBy).user.name` is the
+    standard way an Entra ID detection reads a principal. Nothing implemented
+    it, and member access on the result could not parse at all.
+    """
+    if not args:
+        raise Refusal(
+            "FUNCTION_ARITY", f"`{node.function}()` needs a value.", "eval"
+        )
+    value = args[0]
+    if value is ABSENT or value is None:
+        return UNDECIDED
+    if not isinstance(value, str):
+        # Already structured: a sample may carry the object directly.
+        return value
+    try:
+        return json.loads(value)
+    except (ValueError, TypeError):
+        ctx.uncertain(
+            "JSON_UNREADABLE",
+            f"`{node.function}` was given text that is not JSON, so the value "
+            f"it should hold cannot be read.",
+            where=render_where(node),
+        )
+        return UNDECIDED
+
+
+def _fn_json_extract(args: list[Any], ctx: "Context", node: Call) -> Any:
+    """`base.path.to.field`, carried as a call so the IR can hold it.
+
+    The member path is the second argument, dotted. A missing key is ABSENT
+    rather than null: the object does not carry that member, which is the same
+    distinction the rest of the engine keeps between absent and null.
+    """
+    if len(args) != 2:
+        raise Refusal(
+            "FUNCTION_ARITY",
+            f"`{node.function}()` needs a value and a member path.",
+            "eval",
+        )
+    base, path = args
+    if base is ABSENT or base is UNDECIDED:
+        return UNDECIDED
+    if not isinstance(path, str) or not path:
+        return UNDECIDED
+    current = base
+    for part in path.split("."):
+        if isinstance(current, dict):
+            if part not in current:
+                return ABSENT
+            current = current[part]
+        elif isinstance(current, (list, tuple)):
+            if not part.isdigit() or int(part) >= len(current):
+                return ABSENT
+            current = current[int(part)]
+        else:
+            return ABSENT
+    return current
+
+
 _FUNCTIONS = {
+    "case": _fn_case,
+    "parse_json": _fn_parse_json,
+    "member_path": _fn_json_extract,
     "cidr_contains": _fn_cidr_contains,
     "starts_with": _fn_text("starts_with"),
     "ends_with": _fn_text("ends_with"),
