@@ -975,20 +975,26 @@ def _render_comparison(expr: Comparison) -> str:
             "render",
         )
     right = _render_expression(expr.right)
-    right = _render_expression(expr.right)
     if expr.nocase and expr.op in ("==", "!="):
         # `:` is EQL's case-INSENSITIVE wildcard operator, and with no wildcard
         # in the value it is an equality that ignores case. Left as `==` the
         # export was exact-case, so a rule that matched `ADMIN` locally stopped
-        # matching it in Elastic. EQL has no `!:` operator, so a negated test
-        # keeps its `not`.
+        # matching it in Elastic.
+        #
+        # `!=` carries its negation in the OPERATOR, not in `negate`. Reading
+        # only `negate` emitted `user : "admin"` for "everyone except admin":
+        # the query silently INVERTED, exited 0, and reported nothing. That is
+        # the worst class of bug this tool can have, so both sources are
+        # combined and EQL has no `!:` to fall back on.
         if isinstance(expr.right, Literal) \
                 and isinstance(expr.right.value, str):
             body = expr.right.value.replace("\\", "\\\\").replace('"', '\\"')
             text = f'{left} : "{body}"'
         else:
             text = f"{left} : {right}"
-        return f"not {text}" if expr.negate else text
+        negated = expr.negate ^ (expr.op == "!=")
+        negated = expr.negate ^ (expr.op == "!=")
+        return f"not {text}" if negated else text
 
     text = f"{left} {spelled} {_render_expression(expr.right)}"
     return f"not ({text})" if expr.negate else text

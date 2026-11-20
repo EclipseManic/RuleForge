@@ -423,6 +423,27 @@ def _field(
     return FieldRef(name=parts[0], path=tuple(parts[1:]))
 
 
+def _unescape_string(body: str) -> str:
+    """Undo the escaping `_render_value` applies inside a quoted literal.
+
+    Exactly the inverse of the renderer: `\\\\` becomes `\\` and `\\"` becomes
+    `"`. Nothing else is touched, because the renderer escapes nothing else --
+    inventing more here would corrupt a pattern that legitimately carries `\\d`.
+    """
+    out: list[str] = []
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if (char == "\\" and index + 1 < len(body)
+                and body[index + 1] in '\\"'):
+            out.append(body[index + 1])
+            index += 2
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
 def _value(text: str) -> Expr:
     """A literal, a regex, or a list."""
     body = text.strip()
@@ -439,7 +460,12 @@ def _value(text: str) -> Expr:
         nocase = "nocase" in modifiers or modifiers == "i"
         return Regex(pattern, REGEX_DIALECT, nocase)
     if body.startswith('"') and body.endswith('"') and len(body) >= 2:
-        return Literal(body[1:-1])
+        # UNESCAPED. The renderer escapes `\` and `"` inside the literal, so
+        # reading the inner text verbatim kept the escapes: a rule carrying
+        # `C:\Windows\cmd.exe` came back as `C:\\Windows\\cmd.exe`, which
+        # matches no event, and a value containing a quote could never match at
+        # all. Each round trip doubled the backslashes again.
+        return Literal(_unescape_string(body[1:-1]))
     if body.startswith("[") and body.endswith("]"):
         return ListExpr(tuple(
             _value(part) for part in split_top_level(body[1:-1], ",")

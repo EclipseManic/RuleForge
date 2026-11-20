@@ -26,6 +26,7 @@ tells the analyst nothing they can act on.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import mimetypes
 import re
@@ -1201,12 +1202,22 @@ def _is_loopback(hostname: str) -> bool:
     accept is a loopback one. Without the check, DNS rebinding defeats the
     Origin test completely: the attacker's own domain points at 127.0.0.1, so
     `Origin` and `Host` agree and the comparison passes.
+
+    The address is PARSED, not prefix-matched. `name.startswith("127.")` looks
+    equivalent and is not: `127.attacker.com` is a legal DNS name that begins
+    with `127.`, so a page served from it cleared the gate and could read, save
+    and delete the analyst's saved rules. Only a literal address in
+    127.0.0.0/8 -- or ::1 -- is loopback.
     """
     name = hostname.strip().strip("[]").lower()
-    if name in ("localhost", "::1", "0:0:0:0:0:0:0:1"):
+    if name == "localhost":
         return True
-    # 127.0.0.0/8 is loopback in its entirety.
-    return name.startswith("127.")
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        # Not an address at all: a hostname, which is never this machine by
+        # name alone and must not be trusted as one.
+        return False
 
 
 def _entry_id(route: str, prefix: str, suffix: str = "") -> int | None:

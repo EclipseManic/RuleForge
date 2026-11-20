@@ -813,6 +813,23 @@ _BY_FIELD: Final[dict[str, str]] = {
 }
 
 
+def _regex_literal(value: Any) -> str:
+    """A constant as an XML-escaped, regex-escaped Wazuh matcher pattern.
+
+    `re.escape` covers the regex metacharacters, which is what stops `a|b`
+    becoming an alternation and `*`/`?`/`+` becoming quantifiers. It does NOT
+    cover Wazuh's own syntax: a matcher value beginning with `!` is read as a
+    NEGATION by the decoder, so `contains "!important"` inverted into "does not
+    contain important" -- a rule that fires on exactly the events it was written
+    to exclude. `\!` is the same character, spelled so it cannot be taken for
+    the operator, and is valid in both OS-Regex and PCRE2.
+    """
+    pattern = re.escape(str(value))
+    if pattern.startswith("!"):
+        pattern = "\\!" + pattern[1:]
+    return _escape(pattern)
+
+
 def _render_comparison(expr: Comparison, lines: list[str], *, negate: bool) -> None:
     negated = expr.negate ^ negate
     attribute = ' negate="yes"' if negated else ""
@@ -902,7 +919,7 @@ def _render_comparison(expr: Comparison, lines: list[str], *, negate: bool) -> N
         # regex-escaped as well as XML-escaped: `\whoami.exe` unescaped reads
         # as `\w` (any word character), then "hoami", then any character, and
         # the element matched far more than the rule said.
-        pattern_value = _escape(re.escape(str(expr.right.value)))
+        pattern_value = _regex_literal(expr.right.value)
         if name == "full_log":
             if expr.nocase:
                 lines.append(
@@ -924,7 +941,8 @@ def _render_comparison(expr: Comparison, lines: list[str], *, negate: bool) -> N
                     "render",
                 )
             lines.append(
-                f"  <{element}{attribute}>{prefix}{value}{suffix}</{element}>"
+                f"  <{element}{attribute}>"
+                f"{prefix}{pattern_value}{suffix}</{element}>"
             )
         elif expr.nocase:
             lines.append(
@@ -932,9 +950,13 @@ def _render_comparison(expr: Comparison, lines: list[str], *, negate: bool) -> N
                 f"{_FOLD_FLAG}{prefix}{pattern_value}{suffix}</field>"
             )
         else:
+            # REGEX-escaped, not just XML-escaped. `<field>` and every named
+            # element are OS-Regex, so an unescaped `a|b` is an ALTERNATION and
+            # `*`/`?`/`+` are quantifiers: the element matched text the rule
+            # never wrote, and a `contains` on `a|b` matched neither.
             lines.append(
                 f'  <field name="{_escape(name)}"{attribute}>'
-                f"{prefix}{value}{suffix}</field>"
+                f"{prefix}{pattern_value}{suffix}</field>"
             )
         return
 
@@ -953,17 +975,26 @@ def _render_comparison(expr: Comparison, lines: list[str], *, negate: bool) -> N
                     f"case. Rendering this would make the rule exact-case.",
                     "render",
                 )
-            pattern_value = _escape(re.escape(str(expr.right.value)))
+            pattern_value = _regex_literal(expr.right.value)
             lines.append(
                 f'  <field name="{_escape(name)}" type="pcre2"{attribute}>'
                 f"{_FOLD_FLAG}^{pattern_value}$</field>"
             )
             return
+        # ANCHORED and REGEX-escaped. An unanchored `<field>SYSTEM</field>` is
+        # a SUBSTRING test in OS-Regex, so a case-sensitive equality silently
+        # widened; and an unescaped value made `a|b` an alternation and `*` a
+        # quantifier. `==` means the whole field equals this text, which is
+        # `^...$` over the escaped literal.
+        pattern_value = _regex_literal(expr.right.value)
         if element:
-            lines.append(f"  <{element}{attribute}>{value}</{element}>")
+            lines.append(
+                f"  <{element}{attribute}>^{pattern_value}$</{element}>"
+            )
         else:
             lines.append(
-                f'  <field name="{_escape(name)}"{attribute}>{value}</field>'
+                f'  <field name="{_escape(name)}"{attribute}>'
+                f"^{pattern_value}$</field>"
             )
         return
 

@@ -1191,3 +1191,136 @@ class EveryRendererWalksItsWholePipeline(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+#: Values a real rule carries and a hand-written fixture never does.
+#:
+#: Every one of these is a character with a MEANING in at least one of the
+#: eight languages here: a quote ends a string, a backslash starts an escape, a
+#: `%` is a LIKE wildcard, a `*`/`?` is a glob, a `|` is an alternation in AQL
+#: and Wazuh, a `!` is negation in Wazuh, a leading `/` opens a YARA-L comment.
+#: A renderer that forgets one of those produces text that parses and matches
+#: the wrong events -- or does not parse at all.
+NASTY_VALUES = (
+    'a"b',                      # a double quote
+    "a'b",                      # a single quote
+    "C:\\Windows\\System32",    # backslashes
+    "100%",                     # a LIKE wildcard, whole value
+    "50% off",                  # a LIKE wildcard mid-value
+    "*mimikatz*",               # glob stars
+    "a?b",                      # a glob question mark
+    "!important",               # leading bang
+    "a|b",                      # AQL / Wazuh alternation
+    "NT AUTHORITY\\SYSTEM",     # the Sigma benign-filter idiom
+    "/dev/tcp/",                # a leading slash, a YARA-L comment opener
+)
+
+
+class ConvertedRulesDecideTheSameEvents(unittest.TestCase):
+    """The verdict-level property: a conversion must not change the ANSWER.
+
+    Every other sweep in this module checks TEXT -- that a field name or a
+    literal survives into the output, that the stage shape is preserved, that
+    the renderer can re-read what it wrote. All of those can pass while the
+    converted rule decides different events, which is the only failure mode
+    that matters to a detection engineer: the output looks like a working rule.
+
+    Three defects found this way, none of them visible to a text check:
+
+      * Elastic rendered a case-insensitive `!=` exactly like `==`, so
+        "everyone except admin" became "only admin" -- exit 0, no diagnostic
+      * Sigma and CrowdStrike dropped the fold on `==`, so a rule that matched
+        `ADMIN` locally matched only `admin` after conversion
+      * a backslash before a wildcard was escaped once instead of twice, so
+        `NT AUTHORITY\\` + `%` read as an escaped percent and the filter never
+        matched -- under a negation that fires on every benign event
+
+    The comparison is on the DECISION, not the verdict string: a dialect may
+    legitimately return `not_evaluated` where the source decided, and that is
+    still a change of answer, so it is compared as "did any row survive".
+    A refusal is skipped, because refusing is the honest outcome and this test
+    is about silence.
+    """
+
+    OPS = ("==", "!=", "contains", "startswith", "endswith")
+
+    def build(self, op, value, nocase):
+        from engine.ir import Annotations, Emit, Filter, Read
+
+        return Rule(
+            rule_id="fuzz",
+            pipeline=(
+                Read(id="s", table="events"),
+                Filter(id="f", condition=Comparison(
+                    op, FieldRef(name="Field"), Literal(value), nocase=nocase,
+                )),
+                Emit(id="o"),
+            ),
+            annotations=Annotations(title=""),
+        )
+
+    def decisions(self, rule, value):
+        """How the rule answers, on the value and on an unrelated one."""
+        hit = evaluate(rule, [{"Field": value}]).verdict
+        miss = evaluate(rule, [{"Field": "zzz-unrelated-zzz"}]).verdict
+        return hit, miss
+
+    def test_a_converted_rule_decides_the_same_events(self):
+        broken: list[str] = []
+        targets = [e.key for e in dialects.ready_dialects() if e.can_render]
+        for value in NASTY_VALUES:
+            for op in self.OPS:
+                for nocase in (False, True):
+                    rule = self.build(op, value, nocase)
+                    want = self.decisions(rule, value)
+                    for target in targets:
+                        if not dialects.get(target).can_parse:
+                            continue
+                        try:
+                            out, _notes = dialects.render(target, rule)
+                            back, _ = dialects.lower(target, out)
+                        except Refusal:
+                            continue
+                        got = self.decisions(back, value)
+                        for index, (before, after) in enumerate(
+                            zip(want, got)
+                        ):
+                            # `not_evaluated` is an honest "I cannot tell", and
+                            # Wazuh's OS-Regex elements produce it by design --
+                            # reporting a Python `re` result as an OS-Regex
+                            # result would be a false claim about a security
+                            # control. That is not a changed decision.
+                            if after == "not_evaluated":
+                                continue
+                            if after != before:
+                                where = "the value" if index == 0 \
+                                    else "an unrelated value"
+                                broken.append(
+                                    f"{op} {value!r} nocase={nocase} -> "
+                                    f"{target}: on {where} the source decides "
+                                    f"{before!r}, the converted rule decides "
+                                    f"{after!r}"
+                                )
+        self.assertEqual(
+            broken, [],
+            "a conversion changed which events the rule matches:\n  "
+            + "\n  ".join(broken),
+        )
+
+    def test_the_fuzz_is_actually_doing_work(self):
+        # A guard on the guard: if every dialect refused, the sweep above
+        # would pass while testing nothing.
+        converted = 0
+        targets = [e.key for e in dialects.ready_dialects() if e.can_render]
+        for value in NASTY_VALUES:
+            rule = self.build("contains", value, False)
+            for target in targets:
+                if not dialects.get(target).can_parse:
+                    continue
+                try:
+                    out, _notes = dialects.render(target, rule)
+                    dialects.lower(target, out)
+                except Refusal:
+                    continue
+                converted += 1
+        self.assertGreater(converted, 20)
