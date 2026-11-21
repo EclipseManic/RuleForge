@@ -988,11 +988,25 @@ def _render_comparison(expr: Comparison) -> str:
         # combined and EQL has no `!:` to fall back on.
         if isinstance(expr.right, Literal) \
                 and isinstance(expr.right.value, str):
+            if "*" in expr.right.value or "?" in expr.right.value:
+                # `:` reads `*` and `?` as wildcards and EQL has no escape for
+                # them, so a LITERAL one would match far more than the rule
+                # says (`A == "*"` would match every event). `==` would be
+                # exact, but it drops the case fold; there is no spelling that
+                # keeps both, so say so instead of widening.
+                raise Refusal(
+                    "EQL_RENDER_LITERAL_WILDCARD",
+                    f"`{render_expr(expr)}` compares ignoring case against a "
+                    f"value containing `*` or `?`. EQL's case-insensitive "
+                    f"equality (`:`) would read those as wildcards and match "
+                    f"more than the rule states. Use an exact-case comparison, "
+                    f"or a `like~` pattern if wildcards were intended.",
+                    "render",
+                )
             body = expr.right.value.replace("\\", "\\\\").replace('"', '\\"')
             text = f'{left} : "{body}"'
         else:
             text = f"{left} : {right}"
-        negated = expr.negate ^ (expr.op == "!=")
         negated = expr.negate ^ (expr.op == "!=")
         return f"not {text}" if negated else text
 

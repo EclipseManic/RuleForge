@@ -25,6 +25,7 @@ from typing import Any
 from . import dialects, synthesize
 from .codec import rule_to_dict
 from .pipeline import evaluate as run_rule
+from .sandbox import evaluate_with_timeout
 from .validate import validate
 from .outline import outline
 from .values import Refusal
@@ -44,14 +45,33 @@ def _read(path: str) -> str:
     if path == "-":
         return sys.stdin.read()
     try:
-        with open(path, encoding="utf-8") as handle:
-            return handle.read()
+        with open(path, "rb") as handle:
+            raw = handle.read()
     except OSError as exc:
         raise Refusal(
             "CLI_UNREADABLE",
             f"could not read `{path}`: {exc.strerror or exc}.",
             "cli",
         ) from None
+    # Windows PowerShell 5 redirects (`>`) as UTF-16 with a BOM, and Notepad
+    # saves UTF-8 with one. Reading everything as plain UTF-8 crashed with a
+    # raw UnicodeDecodeError on exactly the files the README's Windows users
+    # produce.
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encoding = "utf-16"
+    elif raw.startswith(b"\xef\xbb\xbf"):
+        encoding = "utf-8-sig"
+    else:
+        encoding = "utf-8"
+    try:
+        return raw.decode(encoding)
+    except UnicodeDecodeError as exc:
+        raise Refusal(
+            "CLI_ENCODING",
+            f"`{path}` is not valid {encoding} text (byte {exc.start}). Save it "
+            f"as UTF-8 or UTF-16 and try again.",
+            "cli",
+        ) from exc
 
 
 def _report(refusal: Refusal) -> int:
@@ -130,7 +150,7 @@ def _cmd_test(args: argparse.Namespace) -> int:
     rule, lowered = dialects.lower(args.source, _read(args.path))
     status = _notes(lowered, "read")
     events = synthesize.parse_events(_read(args.events), args.format)
-    result = run_rule(rule, events)
+    result = evaluate_with_timeout(rule, events)
     sys.stdout.write(f"{result.verdict}  {len(result.rows)} row(s) of "
                      f"{len(events)} event(s)\n")
     for caveat in result.caveats:

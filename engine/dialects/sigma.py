@@ -101,24 +101,58 @@ LANGUAGE: Final = "Sigma YAML"
 # back a rule that is not the rule on disk.
 
 
+def _opens_quote(text: str, index: int) -> bool:
+    """True when the quote character at `index` STARTS a quoted scalar.
+
+    In YAML a quote only opens a string at the start of a token. The apostrophe
+    in a plain `don't` does not, and treating it as one swallowed the `#` that
+    followed, so a trailing comment became part of the match value.
+    """
+    return index == 0 or text[index - 1] in " \t[{,"
+
+
 def _strip_comment(raw: str) -> str:
-    """Remove a trailing `# comment`, honouring quotes.
+    """Remove a trailing `# comment`, honouring quotes and escapes.
 
     YAML needs whitespace before an inline `#`, so a `#` inside an unquoted
     value -- a colour, a fragment, a Windows path with a hash -- survives.
     """
     quote = ""
-    for index, char in enumerate(raw):
+    index = 0
+    while index < len(raw):
+        char = raw[index]
         if quote:
+            if quote == '"' and char == "\\":
+                index += 2          # an escaped quote does not close the string
+                continue
             if char == quote:
+                if quote == "'" and raw[index + 1:index + 2] == "'":
+                    index += 2      # `''` is an escaped apostrophe
+                    continue
                 quote = ""
+            index += 1
             continue
-        if char in "'\"":
+        if char in "'\"" and _opens_quote(raw, index):
             quote = char
-            continue
-        if char == "#" and (index == 0 or raw[index - 1] in " \t"):
+        elif char == "#" and (index == 0 or raw[index - 1] in " \t"):
             return raw[:index]
+        index += 1
     return raw
+
+
+def _unquote_key(key: str) -> str:
+    """A quoted mapping key without its quotes.
+
+    `'Event Data.Name': x` is ordinary YAML, and the quotes are syntax. Kept,
+    they became part of the FIELD NAME, so the rule tested a field that no
+    event has and silently never matched.
+    """
+    key = key.strip()
+    if len(key) >= 2 and key[0] == key[-1] == "'":
+        return key[1:-1].replace("''", "'")
+    if len(key) >= 2 and key[0] == key[-1] == '"':
+        return _unescape_double(key[1:-1])
+    return key
 
 
 def _split_key(text: str) -> tuple[str, str, str]:
@@ -129,26 +163,44 @@ def _split_key(text: str) -> tuple[str, str, str]:
     read as a key.
     """
     quote = ""
-    for index, char in enumerate(text):
+    index = 0
+    while index < len(text):
+        char = text[index]
         if quote:
+            if quote == '"' and char == "\\":
+                index += 2
+                continue
             if char == quote:
+                if quote == "'" and text[index + 1:index + 2] == "'":
+                    index += 2
+                    continue
                 quote = ""
+            index += 1
             continue
-        if char in "'\"":
+        if char in "'\"" and _opens_quote(text, index):
             quote = char
-            continue
-        if char == ":" and text[index + 1:index + 2] in ("", " "):
-            return text[:index].strip(), ":", text[index + 1:]
+        elif char == ":" and text[index + 1:index + 2] in ("", " "):
+            return _unquote_key(text[:index]), ":", text[index + 1:]
+        index += 1
     return text, "", ""
 
 
 def _unescape_double(body: str) -> str:
     out: list[str] = []
     index = 0
+    widths = {"x": 2, "u": 4, "U": 8}
     while index < len(body):
         char = body[index]
         if char == "\\" and index + 1 < len(body):
             nxt = body[index + 1]
+            if nxt in widths:
+                digits = body[index + 2:index + 2 + widths[nxt]]
+                try:
+                    out.append(chr(int(digits, 16)))
+                    index += 2 + widths[nxt]
+                    continue
+                except (ValueError, OverflowError):
+                    pass
             out.append({
                 "n": "\n", "t": "\t", "r": "\r", "0": "\0",
                 '"': '"', "\\": "\\", "/": "/",
@@ -204,9 +256,17 @@ def _scalar(text: str, line: int) -> Any:
     if _HEX.fullmatch(body):
         return body
     if _INT.fullmatch(body):
+        digits = body.lstrip("-")
+        # `007`, `0123` are identifiers, not numbers; reading them as 7 and 123
+        # changed what the rule matched. A run of digits too long to be a count
+        # is also kept as text (and `int()` refuses beyond 4300 digits).
+        if (len(digits) > 1 and digits[0] == "0") or len(digits) > 30:
+            return body
         return int(body)
     if _FLOAT.fullmatch(body):
-        return float(body)
+        # Decimal, not float: `1.10` is a different value from `1.1` in a
+        # version or build string, and a float cannot tell them apart.
+        return Decimal(body)
 
     lowered = body.lower()
     if lowered in ("null", "~"):
@@ -502,6 +562,110 @@ def _modifiers(raw_key: str) -> tuple[str, list[str]]:
     return parts[0].strip(), [p.strip().lower() for p in parts[1:] if p.strip()]
 
 
+def _sigma_segments(text: str) -> list[tuple[str, str]]:
+    """Split a Sigma plain value into literal text and wildcards.
+
+    Per the Sigma specification a backslash escapes only `*`, `?` and another
+    backslash; before any other character it is a literal backslash, so a
+    Windows path like `\\Windows\\cmd.exe` needs no doubling. `*` is any run
+    of characters and `?` exactly one. Returns ("lit", text) / ("any", "") /
+    ("one", "") segments, with adjacent literals merged.
+    """
+    out: list[tuple[str, str]] = []
+
+    def lit(chars: str) -> None:
+        if out and out[-1][0] == "lit":
+            out[-1] = ("lit", out[-1][1] + chars)
+        else:
+            out.append(("lit", chars))
+
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and index + 1 < len(text) and text[index + 1] in "*?\\":
+            lit(text[index + 1])
+            index += 2
+            continue
+        if char == "*":
+            if not out or out[-1][0] != "any":
+                out.append(("any", ""))
+        elif char == "?":
+            out.append(("one", ""))
+        else:
+            lit(char)
+        index += 1
+    return out
+
+
+def _wildcard_comparison(
+    operator: str, field: FieldRef, text: str, folds: bool
+) -> Expr:
+    """A Sigma string value as an IR comparison, wildcards included.
+
+    Before this, `CommandLine: '*-enc*'` was lowered as equality with the
+    LITERAL text `*-enc*`: a rule that read correctly, rendered cleanly and
+    could never fire. Shapes with a native operator keep it (`foo*` is
+    startswith); anything else becomes a `like` pattern, or a regex when a
+    literal backslash sits next to a wildcard and `like` could not say so
+    unambiguously.
+    """
+    segments = _sigma_segments(text)
+    if operator in ("contains", "startswith", "endswith"):
+        if operator in ("contains", "endswith"):
+            segments.insert(0, ("any", ""))
+        if operator in ("contains", "startswith"):
+            segments.append(("any", ""))
+        merged: list[tuple[str, str]] = []
+        for seg in segments:
+            if seg[0] == "any" and merged and merged[-1][0] == "any":
+                continue
+            merged.append(seg)
+        segments = merged
+    has_wild = any(seg[0] != "lit" for seg in segments)
+    original_wild = any(seg[0] != "lit" for seg in _sigma_segments(text))
+    if not original_wild:
+        literal = "".join(seg[1] for seg in segments if seg[0] == "lit")
+        if operator in ("contains", "startswith", "endswith", "=="):
+            literal = "".join(seg[1] for seg in _sigma_segments(text))
+        return Comparison(operator, field, Literal(literal), nocase=folds)
+
+    kinds = [seg[0] for seg in segments]
+    texts = [seg[1] for seg in segments]
+    if kinds == ["lit", "any"]:
+        return Comparison("startswith", field, Literal(texts[0]), nocase=folds)
+    if kinds == ["any", "lit"]:
+        return Comparison("endswith", field, Literal(texts[1]), nocase=folds)
+    if kinds == ["any", "lit", "any"]:
+        return Comparison("contains", field, Literal(texts[1]), nocase=folds)
+
+    ambiguous = False
+    pattern: list[str] = []
+    for position, (kind, body) in enumerate(segments):
+        if kind == "lit":
+            nxt = segments[position + 1][0] if position + 1 < len(segments) else ""
+            if body.endswith("\\") and nxt in ("any", "one"):
+                ambiguous = True
+            pattern.append(body.replace("%", "\\%").replace("_", "\\_"))
+        elif kind == "any":
+            pattern.append("%")
+        else:
+            pattern.append("_")
+    if not ambiguous:
+        return Comparison("like", field, Literal("".join(pattern)), nocase=folds)
+    regex: list[str] = []
+    for kind, body in segments:
+        if kind == "lit":
+            regex.append(re.escape(body))
+        elif kind == "any":
+            regex.append(".*")
+        else:
+            regex.append(".")
+    return Comparison(
+        "matches", field,
+        Regex("^" + "".join(regex) + "$", dialect="posix_extended", nocase=folds),
+    )
+
+
 def _literal(value: Any) -> Literal:
     """A Sigma scalar as an IR literal.
 
@@ -757,6 +921,10 @@ def _field_predicate(
             and operator in ("==", "!=", "in", "contains", "startswith",
                              "endswith")
         )
+        if isinstance(single, str) and operator in (
+                "==", "contains", "startswith", "endswith"):
+            terms.append(_wildcard_comparison(operator, field, single, folds))
+            continue
         terms.append(Comparison(
             operator, field, _literal(single), nocase=folds,
         ))
@@ -1508,6 +1676,28 @@ _SUFFIX_EXACT: Final[dict[str, str]] = {
 }
 
 
+def _escape_sigma_literal(text: str) -> str:
+    """Text as a Sigma value that reads back as exactly this literal.
+
+    `*` and `?` are wildcards in Sigma, so a LITERAL one (from a KQL `==`, an
+    EQL `==`, a Splunk `where`) must be escaped or the exported rule matches
+    more than the source did -- `A == "*"` became `A: '*'`, which matches
+    every event. A backslash needs doubling only when it precedes a wildcard
+    or another backslash (the spec's rule), so Windows paths stay readable.
+    """
+    if not isinstance(text, str):
+        return text
+    out: list[str] = []
+    for index, char in enumerate(text):
+        if char in "*?":
+            out.append("\\" + char)
+        elif char == "\\" and index + 1 < len(text) and text[index + 1] in "*?\\":
+            out.append("\\\\")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
 def _render_value(
     field: FieldRef, right: Expr, operator: str, nocase: bool = False
 ) -> tuple[str, Any]:
@@ -1555,8 +1745,9 @@ def _render_value(
                     f"Sigma's list holds constants only.",
                     "render",
                 )
-            values.append(item.value)
-        return field.full, _Raw(
+            values.append(_escape_sigma_literal(item.value))
+        exact = (not nocase) and any(isinstance(v, str) for v in values)
+        return field.full + ("|cased" if exact else ""), _Raw(
             "[" + ", ".join(_quote(v) for v in values) + "]"
         )
     if operator in ("has", "has_any", "has_all", "contains_any", "contains_all"):
@@ -1584,7 +1775,12 @@ def _render_value(
         key = field.full + ("|re|i" if right.nocase else "|re")
         return key, right.pattern
     if isinstance(right, Literal):
-        return field.full + suffix, right.value
+        if (operator == "==" and not nocase and isinstance(right.value, str)):
+            # Sigma folds case on plain equality unless told otherwise, so an
+            # exact-case `==` (KQL, EQL, SPL `where`) must carry `|cased` or the
+            # export silently widens to every capitalisation.
+            suffix = "|cased"
+        return field.full + suffix, _escape_sigma_literal(right.value)
     raise Refusal(
         "SIGMA_RENDER_VALUE",
         f"`{render_expr(right)}` is not a value Sigma can put on the "

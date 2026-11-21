@@ -338,6 +338,16 @@ class TestRun:
         return body
 
 
+
+def _owner_only(path: Path, mode: int) -> None:
+    """Restrict `path` to its owner. Best effort: Windows ignores POSIX modes."""
+    try:
+        if path.exists():
+            os.chmod(path, mode)
+    except OSError:
+        pass
+
+
 class RuleStore:
     """Append-only rule history.
 
@@ -358,9 +368,19 @@ class RuleStore:
             self._memory = sqlite3.connect(":memory:", check_same_thread=False)
             self._memory.execute("PRAGMA foreign_keys = ON")
         else:
+            existed = self.path.parent.exists()
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            if not existed:
+                _owner_only(self.path.parent, 0o700)
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+        if not self._in_memory:
+            # The store holds the log samples an analyst pasted -- which carry
+            # usernames, hostnames and sometimes credentials -- in plain text.
+            # SQLite creates the file with the umask's default (0644), readable
+            # by every account on a shared jump host. Owner-only, always.
+            for suffix in ("", "-wal", "-shm", "-journal"):
+                _owner_only(Path(str(self.path) + suffix), 0o600)
 
     # -- plumbing ---------------------------------------------------------
 

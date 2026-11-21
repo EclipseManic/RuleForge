@@ -44,6 +44,7 @@ alternative is a false claim about a security control.
 from __future__ import annotations
 
 import re
+import dataclasses
 from dataclasses import dataclass, field as dc_field
 from decimal import Decimal, InvalidOperation
 from typing import Any, Final
@@ -211,6 +212,9 @@ SPEC: Final = DialectSpec(
 INDEX_TIME_FIELDS: Final[frozenset[str]] = frozenset({
     "index", "sourcetype", "source", "eventtype", "tag", "splunk_server",
     "splunk_server_group", "_index_earliest", "_index_latest",
+    # Time-range modifiers, not columns: `earliest=-10m` read as a field made
+    # every event "undecidable" and rendered as `earliest == (0 - 10m)`.
+    "earliest", "latest",
 })
 
 #: SPL aggregate -> (engine function, distinct).
@@ -462,6 +466,12 @@ def normalise_search(text: str) -> str:
     out: list[str] = []
     for term in rebuilt:
         if term in _BOOLEANS:
+            # NOT is a PREFIX operator, so `a=1 NOT b=2` carries an implicit AND
+            # in front of it exactly as `a=1 b=2` does. Without it the parser
+            # read `a=1` and silently dropped `not b=2`, widening the rule.
+            if (term == "NOT" and out
+                    and out[-1] not in ("and", "or", "not")):
+                out.append("and")
             out.append(term.lower())
             continue
         if out and out[-1] not in ("and", "or", "not"):
@@ -582,8 +592,168 @@ def _expression(
             f"nothing.",
             "lower",
         )
+    searching = spec is SEARCH_SPEC
+    if searching:
+        text = _mark_search_values(text)
     parser = Parser(tokenize(text), spec, field_scopes=scopes)
-    return _fold_eval_predicates(parser.parse_expression(0))
+    parsed = parser.parse_expression(0)
+    # Every other dialect refuses unread input. Without this, `where x=1 y=2`
+    # or `where x=1 not y=2` lowered to `x == 1`: the rest of the condition
+    # vanished and the rule matched far more than it said.
+    if parser.current.kind != "eof":
+        raise Refusal(
+            "SPL_EXPRESSION_TRAILING",
+            f"`{parser.current.text}` follows a complete condition in "
+            f"`{text.strip()[:80]}` and was not read. Dropping it would widen "
+            f"the rule, so it is refused. Join the conditions with `AND`/`OR`.",
+            "lower",
+        )
+    folded = _fold_eval_predicates(parsed)
+    return _search_semantics(folded) if searching else folded
+
+
+
+# ---------------------------------------------------------------------------
+# Search-mode value semantics
+# ---------------------------------------------------------------------------
+
+#: Marks an UNESCAPED `*` between the scan and the parse. Unescaping happens in
+#: the tokenizer, which cannot tell `"C:\\Windows\\*"` (a path, then a wildcard)
+#: from `"\\*"` (a literal star); marking first keeps the two apart.
+_WILD: Final = "\ufdd0"
+
+_NUMBER_VALUE: Final = re.compile(r"^-?\d+(?:\.\d+)?$")
+
+
+def _mark_search_values(text: str) -> str:
+    """Prepare a `search` condition so its values mean what SPL means.
+
+    In `search`, the right-hand side of `=` / `!=` is ALWAYS a value: a bare
+    word is text, never a field name. The shared parser reads a bare word as a
+    field reference, which made `user=bob` compare two columns and `A=foo*bar`
+    a multiplication. Bare non-numeric values are therefore quoted here, and
+    every unescaped `*` (a wildcard in a search value) is marked.
+    """
+    out: list[str] = []
+    index, length = 0, len(text)
+
+    def mark(raw: str) -> str:
+        pieces: list[str] = []
+        position = 0
+        while position < len(raw):
+            char = raw[position]
+            if char == "\\" and position + 1 < len(raw):
+                pieces.append(raw[position:position + 2])
+                position += 2
+                continue
+            pieces.append(_WILD if char == "*" else char)
+            position += 1
+        return "".join(pieces)
+
+    while index < length:
+        char = text[index]
+        if char == '"':
+            end = index + 1
+            while end < length and text[end] != '"':
+                end += 2 if text[end] == "\\" else 1
+            out.append('"' + mark(text[index + 1:end]) + ('"' if end < length else ""))
+            index = end + 1
+            continue
+        for operator in ("!=", "="):
+            if text.startswith(operator, index):
+                out.append(operator)
+                index += len(operator)
+                if index < length and text[index] not in ' ()"':
+                    end = index
+                    while end < length and text[end] not in ' ()"':
+                        end += 1
+                    run = text[index:end]
+                    if _NUMBER_VALUE.match(run):
+                        out.append(run)
+                    else:
+                        out.append('"' + mark(run).replace('"', '\\"') + '"')
+                    index = end
+                break
+        else:
+            out.append(char)
+            index += 1
+    return "".join(out)
+
+
+def _search_segments(value: str) -> list[tuple[str, str]]:
+    """Split a marked search value into literal and wildcard segments."""
+    segments: list[tuple[str, str]] = []
+    for position, piece in enumerate(value.split(_WILD)):
+        if position:
+            segments.append(("any", ""))
+        piece = piece.replace("\\*", "*")
+        if piece:
+            segments.append(("lit", piece))
+    return segments
+
+
+def _search_comparison(op: str, left: Expr, value: str) -> Expr:
+    """`field=value` / `field!=value` in a search, case-folded and wildcarded."""
+    from .sigma import _escape_sigma_literal, _wildcard_comparison
+
+    segments = _search_segments(value)
+    parts: list[str] = []
+    for position, (kind, body) in enumerate(segments):
+        if kind == "any":
+            parts.append("*")
+            continue
+        escaped = _escape_sigma_literal(body)
+        # A literal backslash that sits directly before a wildcard must be
+        # doubled, or `C:\Windows\` + `*` reads back as an ESCAPED star.
+        followed_by_wild = (
+            position + 1 < len(segments) and segments[position + 1][0] == "any"
+        )
+        if followed_by_wild and body.endswith("\\"):
+            escaped += "\\"
+        parts.append(escaped)
+    text = "".join(parts)
+    # The shared builder reads `?` as a wildcard; SPL search has none, so a
+    # literal `?` was already escaped by `_escape_sigma_literal` above.
+    built = _wildcard_comparison("==", left, text, True)
+    return built if op == "==" else Not(built)
+
+
+def _search_semantics(expr: Expr) -> Expr:
+    """Apply search-mode value semantics across a parsed condition."""
+    if isinstance(expr, BoolOp):
+        return BoolOp(expr.op, tuple(_search_semantics(o) for o in expr.operands))
+    if isinstance(expr, Not):
+        return Not(_search_semantics(expr.operand))
+    if isinstance(expr, Comparison):
+        right = expr.right
+        if (expr.op in ("==", "!=") and isinstance(expr.left, FieldRef)
+                and isinstance(right, Literal) and isinstance(right.value, str)):
+            built = _search_comparison(expr.op, expr.left, right.value)
+            if expr.negate:
+                built = Not(built)
+            return built
+        if (expr.op == "in" and isinstance(expr.left, FieldRef)
+                and isinstance(right, ListExpr)
+                and all(isinstance(i, Literal) and isinstance(i.value, str)
+                        for i in right.items)):
+            terms = tuple(
+                _search_comparison("==", expr.left, i.value) for i in right.items
+            )
+            built = terms[0] if len(terms) == 1 else BoolOp("or", terms)
+            return Not(built) if expr.negate else built
+        return Comparison(
+            expr.op, _search_semantics(expr.left), _search_semantics(right),
+            expr.negate, expr.nocase,
+        )
+    if isinstance(expr, Literal) and isinstance(expr.value, str) \
+            and _WILD in expr.value:
+        return Literal(expr.value.replace(_WILD, "*"))
+    if isinstance(expr, ListExpr):
+        return ListExpr(tuple(_search_semantics(i) for i in expr.items))
+    if isinstance(expr, Call):
+        return Call(expr.function, tuple(_search_semantics(a) for a in expr.args),
+                    expr.flags)
+    return expr
 
 
 #: SPL eval FUNCTIONS that mean the same thing as a comparison operator.
@@ -630,6 +800,7 @@ def _fold_eval_predicates(expr: Expr) -> Expr:
             _fold_eval_predicates(expr.left),
             _fold_eval_predicates(expr.right),
             expr.negate,
+            expr.nocase,
         )
     return expr
 
@@ -915,6 +1086,11 @@ def _lower_stats(
 
     keys: list[FieldRef] = []
     window: Window | None = None
+    has_span = any(
+        _SPAN.match(term)
+        for piece in split_top_level(by_text, ",")
+        for term in _split_terms(piece.strip())
+    )
     for piece in split_top_level(by_text, ","):
         piece = piece.strip()
         if not piece:
@@ -932,9 +1108,12 @@ def _lower_stats(
                     )
                 window = Window(kind="tumbling", size=size)
                 continue
-            if term.startswith("_time"):
+            if term == "_time" and has_span:
                 # `by _time span=5m` is the window, not a grouping key: keeping
-                # it as a key would group every second separately.
+                # it as a key would group every second separately. WITHOUT a
+                # span the bucket came from an earlier `bin`, and dropping the
+                # key here is what made `bin _time span=10m | stats ... by
+                # _time, user` count across ALL time. `_merge_bins` folds it.
                 continue
             keys.append(FieldRef.parse(term))
 
@@ -1015,6 +1194,7 @@ def _fix_argument_orders(expr: Expr) -> Expr:
             _fix_argument_orders(expr.left),
             _fix_argument_orders(expr.right),
             expr.negate,
+            expr.nocase,
         )
     if isinstance(expr, BoolOp):
         return BoolOp(expr.op, tuple(_fix_argument_orders(o) for o in expr.operands))
@@ -1533,7 +1713,47 @@ def _lower_stream(
             stage, node_id, bindings, nodes[-1].id, diagnostics
         )
         nodes.extend(produced)
-    return nodes
+    return _merge_bins(nodes)
+
+
+def _merge_bins(nodes: list[Node]) -> list[Node]:
+    """Fold `bin _time span=10m | stats ... by _time, user` into one window.
+
+    The bin used to survive only as a derived column that the following
+    `stats` never grouped on, so `by _time, user` became `by user` and the
+    10-minute bucket vanished: six failures an hour apart counted as one
+    group and fired. The bucketing is a tumbling WINDOW on the aggregate, which
+    is exactly what KQL's `bin()` lowers to.
+    """
+    merged: list[Node] = []
+    index = 0
+    while index < len(nodes):
+        node = nodes[index]
+        following = nodes[index + 1] if index + 1 < len(nodes) else None
+        if (isinstance(node, Derive) and len(node.assignments) == 1
+                and isinstance(following, Aggregate)
+                and following.window is None):
+            target, call = node.assignments[0]
+            if (isinstance(call, Call) and call.function == "bin"
+                    and len(call.args) == 2
+                    and isinstance(call.args[0], FieldRef)
+                    and isinstance(call.args[1], Literal)
+                    and any(k.full == target for k in following.keys)):
+                span = duration_seconds(str(call.args[1].value))
+                if span is not None:
+                    merged.append(dataclasses.replace(
+                        following,
+                        keys=tuple(k for k in following.keys if k.full != target),
+                        window=Window(
+                            kind="tumbling", size=span,
+                            time_field=call.args[0].full,
+                        ),
+                    ))
+                    index += 2
+                    continue
+        merged.append(node)
+        index += 1
+    return merged
 
 
 def lower_splunk(text: str, rule_id: str = "rule") -> tuple[Rule, list[Diagnostic]]:
@@ -1637,7 +1857,7 @@ def _like_body(operator: str, value: str, nocase: bool = False) -> str:
     wildcards = {
         "contains": "%{0}%", "startswith": "{0}%", "endswith": "%{0}",
     }[operator]
-    escaped = _like_escape(value).replace('"', '\\"')
+    escaped = _like_escape(value)
     if nocase:
         # The subject is lowercased by `_like_subject`, so the pattern has to
         # be folded too. Folding only one side makes an uppercase character in
@@ -1648,9 +1868,15 @@ def _like_body(operator: str, value: str, nocase: bool = False) -> str:
     # `escape_for_string_literal`: without this a trailing `\` in the value
     # became an escaped `%`, so `User|startswith: 'NT AUTHORITY\'` stopped
     # matching and its negation alerted on every SYSTEM event.
-    return escape_for_string_literal(
-        wildcards.format(escaped).replace("*", "%")
-    )
+    # No `*` -> `%` translation here: the table above already writes `%`, and
+    # translating again turned a LITERAL `*` in the value into a wildcard, so
+    # `contains "*"` became `LIKE "%%%"` and matched everything.
+    body = escape_for_string_literal(wildcards.format(escaped))
+    # The quote is escaped LAST. Doing it first (as before) let the backslash
+    # doubling above turn `\"` into `\\"`: an escaped backslash followed by a
+    # bare closing quote, which ended the string early and left the rest of the
+    # value outside it.
+    return body.replace('"', '\\"')
 
 
 def _like_subject(expr: Any) -> str:
@@ -1766,6 +1992,14 @@ def _render_expression(expr: Expr) -> str:
             # from a round trip as `like` rendered differently the second
             # time -- the same rule, two texts, and every save looking like an
             # edit.
+            return f"NOT ({body})" if expr.negate else body
+        if (expr.op == "like" and expr.nocase and isinstance(expr.right, Literal)
+                and isinstance(expr.right.value, str)):
+            # SPL's LIKE is case-SENSITIVE, and a wildcard pattern read from a
+            # search (`CommandLine="*delete*shadows*"`) is not. Same idiom as
+            # `contains`: lowercase BOTH sides, or the fold is silently lost.
+            body = (f"lower({_render_expression(expr.left)}) LIKE "
+                    f"{_quote(expr.right.value.lower())}")
             return f"NOT ({body})" if expr.negate else body
         if expr.op in ("in", "contains_any", "contains_all"):
             # `field IN (a, b)` is valid in BOTH places this renderer emits:
@@ -1903,13 +2137,18 @@ def _render_stage(node: Node, rule: Rule) -> list[str]:
         command = "tstats" if node.capability is Capability.DECLARED_ONLY else "stats"
         body = ", ".join(_render_measure(m) for m in node.measures)
         by: list[str] = []
+        lines: list[str] = []
         if node.window is not None and node.window.size is not None:
-            by.append(f"_time span={_render_span(node.window.size)}")
+            # `by _time span=10m` is not SPL: `span` belongs to `bin`/`bucket`.
+            # The bucket is made first, then grouped on like any other field.
+            clock = node.window.time_field or "_time"
+            lines.append(f"| bin {clock} span={_render_span(node.window.size)}")
+            by.append(clock)
         by.extend(key.full for key in node.keys)
         line = f"| {command} {body}"
         if by:
             line += " by " + ", ".join(by)
-        return [line]
+        return lines + [line]
     if isinstance(node, Sort):
         body = ", ".join(
             ("-" if descending else "+") + key.full

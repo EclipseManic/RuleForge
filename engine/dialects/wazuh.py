@@ -39,6 +39,7 @@ machines would fire a rule that means five failures on ONE machine.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import xml.etree.ElementTree as ElementTree
 from dataclasses import dataclass, field as dc_field
@@ -1126,6 +1127,22 @@ CARRIED_ATTRIBUTES: Final[tuple[str, ...]] = (
 )
 
 
+#: Wazuh loads custom rules in 100000-120000 and the id must be a NUMBER. A
+#: Sigma UUID (or the placeholder `rule`) written into `id=` produces a rules
+#: file the manager refuses to load.
+_CUSTOM_ID_BASE = 100000
+_CUSTOM_ID_SPAN = 20001
+
+
+def _numeric_rule_id(raw: str) -> tuple[str, bool]:
+    """(numeric id, whether it was assigned rather than kept)."""
+    text = (raw or "").strip()
+    if text.isdigit():
+        return text, False
+    digest = int(hashlib.sha1(text.encode("utf-8")).hexdigest(), 16)
+    return str(_CUSTOM_ID_BASE + digest % _CUSTOM_ID_SPAN), True
+
+
 def render_wazuh(rule: Rule) -> str:
     """Write a Rule back out as a Wazuh rule inside a `<group>`.
 
@@ -1222,7 +1239,9 @@ def render_wazuh(rule: Rule) -> str:
             "render",
         )
 
-    attributes = [f'id="{_escape(meta.get("wazuh.id") or rule.rule_id)}"']
+    original_id = str(meta.get("wazuh.id") or rule.rule_id)
+    numeric_id, assigned_id = _numeric_rule_id(original_id)
+    attributes = [f'id="{_escape(numeric_id)}"']
     level = meta.get("wazuh.level") or _level_from(annotations.severity)
     attributes.append(f'level="{_escape(level)}"')
 
@@ -1245,6 +1264,14 @@ def render_wazuh(rule: Rule) -> str:
         f"<group name=\"{_escape(meta.get('wazuh.ruleset_group') or 'local')},\">"
     ]
     lines.append(f"  <rule {' '.join(attributes)}>")
+    if assigned_id:
+        # Deterministic, so re-exporting the same rule gives the same id, but a
+        # 20,001-wide range can collide: the original id is kept beside it so
+        # the mapping is auditable.
+        lines.append(
+            f"  <!-- id assigned from {_escape(original_id)}; "
+            f"check it does not collide with another custom rule -->"
+        )
 
     body: list[str] = []
     parent = meta.get("wazuh.if_sid")

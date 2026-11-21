@@ -40,6 +40,7 @@ from typing import Any, Callable, Final
 from urllib.parse import parse_qs, unquote, urlparse, urlsplit
 
 from engine import dialects, synthesize
+from engine.sandbox import evaluate_with_timeout
 from engine.codec import rule_from_dict, rule_to_dict
 from engine.evaluate import Budget, Caveat, EvaluationResult, Trace
 from engine.ir import Rule, render_expr
@@ -419,7 +420,7 @@ class Api:
                 f"not being debugged, it is being hoped about.",
                 "api",
             )
-        result = evaluate(rule, events, budget=Budget())
+        result = evaluate_with_timeout(rule, events, budget=Budget())
         return _result_dict(result)
 
     # -- evidence: datasets and replay runs -------------------------------
@@ -544,7 +545,7 @@ class Api:
                 "REQUEST_FIELD_TYPE", "`dataset_id` must be a number.", "api"
             )
         dataset = self.store.dataset(raw_dataset_id)
-        result = evaluate(rule, dataset.events(), budget=Budget())
+        result = evaluate_with_timeout(rule, dataset.events(), budget=Budget())
         result_body = _result_dict(result)
         expected = body.get("expected_verdict", "")
         if not isinstance(expected, str):
@@ -831,9 +832,24 @@ class RuleForgeHandler(BaseHTTPRequestHandler):
         "form-action 'none'; frame-ancestors 'none'"
     )
 
+    def _unread_body(self) -> bool:
+        """True when the client sent a body this request never read."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return True
+        return length > 0 and not getattr(self, "_body_consumed", False)
+
     def _send(self, status: int, payload: Any) -> None:
         body = json.dumps(payload, allow_nan=False).encode("utf-8")
         self.send_response(status)
+        if self._unread_body():
+            # An early refusal (unknown route, cross-origin, bad Host) leaves the
+            # request body in the socket. On a keep-alive connection the server
+            # would parse that body as the NEXT request -- request smuggling.
+            # Closing the connection after the reply removes the desync.
+            self.send_header("Connection", "close")
+            self.close_connection = True
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         # This tool renders rule text and log samples that came from
@@ -904,6 +920,23 @@ class RuleForgeHandler(BaseHTTPRequestHandler):
             super().handle()
         except (TimeoutError, OSError):
             self.close_connection = True
+
+    def _host_allowed(self) -> bool:
+        """The Host header must be a loopback name -- or the address this
+        server was explicitly bound to. Checked on reads as well as writes:
+        DNS rebinding makes the attacker's page same-origin, so a GET carries
+        no Origin and reads everything saved in the store."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        if not host:
+            # A browser always sends Host, so an absent one is a raw client
+            # (curl, HTTP/1.0, a test), never a rebinding page.
+            return True
+        hostname = urlsplit("//" + host).hostname or ""
+        if _is_loopback(hostname):
+            return True
+        bound = str(self.server.server_address[0]).lower()
+        return bool(hostname) and hostname == bound and not _is_loopback(bound) \
+            and bound not in ("0.0.0.0", "::")
 
     def _same_origin(self) -> bool:
         """True when a state-changing request is allowed to touch the store.
@@ -980,6 +1013,7 @@ class RuleForgeHandler(BaseHTTPRequestHandler):
             return {}
         try:
             raw = self.rfile.read(length)
+            self._body_consumed = True
         except (TimeoutError, OSError) as exc:
             # The declared length never arrived. Refused by name rather than
             # falling through to a JSON error about truncated input, which
@@ -1054,7 +1088,13 @@ class RuleForgeHandler(BaseHTTPRequestHandler):
         # Resolve and then confirm containment. Checking for ".." in the raw
         # string misses encoded traversal and symlinks; comparing resolved
         # paths does not.
-        target = (_STATIC_ROOT / unquote(relative)).resolve()
+        decoded = unquote(relative)
+        if "\x00" in decoded:
+            self._send(HTTPStatus.NOT_FOUND, {"error": {
+                "code": "NOT_FOUND", "message": "not found.", "where": "api",
+            }})
+            return
+        target = (_STATIC_ROOT / decoded).resolve()
         try:
             target.relative_to(_STATIC_ROOT.resolve())
         except ValueError:
@@ -1083,6 +1123,16 @@ class RuleForgeHandler(BaseHTTPRequestHandler):
         params = parse_qs(parsed.query)
 
         try:
+            if not self._host_allowed():
+                self._refuse(Refusal(
+                    "REQUEST_BAD_HOST",
+                    "this request names a host that is not this machine. The "
+                    "workbench answers only to its own loopback address, "
+                    "because a page on another site can point its own domain "
+                    "at 127.0.0.1 (DNS rebinding) and read what is saved here.",
+                    "api",
+                ), HTTPStatus.FORBIDDEN)
+                return
             # Writes are the only thing worth forging: a cross-origin GET can
             # read nothing back, and the pages are same-origin anyway. Both
             # POST and DELETE mutate the SQLite store, so both are guarded.

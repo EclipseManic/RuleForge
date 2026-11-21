@@ -435,9 +435,27 @@ def lower(key: str, text: str, rule_id: str = "rule") -> tuple[Rule, list[Diagno
             f"only be written out. {entry.note}".strip(),
             "registry",
         )
-    return _function(key, entry.lower_attr, "parse")(
-        _without_bom(text), rule_id
-    )
+    try:
+        return _function(key, entry.lower_attr, "parse")(
+            _without_bom(text), rule_id
+        )
+    except RecursionError as error:
+        raise Refusal(
+            "INPUT_TOO_DEEPLY_NESTED",
+            "this rule nests parentheses or sub-expressions far deeper than any "
+            "real rule does, and was refused before it could exhaust the parser. "
+            "Flatten it, or split it into several rules.",
+            "parse",
+        ) from error
+    except ValueError as error:
+        if "digits" in str(error):
+            raise Refusal(
+                "INPUT_NUMBER_TOO_LONG",
+                "a number in this rule has thousands of digits. That is not a "
+                "threshold or an id; quote it if it is meant as text.",
+                "parse",
+            ) from error
+        raise
 
 
 def _transfer_diagnostics(key: str, rule: Rule) -> list[Diagnostic]:
@@ -695,6 +713,22 @@ def _fidelity_diagnostics(key: str, rule: Rule, text: str) -> list[Diagnostic]:
                     f"`{original['value']}` was matched regardless of case in "
                     f"this rule, and {entry.label} matches it EXACTLY. The "
                     f"rendered rule is narrower than the one it came from."
+                ),
+                severity="problem",
+                verified=True,
+            ))
+            continue
+        if reread["fold"] and not original["fold"]:
+            # The mirror image, and the more dangerous one: the source matched
+            # this value EXACTLY and the target cannot say so (FQL's `:` and
+            # Sigma without `|cased` fold unconditionally). Silence here meant an
+            # exact-case rule fired on every capitalisation after export.
+            notes.append(Diagnostic(
+                code="RENDER_CASE_FOLD_ADDED",
+                message=(
+                    f"`{original['value']}` was matched EXACTLY in this rule, "
+                    f"and {entry.label} matches it regardless of case. The "
+                    f"rendered rule is wider than the one it came from."
                 ),
                 severity="problem",
                 verified=True,

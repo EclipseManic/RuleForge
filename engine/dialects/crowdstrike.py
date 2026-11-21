@@ -628,7 +628,6 @@ def _escape_glob_literal(text: str) -> str:
         text.replace("\\", "\\\\")
         .replace("*", "\\*")
         .replace("?", "\\?")
-        .replace("'", "\\'")
     )
 
 
@@ -642,7 +641,11 @@ def _quote_glob(glob: str) -> str:
     backslash lost its escape and turned the following `*` into a literal star
     -- which is why `User:!*'NT AUTHORITY\\*'` alerted on every SYSTEM event.
     """
-    return "'" + escape_for_string_literal(glob) + "'"
+    # The quote is escaped AFTER the backslash layer. Escaping it in the glob
+    # (as before) let `escape_for_string_literal` double that backslash, so
+    # `it's` became `it\\'s`: an escaped backslash then a bare closing quote,
+    # which ended the value early and left `s*'` outside it.
+    return "'" + escape_for_string_literal(glob).replace("'", "\\'") + "'"
 
 
 def _like_to_glob(pattern: str) -> str:

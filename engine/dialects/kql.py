@@ -894,16 +894,47 @@ def _lower_summarize(
                 size_text = part.rsplit(",", 1)[1].rstrip(") ").strip()
                 span = duration_seconds(size_text)
                 if span is not None:
+                    # The WINDOW is the bucketing. Also grouping by the raw
+                    # time field split every bucket back into one group per
+                    # timestamp, so no count ever reached a threshold and every
+                    # renderer emitted a `group by` that could never fire.
                     window = Window(
                         kind="tumbling", size=span, time_field=inner
                     )
-                    keys.append(_scoped(inner, field_scopes))
                     continue
             keys.append(_scoped(part, field_scopes))
 
     return Aggregate(
         id=node_id, measures=tuple(measures), keys=tuple(keys), window=window
     )
+
+
+#: KQL's default output-column prefix per aggregate, when `summarize` is not
+#: given an explicit name. `make_set(x)` yields `set_x`, not `make_set_x`.
+_DEFAULT_PREFIX: Final[dict[str, str]] = {
+    "make_set": "set", "make_list": "list", "makelist": "list",
+    "make_bag": "bag", "distinctcount": "dcount",
+}
+
+
+def _default_measure_name(lowered: str, field_text: str, param: Any = None) -> str:
+    """The column name KQL itself gives an unnamed aggregate.
+
+    `summarize dcount(Computer) by user | where dcount_Computer > 3` is the
+    standard idiom, and it only works if the column is called what KQL calls
+    it. The lowering named it after the bare column (`Computer`), so the
+    follow-up `where` referenced a column that did not exist and every such
+    rule reported `not_evaluated`.
+    """
+    if lowered == "count":
+        return "count_"
+    if lowered == "countif":
+        return "countif_"
+    prefix = _DEFAULT_PREFIX.get(lowered, lowered)
+    column = field_text.strip().replace(".", "_")
+    if lowered == "percentile" and param is not None:
+        return f"percentile_{column}_{param.normalize():f}"
+    return f"{prefix}_{column}"
 
 
 def _lower_measure(
@@ -969,7 +1000,7 @@ def _lower_measure(
         )
         return Measure(
             function="count_if",
-            name=name or "count_if",
+            name=name or "countif_",
             condition=condition,
         )
 
@@ -1024,7 +1055,7 @@ def _lower_measure(
 
     return Measure(
         function=engine,
-        name=name or field_text.replace(".", "_"),
+        name=name or _default_measure_name(lowered, field_text, param),
         field=field,
         distinct=distinct,
         param=param,

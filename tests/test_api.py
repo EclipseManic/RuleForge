@@ -1366,7 +1366,7 @@ class OverHttp(unittest.TestCase):
             + b'"}'
         )
         header = (
-            b"POST /api/lower HTTP/1.1\r\nHost: x\r\n"
+            b"POST /api/lower HTTP/1.1\r\nHost: 127.0.0.1\r\n"
             b"Content-Type: application/json\r\n"
             b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n"
         )
@@ -1388,7 +1388,7 @@ class OverHttp(unittest.TestCase):
         # analyst hunting for a bracket they did not miss.
         body = b'{"dialect":"sentinel","text":"T"}'
         header = (
-            b"POST /api/lower HTTP/1.1\r\nHost: x\r\n"
+            b"POST /api/lower HTTP/1.1\r\nHost: 127.0.0.1\r\n"
             b"Content-Type: application/json\r\n"
             b"Content-Length: 500\r\n\r\n"
         )
@@ -1415,7 +1415,7 @@ class OverHttp(unittest.TestCase):
         import socket
 
         sock = socket.create_connection(("127.0.0.1", self.port), timeout=10)
-        sock.sendall(b"POST /api/lower HTTP/1.1\r\nHost: x\r\n")
+        sock.sendall(b"POST /api/lower HTTP/1.1\r\nHost: 127.0.0.1\r\n")
         sock.close()
         # The server must still answer the next request on a new connection.
         status, body = self.post(

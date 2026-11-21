@@ -1496,6 +1496,19 @@ def render_qradar(rule: Rule) -> str:
             # before or after the aggregate, which is exactly the distinction
             # the pipeline order carries and AQL's syntax loses.
             (having if seen_aggregate else where).append(node.condition)
+        elif isinstance(node, Aggregate) and node.window is not None:
+            # AQL has no per-bucket GROUP BY over time, and `LAST n MINUTES` is a
+            # look-back range, not a bucket. Dropping the window (what this did)
+            # turned "more than 5 per 10 minutes" into "more than 5, ever".
+            raise Refusal(
+                "AQL_RENDER_WINDOW",
+                f"`{node.id}` counts per time window, and AQL cannot group by "
+                f"one. Writing the GROUP BY without it would count across all "
+                f"time and match far more than the rule says. Keep this rule "
+                f"in a dialect with windows, or move the window into a "
+                f"QRadar custom rule's time-and-count test.",
+                "render",
+            )
         elif isinstance(node, Aggregate):
             seen_aggregate = True
             group_keys = list(node.keys)
