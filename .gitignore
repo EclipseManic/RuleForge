@@ -45,5 +45,12 @@ session-*.md
 *-session.txt
 *.log
 
+# Scratch reproducers and dumped audit reports from review rounds. A probe is
+# how a review proves a defect and an audit dump is its input; neither belongs
+# in the tool, so they must not accumulate in the tree.
+probe_*.py
+issues.txt
+issues.html
+
 # Assistant working state
 .oxcode-memory/
