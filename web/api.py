@@ -82,7 +82,11 @@ _TOO_LARGE_CODES: Final[frozenset[str]] = frozenset({
 #: that stayed just inside the limit would have been read and parsed anyway.
 #: A body far beyond it is still cut off, and a client sending one is not
 #: owed a courteous explanation.
-_DRAIN_LIMIT: Final = MAX_BODY_BYTES
+#: A little over the ceiling on purpose. Draining exactly MAX_BODY_BYTES
+#: leaves the last few bytes of a marginally-oversized body unread, and
+#: closing a socket with unread data resets it -- so a 16 MB + 32 byte
+#: paste still arrived as a network error instead of a 413.
+_DRAIN_LIMIT: Final = MAX_BODY_BYTES + 256 * 1024
 
 _WEB_ROOT: Final = Path(__file__).resolve().parent
 _STATIC_ROOT: Final = _WEB_ROOT / "static"

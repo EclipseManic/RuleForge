@@ -58,7 +58,7 @@ DEFAULT_PORT = 8765
 PORT_ATTEMPTS = 20
 
 HELP = """\
-RuleForge -- a detection rule workbench for enterprise SIEM rules.
+RuleForge -- a detection rule workbench for SIEM, EDR and cloud query languages.
 
     python run.py                  start the browser workbench (default)
     python run.py serve --port N   start it on a specific port
