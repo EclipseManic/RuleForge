@@ -88,6 +88,10 @@ Verify the checkout before you trust it:
 python run.py verify
 ```
 
+Output from a real run on this machine, `python run.py dialects`:
+
+![RuleForge dialect list](docs/dialects.png)
+
 That runs the full test suite and then sweeps 403 real-shaped rules through all
 eight dialects.
 
