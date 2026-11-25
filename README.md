@@ -1,15 +1,9 @@
 # RuleForge
 
-**A local detection-rule workbench for enterprise SIEM rules.**
+**A local detection-rule workbench for SIEM, EDR and cloud query languages.**
 
 Author a rule once, read it in eight dialects, test it against real log samples,
 and keep the history of how it changed.
-
-![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
-![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
-![Tests](https://img.shields.io/badge/tests-1345%20passing-brightgreen)
-![Dialects](https://img.shields.io/badge/dialects-8-blue)
-![Corpus](https://img.shields.io/badge/corpus-403%20rules-blue)
 
 ---
 
