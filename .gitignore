@@ -51,6 +51,3 @@ session-*.md
 probe_*.py
 issues.txt
 issues.html
-
-# Assistant working state
-.oxcode-memory/
